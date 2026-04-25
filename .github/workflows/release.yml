@@ -1,0 +1,117 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: resolve version
+        id: ver
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build agent + ctl
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -eux
+          archsuffix="${GOARCH}"
+          if [ -n "${GOARM:-}" ]; then archsuffix="${GOARCH}v${GOARM}"; fi
+          outdir="dist/obacht-agent_${{ steps.ver.outputs.tag }}_${GOOS}_${archsuffix}"
+          mkdir -p "$outdir"
+          go build -trimpath \
+            -ldflags "-s -w -X main.agentVersion=${{ steps.ver.outputs.tag }}" \
+            -o "$outdir/obacht-agent" ./cmd/obacht-agent
+          go build -trimpath \
+            -ldflags "-s -w -X main.cliVersion=${{ steps.ver.outputs.tag }}" \
+            -o "$outdir/obachtctl" ./cmd/obachtctl
+          cp README.md LICENSE 2>/dev/null "$outdir/" || true
+          tar -C dist -czf "dist/obacht-agent_${{ steps.ver.outputs.tag }}_${GOOS}_${archsuffix}.tar.gz" \
+            "$(basename "$outdir")"
+          ( cd dist && shasum -a 256 "obacht-agent_${{ steps.ver.outputs.tag }}_${GOOS}_${archsuffix}.tar.gz" \
+            > "obacht-agent_${{ steps.ver.outputs.tag }}_${GOOS}_${archsuffix}.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: resolve tag
+        id: ver
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          ls -la dist
+          # ship install.sh alongside the binaries so the release page is the
+          # single source of truth for bootstrap (curl|sh).
+          cp install.sh dist/install.sh
+          gh release create "${{ steps.ver.outputs.tag }}" \
+              dist/*.tar.gz dist/*.sha256 dist/install.sh \
+            --title "${{ steps.ver.outputs.tag }}" \
+            --generate-notes \
+            --target "$GITHUB_SHA" || \
+          gh release upload "${{ steps.ver.outputs.tag }}" \
+            dist/*.tar.gz dist/*.sha256 dist/install.sh --clobber

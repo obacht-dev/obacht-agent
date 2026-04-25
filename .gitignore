@@ -1,0 +1,13 @@
+build/
+dist/
+*.test
+*.db
+*.db-journal
+.DS_Store
+.vscode/
+.idea/
+coverage.out
+tmp/
+bin/
+/obacht-agent
+/obachtctl

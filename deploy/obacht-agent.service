@@ -1,0 +1,32 @@
+[Unit]
+Description=Obacht Pi Agent v2
+Documentation=https://obacht.dev/docs
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/obacht-agent/obacht-agent -config=/etc/obacht/agent-v2.yml -log-level=info
+Restart=always
+RestartSec=5
+User=root
+Group=root
+
+# logs
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=obacht-agent
+
+# runtime dir for socket
+RuntimeDirectory=obacht
+RuntimeDirectoryMode=0755
+
+# hardening (light — agent needs docker socket + systemd dbus + caddy mgmt)
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

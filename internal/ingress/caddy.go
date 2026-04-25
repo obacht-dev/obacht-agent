@@ -1,0 +1,489 @@
+// Package ingress manages Caddy as the device-local edge proxy.
+//
+// Responsibilities:
+//   - Ensure a shared docker network (`obacht-edge`) exists so the Caddy
+//     container can reach template containers by name.
+//   - Run a single Caddy 2 container with persistent data/config volumes.
+//   - Generate the Caddyfile from the SQLite SSOT (domains + ingress_bindings
+//     + instance_services) and reload Caddy in place.
+//   - Drive the per-domain state machine: pending → claiming → ready → bound
+//     (observed_status), reflecting what Caddy has actually achieved.
+//
+// We intentionally manage Caddy via a container instead of embedding it as a
+// Go library: it lets us version Caddy independently from the agent and
+// keeps the agent binary small.
+package ingress
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/obacht-dev/obacht-agent/internal/config"
+	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
+	"github.com/obacht-dev/obacht-agent/internal/store"
+)
+
+// ContainerName is the docker container name we use for Caddy.
+const ContainerName = "obacht-caddy"
+
+// Manager owns the Caddy lifecycle and Caddyfile generation.
+type Manager struct {
+	docker  *container.Driver
+	store   *store.Store
+	cfg     config.IngressConfig
+	paths   config.PathsConfig
+	log     *slog.Logger
+
+	mu       sync.Mutex
+	lastHash string
+
+	ensureMu sync.Mutex
+}
+
+// New constructs a Manager. Call Bootstrap once at startup before any Apply.
+func New(docker *container.Driver, st *store.Store, cfg config.IngressConfig, paths config.PathsConfig, log *slog.Logger) *Manager {
+	return &Manager{docker: docker, store: st, cfg: cfg, paths: paths, log: log}
+}
+
+// Bootstrap ensures the docker network and Caddy container exist with an
+// initial (possibly empty) Caddyfile. Safe to call multiple times.
+func (m *Manager) Bootstrap(ctx context.Context) error {
+	if m.cfg.Disabled {
+		m.log.Info("ingress disabled by config; skipping bootstrap")
+		return nil
+	}
+	if err := m.docker.EnsureNetwork(ctx, m.cfg.Network); err != nil {
+		return fmt.Errorf("ensure network: %w", err)
+	}
+	if err := m.ensureDirs(); err != nil {
+		return err
+	}
+	caddyfile, _, err := m.renderCaddyfile(ctx)
+	if err != nil {
+		return fmt.Errorf("render initial caddyfile: %w", err)
+	}
+	if err := m.writeCaddyfile(caddyfile); err != nil {
+		return err
+	}
+	if err := m.ensureCaddyContainer(ctx); err != nil {
+		return fmt.Errorf("ensure caddy container: %w", err)
+	}
+	m.log.Info("ingress bootstrap complete", "network", m.cfg.Network, "image", m.cfg.Image)
+	return nil
+}
+
+// Apply re-renders the Caddyfile, writes it to disk, and reloads Caddy if
+// anything changed. It also updates each domain's observed_status based on
+// whether it has a binding (bound) or not (ready).
+func (m *Manager) Apply(ctx context.Context) error {
+	if m.cfg.Disabled {
+		return nil
+	}
+	caddyfile, summary, err := m.renderCaddyfile(ctx)
+	if err != nil {
+		return fmt.Errorf("render caddyfile: %w", err)
+	}
+	hash := sha256Hex(caddyfile)
+
+	m.mu.Lock()
+	changed := hash != m.lastHash
+	m.mu.Unlock()
+
+	if changed {
+		if err := m.writeCaddyfile(caddyfile); err != nil {
+			return err
+		}
+		// Make sure Caddy is up before we ask it to reload.
+		if err := m.ensureCaddyContainer(ctx); err != nil {
+			return err
+		}
+		if err := m.reloadCaddy(ctx); err != nil {
+			return fmt.Errorf("reload caddy: %w", err)
+		}
+		m.mu.Lock()
+		m.lastHash = hash
+		m.mu.Unlock()
+		m.log.Info("caddyfile reloaded", "hash", hash[:12], "domains", summary.totalDomains, "bound", summary.bound)
+	}
+
+	// Reflect observed status into the SSOT regardless of whether the
+	// Caddyfile changed: cert state can flip without the file changing.
+	for d, s := range summary.observed {
+		if err := m.store.SetDomainObserved(ctx, d, s, ""); err != nil {
+			m.log.Warn("set domain observed", "domain", d, "err", err)
+		}
+	}
+	return nil
+}
+
+// Reload forces Caddy to reload (no-op render diff). Useful after manual edits.
+func (m *Manager) Reload(ctx context.Context) error {
+	if m.cfg.Disabled {
+		return nil
+	}
+	if err := m.ensureCaddyContainer(ctx); err != nil {
+		return err
+	}
+	return m.reloadCaddy(ctx)
+}
+
+// --- helpers ---
+
+func (m *Manager) ensureDirs() error {
+	for _, p := range []string{m.paths.CaddyData, m.paths.CaddyConfig} {
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) caddyfilePath() string { return filepath.Join(m.paths.CaddyConfig, "Caddyfile") }
+
+func (m *Manager) writeCaddyfile(body string) error {
+	return os.WriteFile(m.caddyfilePath(), []byte(body), 0o644)
+}
+
+type renderSummary struct {
+	totalDomains int
+	bound        int
+	observed     map[string]string // domain → observed_status to write back
+}
+
+// renderCaddyfile builds the Caddyfile body from current SSOT. It returns
+// the rendered body plus a summary the caller uses to update observed state.
+//
+// Layout:
+//
+//	{
+//	    admin 0.0.0.0:2019
+//	}
+//
+//	# Default site for ready+unbound domains.
+//	example.com {
+//	    respond "obacht: domain ready, no app bound yet" 200
+//	}
+//
+//	# Bound site.
+//	app.example.com {
+//	    reverse_proxy obacht-myapp:8080
+//	}
+func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, error) {
+	domains, err := m.store.ListDomains(ctx)
+	if err != nil {
+		return "", renderSummary{}, err
+	}
+	bindings, err := m.store.ListBindings(ctx)
+	if err != nil {
+		return "", renderSummary{}, err
+	}
+	services, err := m.store.ListInstanceServices(ctx)
+	if err != nil {
+		return "", renderSummary{}, err
+	}
+
+	bindByDomain := map[string]store.IngressBinding{}
+	for _, b := range bindings {
+		bindByDomain[b.Domain] = b
+	}
+	svcKey := func(inst, name string) string { return inst + "/" + name }
+	svcMap := map[string]store.InstanceService{}
+	for _, s := range services {
+		svcMap[svcKey(s.InstanceID, s.ServiceName)] = s
+	}
+
+	var b strings.Builder
+	b.WriteString("# Generated by obacht-agent. Do not edit by hand.\n")
+	b.WriteString("{\n\tadmin 0.0.0.0:2019\n}\n\n")
+
+	summary := renderSummary{observed: map[string]string{}}
+
+	// Stable order makes the hash stable.
+	sort.Slice(domains, func(i, j int) bool { return domains[i].Domain < domains[j].Domain })
+
+	for _, d := range domains {
+		if d.DesiredStatus == store.DomainStatusRemoved {
+			summary.observed[d.Domain] = store.DomainStatusRemoved
+			continue
+		}
+		summary.totalDomains++
+		bind, hasBinding := bindByDomain[d.Domain]
+
+		fmt.Fprintf(&b, "%s {\n", d.Domain)
+		if hasBinding {
+			svc, ok := svcMap[svcKey(bind.InstanceID, bind.ServiceName)]
+			if !ok {
+				// Binding points at a missing service — fall back to a
+				// helpful 503 so we still get a cert and a clear error.
+				fmt.Fprintf(&b, "\trespond \"obacht: binding %s/%s has no registered service yet\" 503\n",
+					bind.InstanceID, bind.ServiceName)
+				summary.observed[d.Domain] = store.DomainStatusReady
+			} else {
+				upstream, err := upstreamFor(svc, bind.InstanceID)
+				if err != nil {
+					fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(err.Error()))
+					summary.observed[d.Domain] = store.DomainStatusReady
+				} else {
+					if bind.Mode == "path" && bind.PathPrefix != "" {
+						fmt.Fprintf(&b, "\thandle %s* {\n\t\treverse_proxy %s\n\t}\n", bind.PathPrefix, upstream)
+					} else {
+						fmt.Fprintf(&b, "\treverse_proxy %s\n", upstream)
+					}
+					summary.bound++
+					summary.observed[d.Domain] = store.DomainStatusBound
+				}
+			}
+		} else {
+			b.WriteString("\trespond \"obacht: domain ready, no app bound yet\" 200\n")
+			summary.observed[d.Domain] = store.DomainStatusReady
+		}
+		b.WriteString("}\n\n")
+	}
+
+	if summary.totalDomains == 0 {
+		// Caddy needs *something* to listen on or it will exit. A loopback
+		// admin-only listener is enough.
+		b.WriteString(":80 {\n\trespond \"obacht-agent: no domains configured\" 200\n}\n")
+	}
+	return b.String(), summary, nil
+}
+
+// upstreamFor returns the Caddy reverse_proxy target for a service.
+func upstreamFor(svc store.InstanceService, instanceID string) (string, error) {
+	switch svc.TargetType {
+	case "host_port":
+		// host_port targets like "127.0.0.1:8080" must be reached through the
+		// docker host bridge.
+		hp := svc.Target
+		if strings.HasPrefix(hp, "127.0.0.1:") || strings.HasPrefix(hp, "localhost:") {
+			parts := strings.SplitN(hp, ":", 2)
+			if len(parts) == 2 {
+				return "host.docker.internal:" + parts[1], nil
+			}
+		}
+		return hp, nil
+	case "docker_dns":
+		// Caller should set Target to "containerName:port" — we resolve
+		// container DNS automatically inside the obacht-edge network.
+		return svc.Target, nil
+	case "unix_socket":
+		return "", fmt.Errorf("unix_socket target not supported by ingress (instance %s)", instanceID)
+	default:
+		return "", fmt.Errorf("unknown target_type %q for instance %s", svc.TargetType, instanceID)
+	}
+}
+
+func (m *Manager) ensureCaddyContainer(ctx context.Context) error {
+	// Serialize so concurrent Bootstrap + Apply can't both try to create.
+	m.ensureMu.Lock()
+	defer m.ensureMu.Unlock()
+
+	// Try to start an existing container if it's stopped.
+	insp, err := m.docker.Inspect(ctx, ContainerName)
+	if err != nil {
+		return err
+	}
+	if insp != nil {
+		state, _ := insp["State"].(map[string]any)
+		running, _ := state["Running"].(bool)
+		if running {
+			// Make sure it is on the obacht-edge network.
+			if err := m.docker.ConnectContainerToNetwork(ctx, ContainerName, m.cfg.Network); err != nil {
+				m.log.Warn("connect caddy to network", "err", err)
+			}
+			return nil
+		}
+		// Container exists but isn't running — easiest to recreate.
+		if err := m.removeCaddyContainer(ctx); err != nil {
+			return fmt.Errorf("remove stopped caddy: %w", err)
+		}
+	}
+	if err := m.docker.PullImage(ctx, m.cfg.Image); err != nil {
+		return err
+	}
+	if err := m.createCaddyContainer(ctx); err != nil {
+		// Conflict (409) means another caller created it concurrently or a
+		// stale container with the same name exists. Try to remove + recreate
+		// once.
+		if strings.Contains(err.Error(), "create caddy 409") {
+			m.log.Warn("caddy create conflict; removing leftover and retrying", "err", err)
+			if rmErr := m.removeCaddyContainer(ctx); rmErr != nil {
+				return fmt.Errorf("remove conflicting caddy: %w", rmErr)
+			}
+			if err := m.createCaddyContainer(ctx); err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	if err := m.docker.ConnectContainerToNetwork(ctx, ContainerName, m.cfg.Network); err != nil {
+		m.log.Warn("connect caddy to network", "err", err)
+	}
+	return nil
+}
+
+func (m *Manager) removeCaddyContainer(ctx context.Context) error {
+	body, _ := json.Marshal(struct{}{})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+		"http://docker/v1.43/containers/"+ContainerName+"?force=true&v=false", bytes.NewReader(body))
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 204 || resp.StatusCode == 404 {
+		return nil
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("delete caddy %d: %s", resp.StatusCode, string(raw))
+}
+
+func (m *Manager) createCaddyContainer(ctx context.Context) error {
+	body := map[string]any{
+		"Image": m.cfg.Image,
+		"Cmd":   []string{"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"},
+		"Labels": map[string]string{
+			"obacht.managed": "1",
+			"obacht.role":    "ingress",
+		},
+		"ExposedPorts": map[string]struct{}{
+			"80/tcp":  {},
+			"443/tcp": {},
+		},
+		"HostConfig": map[string]any{
+			"Binds": []string{
+				m.paths.CaddyData + ":/data:rw",
+				m.paths.CaddyConfig + ":/etc/caddy:rw",
+			},
+			"PortBindings": map[string][]map[string]string{
+				"80/tcp":  {{"HostIp": "0.0.0.0", "HostPort": "80"}},
+				"443/tcp": {{"HostIp": "0.0.0.0", "HostPort": "443"}},
+			},
+			"NetworkMode":   m.cfg.Network,
+			"RestartPolicy": map[string]string{"Name": "unless-stopped"},
+		},
+	}
+	buf, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/containers/create?name="+ContainerName, bytes.NewReader(buf))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return fmt.Errorf("create caddy: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("create caddy %d: %s", resp.StatusCode, string(raw))
+	}
+	startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/containers/"+ContainerName+"/start", nil)
+	sresp, err := m.docker.HTTP().Do(startReq)
+	if err != nil {
+		return fmt.Errorf("start caddy: %w", err)
+	}
+	defer sresp.Body.Close()
+	if sresp.StatusCode != 204 && sresp.StatusCode != 304 {
+		raw, _ := io.ReadAll(sresp.Body)
+		return fmt.Errorf("start caddy %d: %s", sresp.StatusCode, string(raw))
+	}
+	// Give Caddy a moment to spin up before any reload.
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// reloadCaddy POSTs the on-disk Caddyfile to Caddy's admin API on the
+// container. We exec `caddy reload` inside the container so we do not have
+// to expose the admin port to the host.
+func (m *Manager) reloadCaddy(ctx context.Context) error {
+	// Use docker exec: POST /containers/{id}/exec then /exec/{id}/start.
+	body, _ := json.Marshal(map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Cmd":          []string{"caddy", "reload", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"},
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/containers/"+ContainerName+"/exec", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("exec create %d: %s", resp.StatusCode, string(raw))
+	}
+	var er struct{ Id string }
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		return err
+	}
+	startBody, _ := json.Marshal(map[string]any{"Detach": false, "Tty": false})
+	sReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/exec/"+er.Id+"/start", bytes.NewReader(startBody))
+	sReq.Header.Set("Content-Type", "application/json")
+	sResp, err := m.docker.HTTP().Do(sReq)
+	if err != nil {
+		return err
+	}
+	defer sResp.Body.Close()
+	out, _ := io.ReadAll(sResp.Body)
+
+	// Check exit code.
+	insReq, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://docker/v1.43/exec/"+er.Id+"/json", nil)
+	iResp, err := m.docker.HTTP().Do(insReq)
+	if err != nil {
+		return err
+	}
+	defer iResp.Body.Close()
+	var ins struct{ ExitCode int }
+	_ = json.NewDecoder(iResp.Body).Decode(&ins)
+	if ins.ExitCode != 0 {
+		return fmt.Errorf("caddy reload exit=%d output=%s", ins.ExitCode, sanitize(out))
+	}
+	return nil
+}
+
+func sha256Hex(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+func escape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
+// sanitize strips docker exec stream multiplexing prefix bytes so log output
+// stays readable. Best-effort.
+func sanitize(b []byte) string {
+	s := string(b)
+	// docker exec streams have an 8-byte header per chunk in TTY=false mode
+	// (we set TTY=false above). For our purposes a printable filter is enough.
+	out := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 32 && c < 127 {
+			out = append(out, c)
+		} else if c == '\n' {
+			out = append(out, '\n')
+		}
+	}
+	return strings.TrimSpace(string(out))
+}
