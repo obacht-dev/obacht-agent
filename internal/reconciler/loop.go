@@ -146,9 +146,13 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		if _, ok := desiredIDs[id]; ok {
 			continue
 		}
-		r.log.Info("removing orphan container", "instance", id, "container", c.Name)
-		if err := r.docker.Remove(ctx, id); err != nil {
+		removed, err := r.docker.Remove(ctx, id)
+		if err != nil {
 			r.log.Error("remove orphan", "instance", id, "err", err)
+			continue
+		}
+		if removed {
+			r.log.Info("removed orphan container", "instance", id, "container", c.Name)
 		}
 	}
 
@@ -178,14 +182,17 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 			r.log.Error("inject ipc", "instance", inst.ID, "err", err)
 			return
 		}
-		if err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec); err != nil {
+		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
+		if err != nil {
 			r.log.Error("apply instance", "instance", inst.ID, "err", err)
 			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
 				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
 			}
 			return
 		}
-		r.log.Info("applied", "instance", inst.ID, "template", inst.TemplateID)
+		if changed {
+			r.log.Info("applied", "instance", inst.ID, "template", inst.TemplateID)
+		}
 		// Reflect the container's runtime state back to the api so the user
 		// sees their install transition to "installed". Templates that opt
 		// into IPC may overwrite this with finer-grained values later.
@@ -197,11 +204,11 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 			r.log.Warn("record observed state", "instance", inst.ID, "err", err)
 		}
 	case store.DesiredStopped:
-		if err := r.docker.Remove(ctx, inst.ID); err != nil {
+		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("stop (remove) instance", "instance", inst.ID, "err", err)
 		}
 	case store.DesiredRemoved:
-		if err := r.docker.Remove(ctx, inst.ID); err != nil {
+		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove instance", "instance", inst.ID, "err", err)
 			return
 		}

@@ -207,19 +207,19 @@ func (d *Driver) List(ctx context.Context) ([]ManagedContainer, error) {
 }
 
 // Apply ensures a single container exists for the given instance, matching
-// the spec. If a container already exists with the same config hash and is
-// running it is left alone; otherwise it is recreated.
-func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec Spec) error {
+// the spec. Returns true if the container was created or recreated, false if
+// it was already correct (no-op).
+func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec Spec) (bool, error) {
 	hash := spec.hash()
 	containerName := "obacht-" + instanceID
 
 	existing, err := d.findByName(ctx, containerName)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if existing != nil {
 		if existing.Labels["obacht.config.hash"] == hash && existing.State == "running" {
-			return nil // already correct
+			return false, nil // already correct
 		}
 		d.log.Info("recreate container",
 			"instance", instanceID,
@@ -228,33 +228,34 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 			"hash_new", hash,
 		)
 		if err := d.removeContainer(ctx, existing.ID); err != nil {
-			return fmt.Errorf("remove stale container: %w", err)
+			return false, fmt.Errorf("remove stale container: %w", err)
 		}
 	}
 
 	if err := d.pullIfMissing(ctx, spec.Image); err != nil {
-		return fmt.Errorf("pull image %s: %w", spec.Image, err)
+		return false, fmt.Errorf("pull image %s: %w", spec.Image, err)
 	}
 
 	if err := d.create(ctx, containerName, instanceID, templateID, hash, spec); err != nil {
-		return fmt.Errorf("create container: %w", err)
+		return false, fmt.Errorf("create container: %w", err)
 	}
 	if err := d.start(ctx, containerName); err != nil {
-		return fmt.Errorf("start container: %w", err)
+		return false, fmt.Errorf("start container: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
-// Remove deletes the container for the given instance (if any).
-func (d *Driver) Remove(ctx context.Context, instanceID string) error {
+// Remove deletes the container for the given instance. Returns true if a
+// container was actually removed, false if there was nothing to remove.
+func (d *Driver) Remove(ctx context.Context, instanceID string) (bool, error) {
 	c, err := d.findByName(ctx, "obacht-"+instanceID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if c == nil {
-		return nil
+		return false, nil
 	}
-	return d.removeContainer(ctx, c.ID)
+	return true, d.removeContainer(ctx, c.ID)
 }
 
 // --- low-level helpers ---

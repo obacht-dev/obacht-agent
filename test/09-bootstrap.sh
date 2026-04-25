@@ -55,13 +55,14 @@ ssh "$PI_HOST" sudo bash -s -- \
 
 say "verifying device is registered as v2 in api"
 sleep 5
-DEV_JSON="$(curl -fsS -H "Authorization: Bearer $USER_JWT" "$API_URL/devices/$DEVICE_ID")"
+DEV_JSON="$(curl -fsS -H "Authorization: Bearer $USER_JWT" "$API_URL/devices/$DEVICE_ID/state/desired")"
 echo "$DEV_JSON" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 assert d.get("agent_v2") is True, f"agent_v2 not set: {d}"
-print("agent_version:", d.get("agent_version"))
-print("agent_last_seen:", d.get("agent_last_seen"))
+print("agent_v2:", d.get("agent_v2"))
+print("instances:", len(d.get("instances", [])))
+print("domains:", len(d.get("domains", [])))
 '
 
 say "bootstrap test passed"
