@@ -79,10 +79,16 @@ func main() {
 	}
 	log.Info("store ready", "schema_version", schema)
 
-	if err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg); err != nil && !errors.Is(err, bootstrap.ErrSkipped) {
+tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
+	if err != nil && !errors.Is(err, bootstrap.ErrSkipped) {
 		// Bootstrap failure is logged but not fatal: the device may simply
-		// have lost connectivity. Reconciler keeps running locally.
+		// have lost connectivity. Reconciler keeps running locally and the
+		// install token is reused as a fallback for ws auth.
 		log.Warn("bootstrap incomplete", "err", err)
+	}
+	authToken := ""
+	if tok != nil {
+		authToken = tok.Effective()
 	}
 
 	docker := container.New(*dockerSock)
@@ -126,13 +132,13 @@ func main() {
 	go rec.Run(ctx)
 
 	// Backend channel (Socket.IO v4). Skipped if no server configured.
-	if cfg.Server.URL != "" && cfg.Server.AuthToken != "" {
-		wsClient := api.New(cfg.Server.URL, cfg.Server.AuthToken, log.With("component", "ws"))
+	if cfg.Server.URL != "" && authToken != "" {
+		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"))
 		go wsClient.Run(ctx)
 		go syncer.Run(ctx)
 	} else {
-		log.Info("backend channel disabled (no server.url or server.authToken)")
+		log.Info("backend channel disabled (no server.url or auth token)")
 	}
 
 	<-ctx.Done()

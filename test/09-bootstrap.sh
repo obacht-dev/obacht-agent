@@ -24,7 +24,7 @@ say "issuing install token for $DEVICE_ID via api"
 TOKEN_RESP="$(curl -fsS -X POST \
   -H "Authorization: Bearer $USER_JWT" \
   -H 'Content-Type: application/json' \
-  "$API_URL/devices/$DEVICE_ID/install-token")"
+  "$API_URL/devices/$DEVICE_ID/install-token?force=true")"
 INSTALL_TOKEN="$(echo "$TOKEN_RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')"
 [ -n "$INSTALL_TOKEN" ] || { echo "failed to mint install token: $TOKEN_RESP" >&2; exit 1; }
 
@@ -39,13 +39,19 @@ rm -rf /opt/obacht-agent /etc/obacht /var/lib/obacht/agent-v2.db /run/obacht
 docker ps -aq --filter label=obacht.managed=1 | xargs -r docker rm -f
 WIPE
 
+if [ "$VERSION" = "latest" ]; then
+  INSTALL_SH_URL="https://github.com/$REPO/releases/latest/download/install.sh"
+else
+  INSTALL_SH_URL="https://github.com/$REPO/releases/download/$VERSION/install.sh"
+fi
+
 say "running install.sh on $PI_HOST"
 ssh "$PI_HOST" sudo bash -s -- \
   --device-id "$DEVICE_ID" \
   --token "$INSTALL_TOKEN" \
   --api-url "$API_URL" \
   --version "$VERSION" \
-  < <(curl -fsSL "https://github.com/$REPO/releases/download/$VERSION/install.sh")
+  < <(curl -fsSL "$INSTALL_SH_URL")
 
 say "verifying device is registered as v2 in api"
 sleep 5
