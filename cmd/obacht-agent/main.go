@@ -20,6 +20,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/bootstrap"
 	"github.com/obacht-dev/obacht-agent/internal/config"
+	"github.com/obacht-dev/obacht-agent/internal/files"
 	"github.com/obacht-dev/obacht-agent/internal/ingress"
 	"github.com/obacht-dev/obacht-agent/internal/ipc"
 	"github.com/obacht-dev/obacht-agent/internal/logging"
@@ -135,6 +136,7 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 	if cfg.Server.URL != "" && authToken != "" {
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"))
+		files.New(wsClient, st, log.With("component", "files")).Register()
 		go wsClient.Run(ctx)
 		go syncer.Run(ctx)
 	} else {
