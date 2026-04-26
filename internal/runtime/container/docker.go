@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -409,6 +410,15 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 		mode := "rw"
 		if v.ReadOnly {
 			mode = "ro"
+		} else {
+			// Pre-create the host directory with permissive perms. Templates
+			// like etherpad run as a non-root UID inside the container and
+			// would otherwise hit EACCES on the docker-created (root:root
+			// 0755) bind directory. 0777 is acceptable for our self-host
+			// model where the host fs is single-tenant per device.
+			if err := os.MkdirAll(v.Source, 0o777); err == nil {
+				_ = os.Chmod(v.Source, 0o777)
+			}
 		}
 		binds = append(binds, fmt.Sprintf("%s:%s:%s", v.Source, v.Target, mode))
 	}
