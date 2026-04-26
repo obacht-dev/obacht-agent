@@ -44,9 +44,10 @@ func DefaultSocketPath() string {
 
 // Driver wraps a Docker engine REST client.
 type Driver struct {
-	socket string
-	http   *http.Client
-	log    *slog.Logger
+	socket  string
+	http    *http.Client
+	pullCli *http.Client // long-running, no overall timeout (image pulls)
+	log     *slog.Logger
 }
 
 // New returns a Driver pointing at the given unix socket path.
@@ -61,9 +62,10 @@ func New(socketPath string) *Driver {
 		},
 	}
 	return &Driver{
-		socket: socketPath,
-		http:   &http.Client{Transport: tr, Timeout: 30 * time.Second},
-		log:    slog.Default().With("component", "docker"),
+		socket:  socketPath,
+		http:    &http.Client{Transport: tr, Timeout: 30 * time.Second},
+		pullCli: &http.Client{Transport: tr}, // image pulls can legitimately take minutes on arm/v7
+		log:     slog.Default().With("component", "docker"),
 	}
 }
 
@@ -325,12 +327,15 @@ func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
 		return nil
 	}
 
-	// Pull.
+	// Pull. Use the long-lived client because image pulls can legitimately
+	// take several minutes (uptime-kuma is ~400MB on arm64) and the 30s
+	// timeout on the default client kills the connection mid-stream — the
+	// pull then aborts silently and the next CreateContainer 404s.
 	q := url.Values{}
 	q.Set("fromImage", image)
 	pullReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, "http://docker/v1.43/images/create?"+q.Encode(), nil)
 	pullReq.Header.Set("X-Registry-Auth", "")
-	pullResp, err := d.http.Do(pullReq)
+	pullResp, err := d.pullCli.Do(pullReq)
 	if err != nil {
 		return err
 	}
