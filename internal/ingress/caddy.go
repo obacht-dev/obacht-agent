@@ -126,6 +126,11 @@ func (m *Manager) Apply(ctx context.Context) error {
 			m.log.Warn("set domain observed", "domain", d, "err", err)
 		}
 	}
+	// Refresh cert metadata (NotAfter + Issuer) from the on-disk PEM. Pure
+	// telemetry — the platform only learns expiry/issuer, never the key.
+	if err := m.ScanCerts(ctx); err != nil {
+		m.log.Debug("scan certs", "err", err)
+	}
 	return nil
 }
 

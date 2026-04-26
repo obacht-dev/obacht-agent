@@ -246,6 +246,9 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		DesiredStatus  string `json:"desired_status"`
 		ObservedStatus string `json:"observed_status,omitempty"`
 		LastError      string `json:"last_error,omitempty"`
+		CertNotAfter   int64  `json:"cert_not_after,omitempty"`
+		CertIssuer     string `json:"cert_issuer,omitempty"`
+		CertObserved   string `json:"cert_observed_state,omitempty"`
 	}
 
 	instances := make([]instOut, 0, len(insts))
@@ -267,11 +270,30 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		bindings = append(bindings, bindOut{Domain: b.Domain, InstanceID: b.InstanceID, ServiceName: b.ServiceName})
 	}
 	doms := make([]domOut, 0, len(domains))
+	now := time.Now()
 	for _, d := range domains {
-		doms = append(doms, domOut{
+		o := domOut{
 			Domain: d.Domain, DesiredStatus: d.DesiredStatus,
 			ObservedStatus: d.ObservedStatus, LastError: d.LastError,
-		})
+			CertIssuer: d.CertIssuer,
+		}
+		if !d.CertNotAfter.IsZero() {
+			o.CertNotAfter = d.CertNotAfter.Unix()
+			// derive a coarse-grained cert state for the UI: the platform
+			// itself never holds the key, so the agent has to label it.
+			delta := d.CertNotAfter.Sub(now)
+			switch {
+			case delta <= 0:
+				o.CertObserved = "expired"
+			case delta < 14*24*time.Hour:
+				o.CertObserved = "expiring"
+			default:
+				o.CertObserved = "active"
+			}
+		} else if d.ObservedStatus == "claiming" || d.ObservedStatus == "ready" {
+			o.CertObserved = "pending"
+		}
+		doms = append(doms, o)
 	}
 
 	payload := map[string]any{

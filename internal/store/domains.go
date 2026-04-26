@@ -24,6 +24,7 @@ type Domain struct {
 	DesiredStatus   string
 	ObservedStatus  string
 	CertNotAfter    time.Time
+	CertIssuer      string
 	LastError       string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -90,6 +91,19 @@ func (s *Store) SetDomainCertNotAfter(ctx context.Context, domain string, notAft
 	return err
 }
 
+// SetDomainCert records the cert expiry timestamp + issuer the agent
+// observed (by parsing Caddy's on-disk PEM, never by exfiltrating the key).
+func (s *Store) SetDomainCert(ctx context.Context, domain string, notAfter time.Time, issuer string) error {
+	v := int64(0)
+	if !notAfter.IsZero() {
+		v = notAfter.Unix()
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE domains SET cert_not_after = ?, cert_issuer = ?, updated_at = ? WHERE domain = ?`,
+		v, issuer, time.Now().Unix(), domain)
+	return err
+}
+
 // DeleteDomain removes the domain row (cascades to ingress_bindings).
 func (s *Store) DeleteDomain(ctx context.Context, domain string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM domains WHERE domain = ?`, domain)
@@ -103,6 +117,7 @@ func (s *Store) ListDomains(ctx context.Context) ([]Domain, error) {
 		       COALESCE(desired_status, status, ''),
 		       COALESCE(observed_status, ''),
 		       COALESCE(cert_not_after, 0),
+		       COALESCE(cert_issuer, ''),
 		       COALESCE(last_error, ''),
 		       created_at, updated_at
 		FROM domains ORDER BY domain ASC`)
@@ -117,7 +132,7 @@ func (s *Store) ListDomains(ctx context.Context) ([]Domain, error) {
 			notAfter    int64
 			created, ua int64
 		)
-		if err := rows.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.LastError, &created, &ua); err != nil {
+		if err := rows.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &created, &ua); err != nil {
 			return nil, err
 		}
 		if notAfter > 0 {
@@ -137,6 +152,7 @@ func (s *Store) GetDomain(ctx context.Context, domain string) (*Domain, error) {
 		       COALESCE(desired_status, status, ''),
 		       COALESCE(observed_status, ''),
 		       COALESCE(cert_not_after, 0),
+		       COALESCE(cert_issuer, ''),
 		       COALESCE(last_error, ''),
 		       created_at, updated_at
 		FROM domains WHERE domain = ?`, domain)
@@ -145,7 +161,7 @@ func (s *Store) GetDomain(ctx context.Context, domain string) (*Domain, error) {
 		notAfter    int64
 		created, ua int64
 	)
-	if err := row.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.LastError, &created, &ua); err != nil {
+	if err := row.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &created, &ua); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
