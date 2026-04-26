@@ -21,6 +21,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/store"
+	"github.com/obacht-dev/obacht-agent/internal/telemetry"
 )
 
 // Triggerable is the subset of *reconciler.Reconciler we depend on.
@@ -37,20 +38,24 @@ type Syncer struct {
 	deviceID     string
 	agentVersion string
 
-	pushEvery time.Duration
+	pushEvery      time.Duration
+	telemetryEvery time.Duration
+	telemetry      telemetry.Collector
 }
 
 // New constructs a Syncer. agentVersion should be the build version baked
 // into the binary (or "dev" for local builds).
 func New(client *api.Client, st *store.Store, rec Triggerable, deviceID, agentVersion string, log *slog.Logger) *Syncer {
 	return &Syncer{
-		client:       client,
-		store:        st,
-		rec:          rec,
-		log:          log,
-		deviceID:     deviceID,
-		agentVersion: agentVersion,
-		pushEvery:    30 * time.Second,
+		client:         client,
+		store:          st,
+		rec:            rec,
+		log:            log,
+		deviceID:       deviceID,
+		agentVersion:   agentVersion,
+		pushEvery:      30 * time.Second,
+		telemetryEvery: 30 * time.Second,
+		telemetry:      telemetry.NewCollector(),
 	}
 }
 
@@ -65,6 +70,10 @@ func (s *Syncer) Run(ctx context.Context) {
 		// Push observed state immediately on connect so the backend has a
 		// fresh snapshot without waiting for the first tick.
 		s.pushObserved(ctx)
+		// Also push telemetry immediately so the backend marks the device
+		// as is_setup_complete=true and the dashboard clears the
+		// "Setup Required" banner without waiting up to 30s.
+		s.pushTelemetry(ctx)
 	})
 
 	s.client.On("agent:upsert_instance", s.handleUpsertInstance)
@@ -76,13 +85,35 @@ func (s *Syncer) Run(ctx context.Context) {
 
 	t := time.NewTicker(s.pushEvery)
 	defer t.Stop()
+	telem := time.NewTicker(s.telemetryEvery)
+	defer telem.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 			s.pushObserved(ctx)
+		case <-telem.C:
+			s.pushTelemetry(ctx)
 		}
+	}
+}
+
+// pushTelemetry collects host metrics and emits the "telemetry" WS event.
+// Wire format matches obacht-api's TelemetryUpdate DTO. The first successful
+// push has the side effect of marking devices.is_setup_complete=true on the
+// backend (see api MetricsService.markSetupComplete).
+func (s *Syncer) pushTelemetry(ctx context.Context) {
+	if !s.client.Connected() || s.telemetry == nil {
+		return
+	}
+	sample, err := s.telemetry.Collect()
+	if err != nil {
+		s.log.Debug("telemetry collect skipped", "err", err)
+		return
+	}
+	if err := s.client.Emit("telemetry", sample); err != nil {
+		s.log.Warn("emit telemetry", "err", err)
 	}
 }
 
