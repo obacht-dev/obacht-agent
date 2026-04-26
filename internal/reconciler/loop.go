@@ -193,6 +193,23 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 		if changed {
 			r.log.Info("applied", "instance", inst.ID, "template", inst.TemplateID)
 		}
+		// Register the manifest's named services so ingress bindings can
+		// route. We do this every reconcile (UpsertService is idempotent) so
+		// agent restarts and config drift converge cleanly.
+		for _, svc := range spec.Services {
+			if svc.Name == "" || svc.TargetPort == 0 {
+				continue
+			}
+			target := fmt.Sprintf("obacht-%s:%d", inst.ID, svc.TargetPort)
+			if err := r.store.UpsertService(ctx, store.InstanceService{
+				InstanceID:  inst.ID,
+				ServiceName: svc.Name,
+				TargetType:  "docker_dns",
+				Target:      target,
+			}); err != nil {
+				r.log.Warn("upsert service", "instance", inst.ID, "service", svc.Name, "err", err)
+			}
+		}
 		// Reflect the container's runtime state back to the api so the user
 		// sees their install transition to "installed". Templates that opt
 		// into IPC may overwrite this with finer-grained values later.

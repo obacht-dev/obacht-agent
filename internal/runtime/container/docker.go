@@ -94,13 +94,23 @@ func (d *Driver) Ping(ctx context.Context) error {
 // Spec is the minimal description of a single container we know how to run.
 // Stored per-instance as JSON in instances.config_json.
 type Spec struct {
-	Image   string            `json:"image"`
-	Env     map[string]string `json:"env,omitempty"`
-	Ports   []PortMap         `json:"ports,omitempty"`
-	Volumes []VolumeMount     `json:"volumes,omitempty"`
-	Network string            `json:"network,omitempty"`
-	Cmd     []string          `json:"cmd,omitempty"`
-	Labels  map[string]string `json:"labels,omitempty"`
+	Image    string            `json:"image"`
+	Env      map[string]string `json:"env,omitempty"`
+	Ports    []PortMap         `json:"ports,omitempty"`
+	Volumes  []VolumeMount     `json:"volumes,omitempty"`
+	Network  string            `json:"network,omitempty"`
+	Cmd      []string          `json:"cmd,omitempty"`
+	Labels   map[string]string `json:"labels,omitempty"`
+	Services []ServiceSpec     `json:"services,omitempty"`
+}
+
+// ServiceSpec declares a named service exposed by the container that the
+// ingress layer can route domain traffic to. targetType="container_port"
+// resolves via docker DNS on the shared edge network.
+type ServiceSpec struct {
+	Name       string `json:"name"`
+	TargetType string `json:"targetType,omitempty"`
+	TargetPort int    `json:"targetPort"`
 }
 
 // PortMap maps a host port to a container port (TCP only for v1).
