@@ -371,6 +371,7 @@ type bindingReq struct {
 	Domain      string `json:"domain"`
 	InstanceID  string `json:"instance_id"`
 	ServiceName string `json:"service_name"`
+	LocalPort   int    `json:"local_port"`
 	Mode        string `json:"mode"`
 	PathPrefix  string `json:"path_prefix"`
 }
@@ -385,6 +386,7 @@ func (s *Server) adminUpsertBinding(w http.ResponseWriter, r *http.Request) {
 		Domain:      body.Domain,
 		InstanceID:  body.InstanceID,
 		ServiceName: body.ServiceName,
+		LocalPort:   body.LocalPort,
 		Mode:        body.Mode,
 		PathPrefix:  body.PathPrefix,
 	}); err != nil {

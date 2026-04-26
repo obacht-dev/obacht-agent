@@ -190,11 +190,12 @@ func (s *Syncer) pullDesired(ctx context.Context) {
 			s.log.Warn("pull: upsert domain", "domain", d.Domain, "err", err)
 			continue
 		}
-		if d.Binding != nil && d.Binding.InstanceID != "" {
+		if d.Binding != nil && (d.Binding.InstanceID != "" || d.Binding.LocalPort > 0) {
 			b := store.IngressBinding{
 				Domain:      d.Domain,
 				InstanceID:  d.Binding.InstanceID,
 				ServiceName: d.Binding.Service,
+				LocalPort:   d.Binding.LocalPort,
 			}
 			if err := s.store.UpsertBinding(ctx, b); err != nil {
 				s.log.Warn("pull: upsert binding", "domain", d.Domain, "err", err)
@@ -240,6 +241,7 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		Domain      string `json:"domain"`
 		InstanceID  string `json:"instance_id"`
 		ServiceName string `json:"service"`
+		LocalPort   int    `json:"local_port,omitempty"`
 	}
 	type domOut struct {
 		Domain         string `json:"domain"`
@@ -267,7 +269,7 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 	}
 	bindings := make([]bindOut, 0, len(binds))
 	for _, b := range binds {
-		bindings = append(bindings, bindOut{Domain: b.Domain, InstanceID: b.InstanceID, ServiceName: b.ServiceName})
+		bindings = append(bindings, bindOut{Domain: b.Domain, InstanceID: b.InstanceID, ServiceName: b.ServiceName, LocalPort: b.LocalPort})
 	}
 	doms := make([]domOut, 0, len(domains))
 	now := time.Now()
@@ -379,17 +381,23 @@ func (s *Syncer) handleUpsertBinding(args []json.RawMessage) {
 		Domain     string `json:"domain"`
 		InstanceID string `json:"instance_id"`
 		Service    string `json:"service"`
+		LocalPort  int    `json:"local_port"`
 	}
 	if err := json.Unmarshal(args[0], &p); err != nil || p.Domain == "" {
 		s.log.Warn("decode upsert_binding", "err", err)
 		return
 	}
-	b := store.IngressBinding{Domain: p.Domain, InstanceID: p.InstanceID, ServiceName: p.Service}
+	b := store.IngressBinding{
+		Domain:      p.Domain,
+		InstanceID:  p.InstanceID,
+		ServiceName: p.Service,
+		LocalPort:   p.LocalPort,
+	}
 	if err := s.store.UpsertBinding(context.Background(), b); err != nil {
 		s.log.Warn("upsert binding", "domain", p.Domain, "err", err)
 		return
 	}
-	s.log.Info("ws upsert binding", "domain", p.Domain, "instance", p.InstanceID, "service", p.Service)
+	s.log.Info("ws upsert binding", "domain", p.Domain, "instance", p.InstanceID, "service", p.Service, "local_port", p.LocalPort)
 	s.rec.Trigger()
 }
 

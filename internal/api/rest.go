@@ -40,6 +40,7 @@ type DesiredDomain struct {
 type DesiredDomainBinding struct {
 	InstanceID string `json:"instance_id"`
 	Service    string `json:"service"`
+	LocalPort  int    `json:"local_port,omitempty"`
 }
 
 // FetchDesiredState performs a GET /devices/:id/state/desired against the

@@ -229,27 +229,40 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 
 		fmt.Fprintf(&b, "%s {\n", d.Domain)
 		if hasBinding {
-			svc, ok := svcMap[svcKey(bind.InstanceID, bind.ServiceName)]
-			if !ok {
-				// Binding points at a missing service — fall back to a
-				// helpful 503 so we still get a cert and a clear error.
-				fmt.Fprintf(&b, "\trespond \"obacht: binding %s/%s has no registered service yet\" 503\n",
-					bind.InstanceID, bind.ServiceName)
+			var (
+				upstream string
+				upErr    error
+			)
+			if bind.LocalPort > 0 {
+				// Local-port reverse proxy: target a host port (a service the
+				// user runs directly on the Pi, outside obacht's container
+				// runtime). Caddy is itself in a container, so we go via the
+				// docker host gateway alias.
+				upstream = fmt.Sprintf("host.docker.internal:%d", bind.LocalPort)
+			} else {
+				svc, ok := svcMap[svcKey(bind.InstanceID, bind.ServiceName)]
+				if !ok {
+					// Binding points at a missing service — fall back to a
+					// helpful 503 so we still get a cert and a clear error.
+					fmt.Fprintf(&b, "\trespond \"obacht: binding %s/%s has no registered service yet\" 503\n",
+						bind.InstanceID, bind.ServiceName)
+					summary.observed[d.Domain] = store.DomainStatusReady
+					b.WriteString("}\n\n")
+					continue
+				}
+				upstream, upErr = upstreamFor(svc, bind.InstanceID)
+			}
+			if upErr != nil {
+				fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(upErr.Error()))
 				summary.observed[d.Domain] = store.DomainStatusReady
 			} else {
-				upstream, err := upstreamFor(svc, bind.InstanceID)
-				if err != nil {
-					fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(err.Error()))
-					summary.observed[d.Domain] = store.DomainStatusReady
+				if bind.Mode == "path" && bind.PathPrefix != "" {
+					fmt.Fprintf(&b, "\thandle %s* {\n\t\treverse_proxy %s\n\t}\n", bind.PathPrefix, upstream)
 				} else {
-					if bind.Mode == "path" && bind.PathPrefix != "" {
-						fmt.Fprintf(&b, "\thandle %s* {\n\t\treverse_proxy %s\n\t}\n", bind.PathPrefix, upstream)
-					} else {
-						fmt.Fprintf(&b, "\treverse_proxy %s\n", upstream)
-					}
-					summary.bound++
-					summary.observed[d.Domain] = store.DomainStatusBound
+					fmt.Fprintf(&b, "\treverse_proxy %s\n", upstream)
 				}
+				summary.bound++
+				summary.observed[d.Domain] = store.DomainStatusBound
 			}
 		} else {
 			b.WriteString("\trespond \"obacht: domain ready, no app bound yet\" 200\n")
@@ -291,6 +304,23 @@ func upstreamFor(svc store.InstanceService, instanceID string) (string, error) {
 	}
 }
 
+// hasHostGatewayExtraHost returns true if the inspected container already
+// carries the `host.docker.internal:host-gateway` mapping we need to reach
+// host-port reverse-proxy targets from inside the Caddy container.
+func hasHostGatewayExtraHost(insp map[string]any) bool {
+	hc, _ := insp["HostConfig"].(map[string]any)
+	if hc == nil {
+		return false
+	}
+	hosts, _ := hc["ExtraHosts"].([]any)
+	for _, h := range hosts {
+		if s, _ := h.(string); strings.HasPrefix(s, "host.docker.internal:") {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) ensureCaddyContainer(ctx context.Context) error {
 	// Serialize so concurrent Bootstrap + Apply can't both try to create.
 	m.ensureMu.Lock()
@@ -305,15 +335,25 @@ func (m *Manager) ensureCaddyContainer(ctx context.Context) error {
 		state, _ := insp["State"].(map[string]any)
 		running, _ := state["Running"].(bool)
 		if running {
-			// Make sure it is on the obacht-edge network.
-			if err := m.docker.ConnectContainerToNetwork(ctx, ContainerName, m.cfg.Network); err != nil {
-				m.log.Warn("connect caddy to network", "err", err)
+			// Detect config drift from older agent versions and recreate if
+			// the running container is missing settings we now require.
+			if !hasHostGatewayExtraHost(insp) {
+				m.log.Info("recreating caddy container to apply host-gateway extra host")
+				if err := m.removeCaddyContainer(ctx); err != nil {
+					return fmt.Errorf("remove drifted caddy: %w", err)
+				}
+			} else {
+				// Make sure it is on the obacht-edge network.
+				if err := m.docker.ConnectContainerToNetwork(ctx, ContainerName, m.cfg.Network); err != nil {
+					m.log.Warn("connect caddy to network", "err", err)
+				}
+				return nil
 			}
-			return nil
-		}
-		// Container exists but isn't running — easiest to recreate.
-		if err := m.removeCaddyContainer(ctx); err != nil {
-			return fmt.Errorf("remove stopped caddy: %w", err)
+		} else {
+			// Container exists but isn't running — easiest to recreate.
+			if err := m.removeCaddyContainer(ctx); err != nil {
+				return fmt.Errorf("remove stopped caddy: %w", err)
+			}
 		}
 	}
 	if err := m.docker.PullImage(ctx, m.cfg.Image); err != nil {
@@ -374,6 +414,10 @@ func (m *Manager) createCaddyContainer(ctx context.Context) error {
 				m.paths.CaddyData + ":/data:rw",
 				m.paths.CaddyConfig + ":/etc/caddy:rw",
 			},
+			// Resolve host.docker.internal to the docker bridge gateway so
+			// "local-port" reverse-proxy bindings (and host_port services)
+			// can reach services running directly on the Pi.
+			"ExtraHosts": []string{"host.docker.internal:host-gateway"},
 			"PortBindings": map[string][]map[string]string{
 				"80/tcp":  {{"HostIp": "0.0.0.0", "HostPort": "80"}},
 				"443/tcp": {{"HostIp": "0.0.0.0", "HostPort": "443"}},

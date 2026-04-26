@@ -31,10 +31,15 @@ type Domain struct {
 }
 
 // IngressBinding is one row in `ingress_bindings`.
+//
+// Either (InstanceID + ServiceName) OR LocalPort identifies the upstream:
+//   - service binding:  InstanceID + ServiceName set, LocalPort == 0
+//   - local-port proxy: LocalPort > 0,  InstanceID/ServiceName empty
 type IngressBinding struct {
 	Domain      string
 	InstanceID  string
 	ServiceName string
+	LocalPort   int
 	Mode        string
 	PathPrefix  string
 }
@@ -180,21 +185,35 @@ func (s *Store) GetDomain(ctx context.Context, domain string) (*Domain, error) {
 // UpsertBinding sets the ingress binding for a domain. Replaces any prior
 // binding (one binding per domain in v1).
 func (s *Store) UpsertBinding(ctx context.Context, b IngressBinding) error {
-	if b.Domain == "" || b.InstanceID == "" || b.ServiceName == "" {
-		return errors.New("domain, instance_id, service_name required")
+	if b.Domain == "" {
+		return errors.New("domain required")
+	}
+	hasService := b.InstanceID != "" && b.ServiceName != ""
+	hasLocal := b.LocalPort > 0
+	if !hasService && !hasLocal {
+		return errors.New("binding needs either instance_id+service_name or local_port")
+	}
+	if hasService && hasLocal {
+		return errors.New("binding cannot set both instance/service and local_port")
 	}
 	if b.Mode == "" {
 		b.Mode = "root"
 	}
+	var instPtr, svcPtr any
+	if hasService {
+		instPtr = b.InstanceID
+		svcPtr = b.ServiceName
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO ingress_bindings(domain, instance_id, service_name, mode, path_prefix)
-		VALUES(?, ?, ?, ?, ?)
+		INSERT INTO ingress_bindings(domain, instance_id, service_name, local_port, mode, path_prefix)
+		VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT(domain) DO UPDATE SET
 			instance_id  = excluded.instance_id,
 			service_name = excluded.service_name,
+			local_port   = excluded.local_port,
 			mode         = excluded.mode,
 			path_prefix  = excluded.path_prefix
-	`, b.Domain, b.InstanceID, b.ServiceName, b.Mode, b.PathPrefix)
+	`, b.Domain, instPtr, svcPtr, b.LocalPort, b.Mode, b.PathPrefix)
 	if err != nil {
 		return fmt.Errorf("upsert binding %s: %w", b.Domain, err)
 	}
@@ -210,7 +229,12 @@ func (s *Store) DeleteBinding(ctx context.Context, domain string) error {
 // ListBindings returns every binding.
 func (s *Store) ListBindings(ctx context.Context) ([]IngressBinding, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT domain, instance_id, service_name, mode, COALESCE(path_prefix,'')
+		SELECT domain,
+		       COALESCE(instance_id,''),
+		       COALESCE(service_name,''),
+		       COALESCE(local_port,0),
+		       mode,
+		       COALESCE(path_prefix,'')
 		FROM ingress_bindings ORDER BY domain ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list bindings: %w", err)
@@ -219,7 +243,7 @@ func (s *Store) ListBindings(ctx context.Context) ([]IngressBinding, error) {
 	var out []IngressBinding
 	for rows.Next() {
 		var b IngressBinding
-		if err := rows.Scan(&b.Domain, &b.InstanceID, &b.ServiceName, &b.Mode, &b.PathPrefix); err != nil {
+		if err := rows.Scan(&b.Domain, &b.InstanceID, &b.ServiceName, &b.LocalPort, &b.Mode, &b.PathPrefix); err != nil {
 			return nil, err
 		}
 		out = append(out, b)
