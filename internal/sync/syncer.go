@@ -275,6 +275,21 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		"bindings":  bindings,
 		"domains":   doms,
 	}
+
+	// Surface the agent's system toggles to the backend so the UI can
+	// render the *real* current state of power_mode / security_mode
+	// instead of a fire-and-confirm shadow. We pull from system_settings
+	// kv (the same source `obachtctl system status` reads).
+	//
+	// SECURITY: keep this map tightly scoped — it lands in the device row
+	// in plaintext. Do not add anything secret-shaped here. If you need
+	// to add a new setting, route it through internal/redact first.
+	if settings, err := s.store.AllSystemSettings(ctx); err == nil {
+		payload["system"] = map[string]any{
+			"power_mode":    settings["power_mode"] == "true",
+			"security_mode": settings["security_mode"],
+		}
+	}
 	if err := s.client.Emit("agent:observed_state", payload); err != nil {
 		s.log.Debug("emit observed_state", "err", err)
 	}
