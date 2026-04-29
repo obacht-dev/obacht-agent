@@ -116,7 +116,7 @@ echo "==> verifying checksum"
 ( cd "$tmpdir" && sha256sum -c "$asset.sha256" )
 
 echo "==> installing to $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR"
+mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" /var/log/obacht
 tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 src_dir="$(find "$tmpdir" -maxdepth 1 -type d -name 'obacht-agent_*' | head -1)"
 install -m 0755 "$src_dir/obacht-agent" "$INSTALL_DIR/obacht-agent"
@@ -152,6 +152,13 @@ if getent group systemd-journal >/dev/null 2>&1; then
 fi
 chown -R obacht:obacht "$STATE_DIR" "$RUNTIME_DIR"
 chown obacht:obacht "$CONFIG_DIR"
+# S1/S5: audit log lives under /var/log/obacht. Owned by obacht so the
+# unprivileged agent can append; group `adm` (when present) lets ops
+# read the log without sudo, mirroring journald conventions.
+log_group="obacht"
+if getent group adm >/dev/null 2>&1; then log_group="adm"; fi
+chown -R "obacht:$log_group" /var/log/obacht
+chmod 0750 /var/log/obacht
 
 # ---------------------------------------------------------------------------
 # S5.4: scrub the v1 NOPASSWD:ALL sudoers fragment if it's still around.
