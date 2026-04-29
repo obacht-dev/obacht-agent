@@ -43,6 +43,8 @@ func main() {
 		rt.cmdHealth(ctx)
 	case "instance":
 		rt.cmdInstance(ctx, args[1:])
+	case "template":
+		rt.cmdTemplate(ctx, args[1:])
 	case "domain":
 		rt.cmdDomain(ctx, args[1:])
 	case "ingress":
@@ -456,7 +458,7 @@ func (r *runtime) cmdAudit(ctx context.Context, args []string) {
 
 func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 	if len(args) == 0 {
-		die("usage: obachtctl system <status>")
+		die("usage: obachtctl system <status|set-power-mode>")
 	}
 	switch args[0] {
 	case "status":
@@ -466,9 +468,112 @@ func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 			die("%v", err)
 		}
 		emit(code, body)
+	case "set-power-mode":
+		r.systemSetPowerMode(ctx, args[1:])
 	default:
 		die("unknown system subcommand: %s", args[0])
 	}
+}
+
+// systemSetPowerMode toggles the power_mode flag in system_settings.
+// The install-plan unlock-power step shells out to this. Power mode
+// itself doesn't grant the agent any new capability today (S2.3) — it
+// is the gate Phase S5 will check before unlocking restricted commands.
+func (r *runtime) systemSetPowerMode(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("system set-power-mode", flag.ExitOnError)
+	enable := fs.Bool("enable", false, "enable power mode")
+	disable := fs.Bool("disable", false, "disable power mode")
+	_ = fs.Bool("json", false, "output JSON (default)")
+	_ = fs.Parse(args)
+	if *enable == *disable {
+		die("exactly one of --enable / --disable is required")
+	}
+	val := "false"
+	if *enable {
+		val = "true"
+	}
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/system/settings", map[string]any{
+		"key":   "power_mode",
+		"value": val,
+	})
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+// cmdTemplate is the install-plan-friendly façade over instance+ipc.
+// The api builds plans like `template install --id static-site --instance
+// blog --json [--version v] [--config-json {...}]` so the ssh-gateway
+// can run them verbatim. Keeping the cli surface stable across the
+// install-plan boundary means the api can be changed without re-rolling
+// agents on every Pi.
+func (r *runtime) cmdTemplate(ctx context.Context, args []string) {
+	if len(args) == 0 {
+		die("usage: obachtctl template <install|uninstall>")
+	}
+	switch args[0] {
+	case "install":
+		r.templateInstall(ctx, args[1:])
+	case "uninstall":
+		r.templateUninstall(ctx, args[1:])
+	default:
+		die("unknown template subcommand: %s", args[0])
+	}
+}
+
+func (r *runtime) templateInstall(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("template install", flag.ExitOnError)
+	tid := fs.String("id", "", "template id (required)")
+	iid := fs.String("instance", "", "instance id (required)")
+	version := fs.String("version", "", "version tag")
+	configJSON := fs.String("config-json", "", "materialized container spec as JSON string")
+	_ = fs.Bool("json", false, "output JSON (default)")
+	_ = fs.Parse(args)
+	if *tid == "" || *iid == "" {
+		die("--id and --instance are required")
+	}
+	var configRaw any
+	if *configJSON != "" {
+		if err := json.Unmarshal([]byte(*configJSON), &configRaw); err != nil {
+			die("--config-json is not valid JSON: %v", err)
+		}
+	}
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/instances", map[string]any{
+		"id":            *iid,
+		"template_id":   *tid,
+		"runtime":       "container",
+		"version":       *version,
+		"desired_state": "installed",
+		"config":        configRaw,
+	})
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+func (r *runtime) templateUninstall(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("template uninstall", flag.ExitOnError)
+	iid := fs.String("instance", "", "instance id (required)")
+	hard := fs.Bool("hard", false, "delete row outright")
+	_ = fs.Bool("json", false, "output JSON (default)")
+	_ = fs.Parse(args)
+	if *iid == "" {
+		die("--instance is required")
+	}
+	r.requireIPC()
+	path := "/v1/admin/instances/" + *iid
+	if *hard {
+		path += "?hard=1"
+	}
+	code, body, err := r.doIPC(ctx, http.MethodDelete, path, nil)
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
 }
 
 func (r *runtime) requireIPC() {

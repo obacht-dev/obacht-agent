@@ -167,6 +167,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// Phase S1: audit + system introspection.
 	mux.HandleFunc("GET /v1/admin/audit", s.adminAuditTail)
 	mux.HandleFunc("GET /v1/system/status", s.systemStatus)
+	// Phase S3: power-mode toggle (writes to system_settings via audit hook).
+	mux.HandleFunc("POST /v1/admin/system/settings", s.adminSetSystemSetting)
 
 	// Template (Bearer per-instance secret required).
 	mux.HandleFunc("GET /v1/template/self", s.templateSelf)
@@ -649,4 +651,50 @@ func (s *Server) systemStatus(w http.ResponseWriter, r *http.Request) {
 		"now":            time.Now().Unix(),
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// --- Phase S3: system settings (power-mode toggle) ---
+
+// adminSetSystemSetting writes a single key into the system_settings table.
+// We restrict it to a small allow-list so a compromised actor with IPC
+// access can't abuse it as a generic kv store.
+func (s *Server) adminSetSystemSetting(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	allowed := map[string]bool{
+		"power_mode":    true,
+		"security_mode": true,
+	}
+	if !allowed[body.Key] {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("setting %q is not writable", body.Key))
+		return
+	}
+	if err := s.store.SetSystemSetting(r.Context(), body.Key, body.Value); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{
+			Op:            "system.setting.set",
+			Actor:         "obachtctl",
+			Target:        body.Key,
+			Result:        audit.ResultError,
+			ParamsSummary: "value=" + body.Value,
+			Params:        map[string]any{"key": body.Key, "value": body.Value},
+			ErrorMessage:  err.Error(),
+		})
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{
+		Op:            "system.setting.set",
+		Actor:         "obachtctl",
+		Target:        body.Key,
+		Result:        audit.ResultOK,
+		ParamsSummary: "value=" + body.Value,
+		Params:        map[string]any{"key": body.Key, "value": body.Value},
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": body.Key, "value": body.Value})
 }
