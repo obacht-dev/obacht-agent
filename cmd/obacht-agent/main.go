@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
+	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/bootstrap"
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/files"
@@ -80,6 +81,20 @@ func main() {
 	}
 	log.Info("store ready", "schema_version", schema)
 
+	auditW, err := audit.New(st, cfg.Paths.AuditLog)
+	if err != nil {
+		log.Error("open audit log", "err", err, "path", cfg.Paths.AuditLog)
+		os.Exit(1)
+	}
+	defer auditW.Close()
+	log.Info("audit log ready", "path", cfg.Paths.AuditLog)
+	_ = auditW.Append(ctx, audit.Entry{
+		Op:            "agent.start",
+		Actor:         "agent",
+		ParamsSummary: "version=" + agentVersion,
+		Params:        map[string]any{"version": agentVersion},
+	})
+
 tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
 	if err != nil && !errors.Is(err, bootstrap.ErrSkipped) {
 		// Bootstrap failure is logged but not fatal: the device may simply
@@ -125,6 +140,8 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 
 	ipcSrv := ipc.New(cfg.Paths.Socket, st, rec, log.With("component", "ipc"))
 	ipcSrv.SetIngress(ingMgr)
+	ipcSrv.SetAudit(auditW)
+	ipcSrv.SetVersion(agentVersion)
 	if err := ipcSrv.Listen(ctx); err != nil {
 		log.Error("ipc listen", "err", err)
 		os.Exit(1)

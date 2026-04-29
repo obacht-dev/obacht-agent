@@ -36,6 +36,7 @@ type PathsConfig struct {
 	Socket      string `yaml:"socket"`      // unix socket for IPC + agentctl
 	CaddyData   string `yaml:"caddyData"`   // /var/lib/obacht/caddy/data
 	CaddyConfig string `yaml:"caddyConfig"` // /var/lib/obacht/caddy/config
+	AuditLog    string `yaml:"auditLog"`    // append-only JSONL audit log
 }
 
 type IngressConfig struct {
@@ -74,6 +75,16 @@ func DefaultSocket() string {
 	return "/run/obacht/agent.sock"
 }
 
+// DefaultAuditLog returns the canonical audit log path for the host OS.
+func DefaultAuditLog() string {
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Application Support", "obacht", "audit.log")
+		}
+	}
+	return "/var/log/obacht/audit.log"
+}
+
 // Load reads a config file. Returns a zero-value config + nil error if the
 // file does not exist (caller may decide whether that is fatal).
 func Load(path string) (*Config, error) {
@@ -109,6 +120,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Paths.CaddyConfig == "" {
 		c.Paths.CaddyConfig = "/var/lib/obacht/caddy/config"
+	}
+	if c.Paths.AuditLog == "" {
+		c.Paths.AuditLog = DefaultAuditLog()
 	}
 	if c.Ingress.Image == "" {
 		c.Ingress.Image = "caddy:2-alpine"

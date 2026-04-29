@@ -49,6 +49,10 @@ func main() {
 		rt.cmdIngress(ctx, args[1:])
 	case "reconcile":
 		rt.cmdReconcile(ctx, args[1:])
+	case "audit":
+		rt.cmdAudit(ctx, args[1:])
+	case "system":
+		rt.cmdSystem(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", args[0])
 		usage(os.Stderr)
@@ -435,6 +439,38 @@ func (r *runtime) cmdIngress(ctx context.Context, args []string) {
 	emit(code, body)
 }
 
+func (r *runtime) cmdAudit(ctx context.Context, args []string) {
+	if len(args) == 0 || args[0] != "tail" {
+		die("usage: obachtctl audit tail [--n N]")
+	}
+	fs := flag.NewFlagSet("audit tail", flag.ExitOnError)
+	n := fs.Int("n", 50, "number of entries (newest first)")
+	_ = fs.Parse(args[1:])
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodGet, fmt.Sprintf("/v1/admin/audit?n=%d", *n), nil)
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+func (r *runtime) cmdSystem(ctx context.Context, args []string) {
+	if len(args) == 0 {
+		die("usage: obachtctl system <status>")
+	}
+	switch args[0] {
+	case "status":
+		r.requireIPC()
+		code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/system/status", nil)
+		if err != nil {
+			die("%v", err)
+		}
+		emit(code, body)
+	default:
+		die("unknown system subcommand: %s", args[0])
+	}
+}
+
 func (r *runtime) requireIPC() {
 	if r.directMode() {
 		die("this command requires the daemon (not available in --db mode)")
@@ -484,6 +520,8 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  domain unbind --domain=FQDN              remove ingress binding for a domain")
 	fmt.Fprintln(w, "  domain service --instance=ID --service=NAME --target=TGT [--type=docker_dns|host_port]")
 	fmt.Fprintln(w, "  ingress reload                           force a Caddy reload")
+	fmt.Fprintln(w, "  audit tail [--n N]                       show recent audit entries (newest first)")
+	fmt.Fprintln(w, "  system status                            show agent runtime + counters")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "with --db=PATH commands write directly to the SQLite SSOT (no daemon required).")
 }

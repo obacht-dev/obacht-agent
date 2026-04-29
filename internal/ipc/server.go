@@ -27,9 +27,11 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
 
@@ -49,6 +51,8 @@ type Server struct {
 	store   *store.Store
 	rec     Reconciler
 	ingress IngressManager
+	audit   *audit.Writer
+	version string
 	log     *slog.Logger
 
 	srv *http.Server
@@ -63,6 +67,12 @@ func New(socket string, st *store.Store, rec Reconciler, log *slog.Logger) *Serv
 // SetIngress wires the ingress manager so the server can expose domain/
 // binding mutations and force reloads.
 func (s *Server) SetIngress(m IngressManager) { s.ingress = m }
+
+// SetAudit wires the audit writer used by mutating handlers.
+func (s *Server) SetAudit(w *audit.Writer) { s.audit = w }
+
+// SetVersion records the agent version for /v1/system/status.
+func (s *Server) SetVersion(v string) { s.version = v }
 
 // Listen binds the unix socket and starts serving in a goroutine.
 // Returns once the listener is up; call Shutdown to stop.
@@ -154,6 +164,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/admin/services", s.adminUpsertService)
 	mux.HandleFunc("POST /v1/admin/ingress/reload", s.adminIngressReload)
 
+	// Phase S1: audit + system introspection.
+	mux.HandleFunc("GET /v1/admin/audit", s.adminAuditTail)
+	mux.HandleFunc("GET /v1/system/status", s.systemStatus)
+
 	// Template (Bearer per-instance secret required).
 	mux.HandleFunc("GET /v1/template/self", s.templateSelf)
 	mux.HandleFunc("POST /v1/template/state", s.templateState)
@@ -222,9 +236,19 @@ func (s *Server) adminUpsertInstance(w http.ResponseWriter, r *http.Request) {
 		DesiredState: store.DesiredState(body.DesiredState),
 		ConfigJSON:   cfg,
 	}); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{
+			Op: "instance.upsert", Actor: "obachtctl", Target: body.ID,
+			Result: audit.ResultError, ErrorMessage: err.Error(),
+			Params: map[string]any{"template": body.TemplateID, "state": body.DesiredState},
+		})
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{
+		Op: "instance.upsert", Actor: "obachtctl", Target: body.ID,
+		Params:        map[string]any{"template": body.TemplateID, "runtime": body.Runtime, "state": body.DesiredState, "version": body.Version},
+		ParamsSummary: fmt.Sprintf("template=%s state=%s", body.TemplateID, body.DesiredState),
+	})
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
@@ -236,9 +260,11 @@ func (s *Server) adminDeleteInstance(w http.ResponseWriter, r *http.Request) {
 	hard := r.URL.Query().Get("hard") == "1"
 	if hard {
 		if err := s.store.DeleteInstance(r.Context(), id); err != nil {
+			_ = s.audit.Append(r.Context(), audit.Entry{Op: "instance.delete", Actor: "obachtctl", Target: id, Result: audit.ResultError, ErrorMessage: err.Error(), ParamsSummary: "hard=true"})
 			writeErr(w, http.StatusInternalServerError, err)
 			return
 		}
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "instance.delete", Actor: "obachtctl", Target: id, ParamsSummary: "hard=true"})
 		if s.rec != nil {
 			s.rec.Trigger()
 		}
@@ -556,4 +582,57 @@ func writeJSON(w http.ResponseWriter, code int, body any) {
 
 func writeErr(w http.ResponseWriter, code int, err error) {
 	writeJSON(w, code, map[string]any{"error": err.Error()})
+}
+
+// --- Phase S1: audit + system status ---
+
+func (s *Server) adminAuditTail(w http.ResponseWriter, r *http.Request) {
+	n := 50
+	if v := r.URL.Query().Get("n"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 && parsed <= 1000 {
+			n = parsed
+		}
+	}
+	if s.audit == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	entries, err := s.audit.Tail(r.Context(), n)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
+}
+
+func (s *Server) systemStatus(w http.ResponseWriter, r *http.Request) {
+	settings, err := s.store.AllSystemSettings(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	counters, err := store.AuditCounters(r.Context(), s.store)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	instances, _ := s.store.ListInstances(r.Context())
+	domains, _ := s.store.ListDomains(r.Context())
+	bindings, _ := s.store.ListBindings(r.Context())
+
+	out := map[string]any{
+		"agent_version":   s.version,
+		"system_settings": settings,
+		"power_mode":      settings["power_mode"] == "true",
+		"security_mode":   settings["security_mode"],
+		"counters": map[string]any{
+			"instances":  len(instances),
+			"domains":    len(domains),
+			"bindings":   len(bindings),
+			"audit_ops":  counters,
+		},
+		"audit_log_path": "", // populated by main.go via SetAudit; for now empty
+		"now":            time.Now().Unix(),
+	}
+	writeJSON(w, http.StatusOK, out)
 }
