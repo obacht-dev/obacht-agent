@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,7 +19,22 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/store"
+	"github.com/obacht-dev/obacht-agent/internal/trust"
 )
+
+// trustDir is where the agent operator drops minisign .pub files for
+// the registry signing key(s). Overridable via OBACHT_TRUST_DIR for
+// tests. We fail-closed: if both --manifest-base64 and --signature-
+// base64 are provided to `template install`, verification is required
+// and a missing trust dir means rejection.
+const defaultTrustDir = "/etc/obacht/trust.d"
+
+func trustDir() string {
+	if d := os.Getenv("OBACHT_TRUST_DIR"); d != "" {
+		return d
+	}
+	return defaultTrustDir
+}
 
 const cliVersion = "0.1.0"
 
@@ -529,11 +545,39 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 	iid := fs.String("instance", "", "instance id (required)")
 	version := fs.String("version", "", "version tag")
 	configJSON := fs.String("config-json", "", "materialized container spec as JSON string")
+	manifestB64 := fs.String("manifest-base64", "", "base64-encoded raw manifest bytes (S4 trust)")
+	signatureB64 := fs.String("signature-base64", "", "base64-encoded minisign signature (S4 trust)")
 	_ = fs.Bool("json", false, "output JSON (default)")
 	_ = fs.Parse(args)
 	if *tid == "" || *iid == "" {
 		die("--id and --instance are required")
 	}
+
+	// S4: minisign trust check. Fail-closed semantics:
+	//   - if either flag is provided, BOTH must be provided
+	//   - the local trust bundle must contain at least one trusted key
+	//   - signature must verify against the manifest content
+	// During the S4 rollout the api may omit both flags for templates
+	// that pre-date signing; in that case we permit the install but
+	// audit-record it as unsigned (the agent's reconciler can flag
+	// these in /system/status for the operator).
+	if (*manifestB64 != "") != (*signatureB64 != "") {
+		die("--manifest-base64 and --signature-base64 must be used together")
+	}
+	if *manifestB64 != "" {
+		manifest, err := decodeB64(*manifestB64)
+		if err != nil {
+			die("--manifest-base64 not valid base64: %v", err)
+		}
+		sig, err := decodeB64(*signatureB64)
+		if err != nil {
+			die("--signature-base64 not valid base64: %v", err)
+		}
+		if err := verifyManifest(manifest, sig); err != nil {
+			die("template signature rejected: %v", err)
+		}
+	}
+
 	var configRaw any
 	if *configJSON != "" {
 		if err := json.Unmarshal([]byte(*configJSON), &configRaw); err != nil {
@@ -548,11 +592,29 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		"version":       *version,
 		"desired_state": "installed",
 		"config":        configRaw,
+		"signed":        *manifestB64 != "",
 	})
 	if err != nil {
 		die("%v", err)
 	}
 	emit(code, body)
+}
+
+// verifyManifest builds the trust bundle (embedded keys + /etc/obacht/
+// trust.d/*.pub) and checks the minisign signature. Returns nil on
+// success, non-nil error otherwise.
+func verifyManifest(manifest, sig []byte) error {
+	entries := append([]trust.KeyEntry(nil), trust.EmbeddedKeys...)
+	dirEntries, err := trust.LoadFromDir(trustDir())
+	if err != nil {
+		return fmt.Errorf("read trust dir %s: %w", trustDir(), err)
+	}
+	entries = append(entries, dirEntries...)
+	bundle, err := trust.New(entries)
+	if err != nil {
+		return fmt.Errorf("build trust bundle: %w", err)
+	}
+	return bundle.Verify(manifest, sig)
 }
 
 func (r *runtime) templateUninstall(ctx context.Context, args []string) {
@@ -605,6 +667,23 @@ func emit(code int, body []byte) {
 func die(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "obachtctl: "+format+"\n", a...)
 	os.Exit(1)
+}
+
+// decodeB64 accepts both standard and url-safe base64, with or
+// without padding. The api could realistically emit either depending
+// on which Node helper it uses, so we try both.
+func decodeB64(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawURLEncoding.DecodeString(s)
 }
 
 func usage(w *os.File) {
