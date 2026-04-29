@@ -67,6 +67,14 @@ func (c *Client) On(event string, h EventHandler) {
 	c.handlers[event] = h
 }
 
+// Handler returns the previously registered handler for event, or nil.
+// Used by tests to invoke handlers without spinning up a real WS server.
+func (c *Client) Handler(event string) EventHandler {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.handlers[event]
+}
+
 // BaseURL returns the api root URL (https://...) configured on the client.
 // Useful for REST helpers that share the same auth.
 func (c *Client) BaseURL() string { return c.url }

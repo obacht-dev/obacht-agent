@@ -152,7 +152,7 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 	// Backend channel (Socket.IO v4). Skipped if no server configured.
 	if cfg.Server.URL != "" && authToken != "" {
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
-		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"))
+		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		go wsClient.Run(ctx)
 		go syncer.Run(ctx)
