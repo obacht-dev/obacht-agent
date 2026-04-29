@@ -128,6 +128,12 @@ func (m *Manager) Apply(ctx context.Context) error {
 	}
 	// Refresh cert metadata (NotAfter + Issuer) from the on-disk PEM. Pure
 	// telemetry — the platform only learns expiry/issuer, never the key.
+	// Caddy writes certs as root inside its container with mode 0600, so
+	// first widen .crt perms (keys stay 0600) so the agent's obacht user
+	// can read them. Best-effort: a chmod failure shouldn't block reload.
+	if err := m.chmodCertsForAgentRead(ctx); err != nil {
+		m.log.Debug("chmod certs", "err", err)
+	}
 	if err := m.ScanCerts(ctx); err != nil {
 		m.log.Debug("scan certs", "err", err)
 	}
@@ -505,6 +511,56 @@ func (m *Manager) reloadCaddy(ctx context.Context) error {
 	if ins.ExitCode != 0 {
 		return fmt.Errorf("caddy reload exit=%d output=%s", ins.ExitCode, sanitize(out))
 	}
+	return nil
+}
+
+// chmodCertsForAgentRead makes Caddy-issued .crt files world-readable so
+// the agent (running as the unprivileged `obacht` user) can parse them
+// in ScanCerts. Caddy inside the container runs as root and writes
+// /data/caddy/certificates/<acme>/<dom>/<dom>.crt with mode 0600 owned
+// by root, which is unreadable from the host. We deliberately leave
+// the .key files untouched (still 0600 root) since the agent never
+// needs them — only the cert metadata (NotAfter, Issuer).
+//
+// Runs as an exec into the caddy container so we don't need sudo on
+// the host. Idempotent and cheap (chmod no-op if already correct).
+func (m *Manager) chmodCertsForAgentRead(ctx context.Context) error {
+	body, _ := json.Marshal(map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Cmd": []string{"sh", "-c",
+			"if [ -d /data/caddy/certificates ]; then " +
+				"find /data/caddy/certificates -type d -exec chmod o+rx {} + ; " +
+				"find /data/caddy/certificates -name '*.crt' -exec chmod o+r {} + ; " +
+				"fi",
+		},
+	})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/containers/"+ContainerName+"/exec", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 201 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("exec create %d: %s", resp.StatusCode, string(raw))
+	}
+	var er struct{ Id string }
+	if err := json.NewDecoder(resp.Body).Decode(&er); err != nil {
+		return err
+	}
+	startBody, _ := json.Marshal(map[string]any{"Detach": false, "Tty": false})
+	sReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/exec/"+er.Id+"/start", bytes.NewReader(startBody))
+	sReq.Header.Set("Content-Type", "application/json")
+	sResp, err := m.docker.HTTP().Do(sReq)
+	if err != nil {
+		return err
+	}
+	defer sResp.Body.Close()
+	_, _ = io.ReadAll(sResp.Body)
 	return nil
 }
 
