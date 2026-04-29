@@ -312,9 +312,11 @@ func (s *Server) adminIssueSecret(w http.ResponseWriter, r *http.Request) {
 	}
 	secret, err := s.store.CreateInstanceSecret(r.Context(), id)
 	if err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "instance.secret.issue", Actor: "obachtctl", Target: id, Result: audit.ResultError, ErrorMessage: err.Error()})
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "instance.secret.issue", Actor: "obachtctl", Target: id, ParamsSummary: "secret rotated"})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "instance_id": id, "secret": secret})
 }
 
@@ -369,9 +371,11 @@ func (s *Server) adminUpsertDomain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.UpsertDomain(r.Context(), body.Domain, body.Desired); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.upsert", Actor: "obachtctl", Target: body.Domain, Result: audit.ResultError, ErrorMessage: err.Error(), Params: map[string]any{"desired": body.Desired}})
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.upsert", Actor: "obachtctl", Target: body.Domain, Params: map[string]any{"desired": body.Desired}, ParamsSummary: "desired=" + body.Desired})
 	if s.ingress != nil {
 		_ = s.ingress.Reload(r.Context())
 	}
@@ -384,9 +388,11 @@ func (s *Server) adminUpsertDomain(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	d := r.PathValue("domain")
 	if err := s.store.DeleteDomain(r.Context(), d); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.delete", Actor: "obachtctl", Target: d, Result: audit.ResultError, ErrorMessage: err.Error()})
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.delete", Actor: "obachtctl", Target: d})
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
@@ -416,9 +422,11 @@ func (s *Server) adminUpsertBinding(w http.ResponseWriter, r *http.Request) {
 		Mode:        body.Mode,
 		PathPrefix:  body.PathPrefix,
 	}); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "binding.upsert", Actor: "obachtctl", Target: body.Domain, Result: audit.ResultError, ErrorMessage: err.Error(), Params: map[string]any{"instance": body.InstanceID, "service": body.ServiceName, "local_port": body.LocalPort, "mode": body.Mode}})
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "binding.upsert", Actor: "obachtctl", Target: body.Domain, Params: map[string]any{"instance": body.InstanceID, "service": body.ServiceName, "local_port": body.LocalPort, "mode": body.Mode, "path_prefix": body.PathPrefix}, ParamsSummary: fmt.Sprintf("%s -> %s/%s", body.Domain, body.InstanceID, body.ServiceName)})
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
@@ -428,9 +436,11 @@ func (s *Server) adminUpsertBinding(w http.ResponseWriter, r *http.Request) {
 func (s *Server) adminDeleteBinding(w http.ResponseWriter, r *http.Request) {
 	d := r.PathValue("domain")
 	if err := s.store.DeleteBinding(r.Context(), d); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "binding.delete", Actor: "obachtctl", Target: d, Result: audit.ResultError, ErrorMessage: err.Error()})
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "binding.delete", Actor: "obachtctl", Target: d})
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
@@ -456,9 +466,11 @@ func (s *Server) adminUpsertService(w http.ResponseWriter, r *http.Request) {
 		TargetType:  body.TargetType,
 		Target:      body.Target,
 	}); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "service.upsert", Actor: "obachtctl", Target: body.InstanceID + "/" + body.ServiceName, Result: audit.ResultError, ErrorMessage: err.Error(), Params: map[string]any{"target_type": body.TargetType, "target": body.Target}})
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "service.upsert", Actor: "obachtctl", Target: body.InstanceID + "/" + body.ServiceName, Params: map[string]any{"target_type": body.TargetType, "target": body.Target}, ParamsSummary: body.TargetType + "=" + body.Target})
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
@@ -471,9 +483,11 @@ func (s *Server) adminIngressReload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.ingress.Reload(r.Context()); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "ingress.reload", Actor: "obachtctl", Result: audit.ResultError, ErrorMessage: err.Error()})
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "ingress.reload", Actor: "obachtctl"})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "reloaded": true})
 }
 
