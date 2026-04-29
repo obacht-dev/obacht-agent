@@ -753,6 +753,41 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 			die("--config-json is not valid JSON: %v", err)
 		}
 	}
+
+	// S6.5: when the api hands us the manifest bytes, materialise the
+	// container.Spec right here. --config-json is then interpreted as
+	// the user-supplied form values map (e.g. {"name":"hello"}). The
+	// reconciler downstream stores whatever we pass under `config` as
+	// instances.config_json and the docker driver consumes it.
+	//
+	// Rollout-fallback: when no manifest bytes are present (legacy
+	// templates pre-S4) we keep the v0 behaviour and pass --config-json
+	// through verbatim — it must already BE a container.Spec in that
+	// case.
+	if *manifestB64 != "" {
+		manifestBytes, err := decodeB64(*manifestB64)
+		if err != nil {
+			die("--manifest-base64 not valid base64: %v", err)
+		}
+		userCfg := map[string]any{}
+		if configRaw != nil {
+			if m, ok := configRaw.(map[string]any); ok {
+				userCfg = m
+			} else {
+				die("--config-json must be a JSON object when materialising from manifest")
+			}
+		}
+		spec, err := materializeManifest(manifestBytes, userCfg, *iid, *tid)
+		if err != nil {
+			die("manifest materialise: %v", err)
+		}
+		var asAny any
+		if err := json.Unmarshal(spec, &asAny); err != nil {
+			die("materialise self-check: %v", err)
+		}
+		configRaw = asAny
+	}
+
 	r.requireIPC()
 	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/instances", map[string]any{
 		"id":            *iid,
