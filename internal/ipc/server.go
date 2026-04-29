@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/redact"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
 
@@ -583,11 +584,68 @@ func instanceToMap(i *store.Instance) map[string]any {
 		m["observed_at"] = i.ObservedAt.Unix()
 	}
 	if i.ConfigJSON != "" {
-		// surface config as raw JSON when possible
-		var raw json.RawMessage = json.RawMessage(i.ConfigJSON)
-		m["config"] = raw
+		// S7: surface config but redact secret-looking env values.
+		// `obachtctl instance get/list` is the operator's primary
+		// debug surface and its output flows up an SSH session, so
+		// we never want to spit raw `DB_PASSWORD` or `API_TOKEN`
+		// values back even to the legitimate device owner. The
+		// manifest-declared secrets[] list isn't persisted on the
+		// agent yet (TODO: thread through from upsert payload), so
+		// redaction is heuristic-only for now.
+		m["config"] = redactInstanceConfig(json.RawMessage(i.ConfigJSON))
+		m["sanitized"] = true
 	}
 	return m
+}
+
+// redactInstanceConfig parses the stored config JSON and replaces
+// secret-looking env values with redact.Placeholder. On parse error
+// it returns the original raw bytes so we never *fail* a list call
+// because of a hand-edited config; the caller still sees `sanitized:
+// true` so a reviewer can spot the case.
+func redactInstanceConfig(raw json.RawMessage) any {
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return raw
+	}
+	envAny, ok := cfg["env"]
+	if !ok {
+		return cfg
+	}
+	switch v := envAny.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(v))
+		for k, val := range v {
+			if redact.IsSecretKey(k) {
+				out[k] = redact.Placeholder
+			} else {
+				out[k] = val
+			}
+		}
+		cfg["env"] = out
+	case []any:
+		out := make([]any, len(v))
+		for i, e := range v {
+			s, ok := e.(string)
+			if !ok {
+				out[i] = e
+				continue
+			}
+			eq := strings.IndexByte(s, '=')
+			if eq <= 0 {
+				out[i] = s
+				continue
+			}
+			k := s[:eq]
+			if redact.IsSecretKey(k) {
+				out[i] = k + "=" + redact.Placeholder
+			} else {
+				out[i] = s
+			}
+		}
+		cfg["env"] = out
+	}
+	return cfg
 }
 
 func writeJSON(w http.ResponseWriter, code int, body any) {
