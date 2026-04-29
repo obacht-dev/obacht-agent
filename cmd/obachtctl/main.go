@@ -360,6 +360,7 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 	case "claim":
 		fs := flag.NewFlagSet("domain claim", flag.ExitOnError)
 		domain := fs.String("domain", "", "fqdn (required)")
+		_ = fs.Bool("json", false, "output JSON (default)")
 		_ = fs.Parse(args[1:])
 		if *domain == "" {
 			die("--domain is required")
@@ -376,6 +377,7 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 	case "unclaim":
 		fs := flag.NewFlagSet("domain unclaim", flag.ExitOnError)
 		domain := fs.String("domain", "", "fqdn (required)")
+		_ = fs.Bool("json", false, "output JSON (default)")
 		_ = fs.Parse(args[1:])
 		if *domain == "" {
 			die("--domain is required")
@@ -393,9 +395,32 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 		svc := fs.String("service", "", "service name (required)")
 		mode := fs.String("mode", "root", "root|path")
 		prefix := fs.String("path-prefix", "", "path prefix (when mode=path)")
+		localPort := fs.Int("local-port", 0, "bind to a local TCP port instead of an instance/service")
+		_ = fs.Bool("json", false, "output JSON (default)")
 		_ = fs.Parse(args[1:])
-		if *domain == "" || *instID == "" || *svc == "" {
-			die("--domain, --instance, --service required")
+		if *domain == "" {
+			die("--domain is required")
+		}
+		if *localPort > 0 {
+			if *instID != "" || *svc != "" {
+				die("--local-port is mutually exclusive with --instance/--service")
+			}
+			r.requireIPC()
+			code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/bindings", map[string]any{
+				"domain":      *domain,
+				"target_type": "host_port",
+				"target":      fmt.Sprintf("127.0.0.1:%d", *localPort),
+				"mode":        *mode,
+				"path_prefix": *prefix,
+			})
+			if err != nil {
+				die("%v", err)
+			}
+			emit(code, body)
+			return
+		}
+		if *instID == "" || *svc == "" {
+			die("--domain plus either --instance/--service or --local-port required")
 		}
 		r.requireIPC()
 		code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/bindings", map[string]any{
@@ -412,6 +437,7 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 	case "unbind":
 		fs := flag.NewFlagSet("domain unbind", flag.ExitOnError)
 		domain := fs.String("domain", "", "fqdn (required)")
+		_ = fs.Bool("json", false, "output JSON (default)")
 		_ = fs.Parse(args[1:])
 		if *domain == "" {
 			die("--domain is required")
