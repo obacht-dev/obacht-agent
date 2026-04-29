@@ -121,6 +121,82 @@ tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 src_dir="$(find "$tmpdir" -maxdepth 1 -type d -name 'obacht-agent_*' | head -1)"
 install -m 0755 "$src_dir/obacht-agent" "$INSTALL_DIR/obacht-agent"
 install -m 0755 "$src_dir/obachtctl"    "$INSTALL_DIR/obachtctl" 2>/dev/null || true
+# S5: privileged helper. Lives outside INSTALL_DIR because the
+# bootstrap sudoers fragment pins this exact path; moving it would
+# require a coordinated sudoers update.
+if [ -f "$src_dir/obacht-power-toggle" ]; then
+  install -m 0755 "$src_dir/obacht-power-toggle" /usr/local/sbin/obacht-power-toggle
+fi
+
+# ---------------------------------------------------------------------------
+# S5: create the unprivileged `obacht` user that the agent runs as.
+#
+# Why: if the agent itself is compromised (the most likely surface — it
+# talks to the network and runs untrusted manifest configs), we want
+# the blast radius to be the docker daemon and a tightly-scoped
+# sudoers entry, NOT free root on the host.
+#
+# The user is added with --no-create-home (we use $STATE_DIR instead)
+# and slotted into the docker group so it can run containers, plus
+# systemd-journal so journalctl works for diagnostics.
+# ---------------------------------------------------------------------------
+if ! id -u obacht >/dev/null 2>&1; then
+  echo "==> creating unprivileged user 'obacht'"
+  useradd --system --no-create-home --shell /usr/sbin/nologin \
+          --home-dir "$STATE_DIR" obacht
+fi
+# Idempotent group adds (errors-on-already-member, hence the || true).
+usermod -a -G docker obacht || true
+if getent group systemd-journal >/dev/null 2>&1; then
+  usermod -a -G systemd-journal obacht || true
+fi
+chown -R obacht:obacht "$STATE_DIR" "$RUNTIME_DIR"
+chown obacht:obacht "$CONFIG_DIR"
+
+# ---------------------------------------------------------------------------
+# S5.4: scrub the v1 NOPASSWD:ALL sudoers fragment if it's still around.
+# v1 (Python agent) installed `/etc/sudoers.d/obacht` with full passwordless
+# root — exactly the blast radius v2 is designed to remove. We drop it on
+# every v2 install so a Pi that gets re-bootstrapped is immediately back to
+# restricted-by-default, even if the operator forgets to wipe /etc.
+# ---------------------------------------------------------------------------
+if [ -f /etc/sudoers.d/obacht ]; then
+  echo "==> removing legacy /etc/sudoers.d/obacht (v1 NOPASSWD:ALL)"
+  rm -f /etc/sudoers.d/obacht
+fi
+# Same for the older Power Mode fragment — obacht-power-toggle is the
+# canonical writer now; if it's there from a previous v2 run it gets
+# rewritten by `obachtctl system unlock-power`. Removing it here means
+# fresh installs always start LOCKED.
+if [ -f /etc/sudoers.d/obacht-power ]; then
+  echo "==> removing /etc/sudoers.d/obacht-power (start locked)"
+  rm -f /etc/sudoers.d/obacht-power
+fi
+
+# ---------------------------------------------------------------------------
+# S5: bootstrap sudoers fragment. The ONLY thing the obacht user is
+# allowed to run as root is /usr/local/sbin/obacht-power-toggle, with
+# its two fixed argv values. Power-level templates can only run after
+# the operator deliberately enables Power Mode — see PLAN-AGENT-V2 S5.
+# ---------------------------------------------------------------------------
+if [ -x /usr/local/sbin/obacht-power-toggle ]; then
+  echo "==> writing /etc/sudoers.d/obacht-bootstrap"
+  tmp_sudoers="$(mktemp)"
+  cat > "$tmp_sudoers" <<'SUDO'
+# Managed by obacht-agent install.sh. Do not edit by hand.
+# Phase S5: lets the unprivileged `obacht` user flip Power Mode on/off
+# via a fixed-content helper (see /usr/local/sbin/obacht-power-toggle).
+# This is the ONLY sudoers grant the agent gets at install time.
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle enable
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle disable
+SUDO
+  chmod 0440 "$tmp_sudoers"
+  if command -v visudo >/dev/null 2>&1; then
+    visudo -c -f "$tmp_sudoers" >/dev/null
+  fi
+  mv "$tmp_sudoers" /etc/sudoers.d/obacht-bootstrap
+fi
+
 
 echo "==> writing $CONFIG_FILE"
 umask 077
@@ -142,6 +218,9 @@ paths:
   caddyConfig: $STATE_DIR/caddy/config
 YAML
 chmod 0600 "$CONFIG_FILE"
+# S5: bootstrap exchange rewrites this file (token -> JWT), so the
+# unprivileged agent must own it. CONFIG_DIR ownership was set above.
+chown obacht:obacht "$CONFIG_FILE"
 
 echo "==> installing systemd unit"
 cat > "$SERVICE_FILE" <<UNIT
@@ -152,6 +231,13 @@ Wants=network-online.target docker.service
 
 [Service]
 Type=simple
+# S5: drop privileges. The agent does not need root for its core job
+# (Docker via group membership, Caddy as a child process binding
+# unprivileged ports first then handed elevated caps via systemd).
+# The only privileged action — flipping Power Mode — goes through the
+# obacht-power-toggle binary via the bootstrap sudoers entry.
+User=obacht
+Group=obacht
 ExecStart=$INSTALL_DIR/obacht-agent -config $CONFIG_FILE
 Restart=always
 RestartSec=3

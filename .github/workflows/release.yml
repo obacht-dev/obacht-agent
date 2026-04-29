@@ -67,6 +67,14 @@ jobs:
           go build -trimpath \
             -ldflags "-s -w -X main.cliVersion=${{ steps.ver.outputs.tag }}" \
             -o "$outdir/obachtctl" ./cmd/obachtctl
+          # S5: privileged power-mode helper. Linux-only — install.sh
+          # only writes the bootstrap sudoers fragment when this binary
+          # is present, so darwin builds intentionally skip it.
+          if [ "$GOOS" = "linux" ]; then
+            go build -trimpath \
+              -ldflags "-s -w" \
+              -o "$outdir/obacht-power-toggle" ./cmd/obacht-power-toggle
+          fi
           cp README.md LICENSE 2>/dev/null "$outdir/" || true
           tar -C dist -czf "dist/obacht-agent_${{ steps.ver.outputs.tag }}_${GOOS}_${archsuffix}.tar.gz" \
             "$(basename "$outdir")"

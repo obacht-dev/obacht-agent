@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -14,8 +15,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/store"
@@ -474,7 +477,7 @@ func (r *runtime) cmdAudit(ctx context.Context, args []string) {
 
 func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 	if len(args) == 0 {
-		die("usage: obachtctl system <status|set-power-mode>")
+		die("usage: obachtctl system <status|set-power-mode|unlock-power|lock-power>")
 	}
 	switch args[0] {
 	case "status":
@@ -486,6 +489,10 @@ func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 		emit(code, body)
 	case "set-power-mode":
 		r.systemSetPowerMode(ctx, args[1:])
+	case "unlock-power":
+		r.systemUnlockPower(ctx, args[1:])
+	case "lock-power":
+		r.systemLockPower(ctx, args[1:])
 	default:
 		die("unknown system subcommand: %s", args[0])
 	}
@@ -525,6 +532,158 @@ func (r *runtime) systemSetPowerMode(ctx context.Context, args []string) {
 // can run them verbatim. Keeping the cli surface stable across the
 // install-plan boundary means the api can be changed without re-rolling
 // agents on every Pi.
+
+// systemUnlockPower is the operator-facing two-step Power Mode
+// unlock.
+//
+// Why two steps: Power Mode lets the agent execute a small set of
+// privileged commands via sudo (see obacht-power-toggle). Flipping it
+// on is high-impact, so we make it deliberately interactive:
+//
+//   1. Without --yes, we print what's about to change, generate a
+//      random 6-char confirm-code, ask the operator to type it back.
+//   2. On match, we shell out to `sudo obacht-power-toggle enable`
+//      AND set the agent's power_mode setting via IPC, so the
+//      reconciler / future template installs see it.
+//
+// Non-interactive use (CI / install-plan via ssh-gateway):
+//   obachtctl system unlock-power --yes
+//
+// The --token / --confirm flow used by the obacht-api unlock-power
+// install-plan endpoint is upstream of this binary; the api validates
+// the operator's webapp confirmation, then issues a plan that calls
+// `system unlock-power --yes` here.
+func (r *runtime) systemUnlockPower(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("system unlock-power", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "skip the interactive confirm-code prompt")
+	togglePath := fs.String("toggle-binary", "/usr/local/sbin/obacht-power-toggle",
+		"path to obacht-power-toggle (override for tests)")
+	skipSudo := fs.Bool("skip-sudo", false, "skip the sudo obacht-power-toggle call (for tests; sets only the IPC flag)")
+	_ = fs.Bool("json", false, "output JSON (default)")
+	_ = fs.Parse(args)
+
+	if !*yes {
+		if err := interactiveConfirm("UNLOCK Power Mode (allow privileged commands)"); err != nil {
+			die("%v", err)
+		}
+	}
+
+	if !*skipSudo {
+		// Try without sudo first when running as root (e.g. in the
+		// agent process) — the sudoers entry only kicks in for the
+		// `obacht` user. This makes the ssh-gateway-driven path work
+		// regardless of whether the agent is running as root or as
+		// `obacht`.
+		var cmd *exec.Cmd
+		if os.Geteuid() == 0 {
+			cmd = exec.CommandContext(ctx, *togglePath, "enable")
+		} else {
+			cmd = exec.CommandContext(ctx, "sudo", "-n", *togglePath, "enable")
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			die("obacht-power-toggle enable: %v\n%s", err, out)
+		}
+	}
+
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/system/settings", map[string]any{
+		"key":   "power_mode",
+		"value": "true",
+	})
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+// systemLockPower disables Power Mode. Always safe to run, even if
+// already locked. We still confirm interactively unless --yes, because
+// it can break running 'power'-level templates.
+func (r *runtime) systemLockPower(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("system lock-power", flag.ExitOnError)
+	yes := fs.Bool("yes", false, "skip the interactive confirm-code prompt")
+	togglePath := fs.String("toggle-binary", "/usr/local/sbin/obacht-power-toggle",
+		"path to obacht-power-toggle (override for tests)")
+	skipSudo := fs.Bool("skip-sudo", false, "skip the sudo obacht-power-toggle call (for tests)")
+	_ = fs.Bool("json", false, "output JSON (default)")
+	_ = fs.Parse(args)
+
+	if !*yes {
+		if err := interactiveConfirm("LOCK Power Mode (revoke privileged commands)"); err != nil {
+			die("%v", err)
+		}
+	}
+
+	if !*skipSudo {
+		var cmd *exec.Cmd
+		if os.Geteuid() == 0 {
+			cmd = exec.CommandContext(ctx, *togglePath, "disable")
+		} else {
+			cmd = exec.CommandContext(ctx, "sudo", "-n", *togglePath, "disable")
+		}
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			die("obacht-power-toggle disable: %v\n%s", err, out)
+		}
+	}
+
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/system/settings", map[string]any{
+		"key":   "power_mode",
+		"value": "false",
+	})
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+// interactiveConfirm prints `action` and asks the operator to type a
+// random 6-character code back. Returns nil if the input matches,
+// non-nil error otherwise.
+//
+// We use crypto/rand for the code so the operator can't predict it
+// (defense against a malicious script piping `yes` into the command).
+// 60-second timeout: long enough for a careful read, short enough to
+// matter against accidental shoulder-surfing replays.
+func interactiveConfirm(action string) error {
+	codeBytes := make([]byte, 4)
+	if _, err := rand.Read(codeBytes); err != nil {
+		return fmt.Errorf("generate confirm code: %w", err)
+	}
+	// 6 hex chars, easy to read aloud, hard to brute force in 60s.
+	code := fmt.Sprintf("%x", codeBytes)[:6]
+
+	fmt.Fprintf(os.Stderr, "\n  About to: %s\n", action)
+	fmt.Fprintf(os.Stderr, "  Type this code to confirm (60s): %s\n  > ", code)
+
+	type res struct {
+		s   string
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		var s string
+		_, err := fmt.Fscanln(os.Stdin, &s)
+		ch <- res{strings.TrimSpace(s), err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return fmt.Errorf("read confirm code: %w", r.err)
+		}
+		if r.s != code {
+			return fmt.Errorf("confirm code did not match")
+		}
+		return nil
+	case <-time.After(60 * time.Second):
+		return fmt.Errorf("confirm code not entered within 60s")
+	}
+}
+
+
 func (r *runtime) cmdTemplate(ctx context.Context, args []string) {
 	if len(args) == 0 {
 		die("usage: obachtctl template <install|uninstall>")
@@ -576,6 +735,16 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		if err := verifyManifest(manifest, sig); err != nil {
 			die("template signature rejected: %v", err)
 		}
+		// S5.4: enforce manifest's spec.minSudoLevel against the host's
+		// current power_mode setting. Templates that need elevated
+		// privileges must NOT install while Power Mode is locked — the
+		// operator has to explicitly call `obachtctl system unlock-
+		// power` first (which itself is a deliberate two-step flow).
+		if level := extractMinSudoLevel(manifest); level == "power" {
+			if err := r.assertPowerModeEnabled(ctx); err != nil {
+				die("template requires power mode: %v", err)
+			}
+		}
 	}
 
 	var configRaw any
@@ -615,6 +784,61 @@ func verifyManifest(manifest, sig []byte) error {
 		return fmt.Errorf("build trust bundle: %w", err)
 	}
 	return bundle.Verify(manifest, sig)
+}
+
+// extractMinSudoLevel parses just enough of the manifest to find
+// spec.minSudoLevel. We do not unmarshal into the full manifest type
+// to keep this command independent of the obacht-template-spec/go
+// module (and to be permissive if the manifest carries extra fields).
+//
+// Returns "" if the field is absent (which is treated the same as
+// "none" by the caller). Returns "power" only if the manifest
+// explicitly opts in.
+func extractMinSudoLevel(manifest []byte) string {
+	var probe struct {
+		Spec struct {
+			MinSudoLevel string `json:"minSudoLevel" yaml:"minSudoLevel"`
+		} `json:"spec" yaml:"spec"`
+	}
+	if err := json.Unmarshal(manifest, &probe); err != nil {
+		// The api always sends JSON; YAML manifests are converted
+		// upstream. If JSON parsing fails we treat the manifest as
+		// not opting into power-mode. Callers still validate the
+		// signature, so a tampered field would have been rejected.
+		return ""
+	}
+	return probe.Spec.MinSudoLevel
+}
+
+// assertPowerModeEnabled queries the agent's IPC /v1/system/status
+// endpoint and returns nil if `power_mode == "enabled"`. Any other
+// value (or any error reaching the endpoint) is fail-closed.
+func (r *runtime) assertPowerModeEnabled(ctx context.Context) error {
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/system/status", nil)
+	if err != nil {
+		return fmt.Errorf("query system status: %w", err)
+	}
+	if code/100 != 2 {
+		return fmt.Errorf("system status returned HTTP %d", code)
+	}
+	var probe struct {
+		PowerMode any `json:"power_mode"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return fmt.Errorf("parse system status: %w", err)
+	}
+	switch v := probe.PowerMode.(type) {
+	case bool:
+		if v {
+			return nil
+		}
+	case string:
+		if v == "true" || v == "enabled" {
+			return nil
+		}
+	}
+	return fmt.Errorf("power_mode is locked; run `obachtctl system unlock-power` first")
 }
 
 func (r *runtime) templateUninstall(ctx context.Context, args []string) {
