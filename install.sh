@@ -152,6 +152,19 @@ if getent group systemd-journal >/dev/null 2>&1; then
 fi
 chown -R obacht:obacht "$STATE_DIR" "$RUNTIME_DIR"
 chown obacht:obacht "$CONFIG_DIR"
+# S6.5: the unix-domain socket /run/obacht/agent-v2.sock is mode 0660
+# (obacht:obacht), which is correct for the daemon but means obachtctl
+# invocations over SSH must run as a user that is in the `obacht`
+# group. The ssh-gateway connects as the operator's SSH login (e.g.
+# `pi`), so we add SUDO_USER to the obacht group on every install.
+# Idempotent: usermod -a -G is a no-op when already a member.
+# Override via OBACHT_SSH_USER env, falling back to SUDO_USER, falling
+# back to nothing (user added pi manually).
+ssh_user="${OBACHT_SSH_USER:-${SUDO_USER:-}}"
+if [ -n "$ssh_user" ] && [ "$ssh_user" != "root" ] && id -u "$ssh_user" >/dev/null 2>&1; then
+  echo "==> adding $ssh_user to obacht group (for obachtctl IPC over SSH)"
+  usermod -a -G obacht "$ssh_user" || true
+fi
 # S1/S5: audit log lives under /var/log/obacht. Owned by obacht so the
 # unprivileged agent can append; group `adm` (when present) lets ops
 # read the log without sudo, mirroring journald conventions.
