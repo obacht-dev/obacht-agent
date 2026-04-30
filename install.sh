@@ -219,7 +219,10 @@ fi
 
 
 echo "==> writing $CONFIG_FILE"
-umask 077
+# umask in a subshell so we don't leave the rest of the install with 0077
+# (the systemd unit, sudoers fragment etc. would otherwise come out 0600
+# instead of the intended 0644/0440).
+( umask 077
 cat > "$CONFIG_FILE" <<YAML
 # Managed by obacht-agent install.sh — overwritten on re-install.
 server:
@@ -237,6 +240,7 @@ paths:
   caddyData: $STATE_DIR/caddy/data
   caddyConfig: $STATE_DIR/caddy/config
 YAML
+)
 chmod 0600 "$CONFIG_FILE"
 # S5: bootstrap exchange rewrites this file (token -> JWT), so the
 # unprivileged agent must own it. CONFIG_DIR ownership was set above.
@@ -281,13 +285,19 @@ fi
 echo "==> starting $SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
-echo "==> waiting for agent to come online"
+# Wait up to ~120s for the agent to come up + connect. Cold first boot on a
+# slow SD card can take 30–60s just to JIT-init the Go runtime + open the
+# WebSocket against the api, so the previous 30s budget was too tight on
+# real hardware. Tolerate both JSON-structured (`"msg":"ws connected"`)
+# and plain (`ws connected`) log lines so a logger format change doesn't
+# silently turn this check into an exit-1.
+echo "==> waiting for agent to come online (up to 120s)"
 ok=0
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for i in $(seq 1 60); do
   sleep 2
   if systemctl is-active --quiet "$SERVICE_NAME"; then
-    if journalctl -u "$SERVICE_NAME" --since "60 seconds ago" --no-pager 2>/dev/null \
-        | grep -q '"msg":"ws connected"'; then
+    if journalctl -u "$SERVICE_NAME" --since "180 seconds ago" --no-pager 2>/dev/null \
+        | grep -qE '("msg":"ws connected"|ws connected)'; then
       ok=1
       break
     fi
@@ -295,7 +305,9 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 
 if [ "$ok" -ne 1 ]; then
-  echo "agent did not connect within timeout — check 'journalctl -u $SERVICE_NAME'" >&2
+  echo "agent did not connect within 120s — last 40 log lines:" >&2
+  journalctl -u "$SERVICE_NAME" --no-pager -n 40 >&2 || true
+  echo "check 'journalctl -u $SERVICE_NAME -f' for ongoing retries" >&2
   exit 1
 fi
 

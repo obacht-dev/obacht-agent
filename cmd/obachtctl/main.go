@@ -23,6 +23,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	"github.com/obacht-dev/obacht-agent/internal/trust"
+	"gopkg.in/yaml.v3"
 )
 
 // trustDir is where the agent operator drops minisign .pub files for
@@ -807,11 +808,28 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		if err != nil {
 			die("manifest materialise: %v", err)
 		}
+		if unresolved := findUnresolvedPlaceholders(spec); len(unresolved) > 0 {
+			die("template refers to unset values: %s — provide them via --config-json", strings.Join(unresolved, ", "))
+		}
 		var asAny any
 		if err := json.Unmarshal(spec, &asAny); err != nil {
 			die("materialise self-check: %v", err)
 		}
 		configRaw = asAny
+
+		// Fall back to the manifest's metadata.version when the api
+		// didn't pass --version explicitly. The api's snapshot
+		// reconciler refuses to upsert empty versions (NOT NULL).
+		if *version == "" {
+			if mv := extractManifestVersion(manifestBytes); mv != "" {
+				*version = mv
+			}
+		}
+	}
+	if *version == "" {
+		// Last-resort fallback so the api/supabase upsert never sees
+		// an empty string.
+		*version = "unknown"
 	}
 
 	r.requireIPC()
@@ -869,6 +887,23 @@ func extractMinSudoLevel(manifest []byte) string {
 		return ""
 	}
 	return probe.Spec.MinSudoLevel
+}
+
+// extractManifestVersion pulls metadata.version out of the manifest as
+// a fallback when the api doesn't pass --version explicitly. The agent
+// stores instances.version and the api's snapshot reconciler refuses
+// to upsert empty strings (supabase column is NOT NULL), so we always
+// want SOMETHING here.
+func extractManifestVersion(manifest []byte) string {
+	var probe struct {
+		Metadata struct {
+			Version string `json:"version" yaml:"version"`
+		} `json:"metadata" yaml:"metadata"`
+	}
+	if err := yaml.Unmarshal(manifest, &probe); err != nil {
+		return ""
+	}
+	return probe.Metadata.Version
 }
 
 // assertPowerModeEnabled queries the agent's IPC /v1/system/status

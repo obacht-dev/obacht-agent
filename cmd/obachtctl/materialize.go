@@ -91,6 +91,32 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 		return nil, fmt.Errorf("manifest missing spec.runtime.container")
 	}
 
+	// S6.5+: merge configSchema defaults under userConfig. The webapp
+	// usually sends them, but if it doesn't (sparse form, legacy plan,
+	// missing --config-json) we still want a working install instead of
+	// a literal `${cfg.contentPath}` ending up in a docker volume name.
+	if userConfig == nil {
+		userConfig = map[string]any{}
+	}
+	if schemaAny, ok := spec["configSchema"].([]any); ok {
+		for _, e := range schemaAny {
+			em, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			key := toString(em["key"])
+			if key == "" {
+				continue
+			}
+			if _, present := userConfig[key]; present {
+				continue
+			}
+			if def, hasDef := em["default"]; hasDef {
+				userConfig[key] = def
+			}
+		}
+	}
+
 	subst := newSubstituter(userConfig, instanceID, templateID)
 	out := matSpec{}
 
@@ -184,6 +210,27 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 	return json.Marshal(out)
 }
 
+// findUnresolvedPlaceholders returns any ${...} keys that survived
+// substitution in user-facing fields. Used by templateInstall to
+// fail fast with a clear message instead of letting docker reject
+// a `${cfg.X}` literal as an invalid volume name.
+func findUnresolvedPlaceholders(specJSON []byte) []string {
+	matches := placeholderRe.FindAllStringSubmatch(string(specJSON), -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range matches {
+		if len(m) < 2 || seen[m[1]] {
+			continue
+		}
+		seen[m[1]] = true
+		out = append(out, m[1])
+	}
+	return out
+}
+
 // substituter resolves ${cfg.X} / ${instance.id} / ${template.id} /
 // ${env.X} placeholders in any string. Unknown placeholders are left
 // in place (so docker emits a clear error) rather than silently
@@ -207,13 +254,25 @@ func (s *substituter) string(in string) string {
 	if in == "" {
 		return in
 	}
-	return placeholderRe.ReplaceAllStringFunc(in, func(match string) string {
-		key := match[2 : len(match)-1] // strip ${ }
-		if v, ok := s.lookup(key); ok {
-			return v
+	// Iterate so values that themselves contain placeholders (e.g. a
+	// configSchema default of "/var/lib/obacht/${template.id}/${instance.id}")
+	// resolve fully. Cap iterations to avoid loops on self-referential
+	// placeholders.
+	cur := in
+	for i := 0; i < 5; i++ {
+		next := placeholderRe.ReplaceAllStringFunc(cur, func(match string) string {
+			key := match[2 : len(match)-1] // strip ${ }
+			if v, ok := s.lookup(key); ok {
+				return v
+			}
+			return match
+		})
+		if next == cur {
+			break
 		}
-		return match
-	})
+		cur = next
+	}
+	return cur
 }
 
 func (s *substituter) lookup(key string) (string, bool) {

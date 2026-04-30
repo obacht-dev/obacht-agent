@@ -206,6 +206,7 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		DesiredState  string `json:"desired_state"`
 		ObservedState string `json:"observed_state,omitempty"`
 		ObservedAt    int64  `json:"observed_at,omitempty"`
+		ErrorMessage  string `json:"error_message,omitempty"`
 	}
 	type bindOut struct {
 		Domain      string `json:"domain"`
@@ -231,6 +232,12 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 			Version:       i.Version,
 			DesiredState:  string(i.DesiredState),
 			ObservedState: i.ObservedState,
+		}
+		// Surface the reconciler's last error so the api/webapp can
+		// show users WHY an install is stuck instead of forcing them
+		// to ssh in.
+		if i.ObservedState == "error" {
+			o.ErrorMessage = i.ObservedJSON
 		}
 		if !i.ObservedAt.IsZero() {
 			o.ObservedAt = i.ObservedAt.Unix()
