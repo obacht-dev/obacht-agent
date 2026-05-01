@@ -73,6 +73,8 @@ func main() {
 		rt.cmdReconcile(ctx, args[1:])
 	case "audit":
 		rt.cmdAudit(ctx, args[1:])
+	case "service":
+		rt.cmdService(ctx, args[1:])
 	case "system":
 		rt.cmdSystem(ctx, args[1:])
 	default:
@@ -848,6 +850,130 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 	emit(code, body)
 }
 
+// ---------------------------------------------------------------------------
+// service — list + control of admin-installed systemd units.
+//
+// Listing is read-only via the agent IPC (`GET /v1/admin/systemd-services`),
+// no privileges required.
+//
+// Mutation actions (start/stop/restart/reload/enable/disable) shell out to
+// `sudo -n /usr/bin/systemctl <verb> <unit>`. The sudoers snippet that
+// makes those calls password-less is owned by `obacht-power-toggle` and is
+// only present when Power Mode is enabled. We pre-flight Power Mode here
+// so the user gets a clean error instead of a sudo failure when the gate
+// is locked.
+// ---------------------------------------------------------------------------
+
+// validUnitName matches systemd unit names: alphanumerics, dot, dash,
+// underscore, '@' (for templated units). We require a `.service` suffix
+// so the api-side plan-builder can't trick us into touching timers,
+// sockets, mounts, etc.
+func isValidServiceUnitName(name string) bool {
+	if len(name) == 0 || len(name) > 128 {
+		return false
+	}
+	if !strings.HasSuffix(name, ".service") {
+		return false
+	}
+	for _, c := range name {
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '.', c == '-', c == '_', c == '@':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// allowedServiceVerbs is the closed allow-list of systemctl actions we
+// expose. Anything else (mask, reset-failed, edit, ...) is rejected.
+var allowedServiceVerbs = map[string]bool{
+	"start":   true,
+	"stop":    true,
+	"restart": true,
+	"reload":  true,
+	"enable":  true,
+	"disable": true,
+}
+
+func (r *runtime) cmdService(ctx context.Context, args []string) {
+	if len(args) == 0 {
+		die("usage: obachtctl service <list|start|stop|restart|reload|enable|disable> [--name UNIT]")
+	}
+	verb := args[0]
+	if verb == "list" {
+		r.serviceList(ctx)
+		return
+	}
+	if !allowedServiceVerbs[verb] {
+		die("unknown service subcommand: %s", verb)
+	}
+	r.serviceControl(ctx, verb, args[1:])
+}
+
+func (r *runtime) serviceList(ctx context.Context) {
+	r.requireIPC()
+	code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/admin/systemd-services", nil)
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+func (r *runtime) serviceControl(ctx context.Context, verb string, args []string) {
+	fs := flag.NewFlagSet("service "+verb, flag.ExitOnError)
+	name := fs.String("name", "", "unit name, must end in .service (required)")
+	_ = fs.Bool("json", true, "output JSON (default; only mode currently supported)")
+	systemctlPath := fs.String("systemctl", "/usr/bin/systemctl", "path to systemctl (override for tests)")
+	skipSudo := fs.Bool("skip-sudo", false, "invoke systemctl directly (for root / tests)")
+	noPowerCheck := fs.Bool("skip-power-check", false, "bypass the Power Mode pre-flight (tests only)")
+	_ = fs.Parse(args)
+	if *name == "" {
+		die("--name UNIT.service is required")
+	}
+	if !isValidServiceUnitName(*name) {
+		die("invalid unit name %q: must match [a-zA-Z0-9._@-]+\\.service", *name)
+	}
+
+	if !*noPowerCheck {
+		if err := r.assertPowerModeEnabled(ctx); err != nil {
+			die("%v", err)
+		}
+	}
+
+	cmdName := "sudo"
+	cmdArgs := []string{"-n", *systemctlPath, verb, *name}
+	if *skipSudo {
+		cmdName = *systemctlPath
+		cmdArgs = []string{verb, *name}
+	}
+	out, err := exec.CommandContext(ctx, cmdName, cmdArgs...).CombinedOutput()
+	exitCode := 0
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	resp := map[string]any{
+		"ok":        exitCode == 0,
+		"verb":      verb,
+		"unit":      *name,
+		"exit_code": exitCode,
+		"output":    string(out),
+	}
+	body, _ := json.Marshal(resp)
+	if exitCode == 0 {
+		emit(http.StatusOK, body)
+	} else {
+		emit(http.StatusInternalServerError, body)
+	}
+}
+
 // verifyManifest builds the trust bundle (embedded keys + /etc/obacht/
 // trust.d/*.pub) and checks the minisign signature. Returns nil on
 // success, non-nil error otherwise.
@@ -1026,6 +1152,9 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  ingress reload                           force a Caddy reload")
 	fmt.Fprintln(w, "  audit tail [--n N]                       show recent audit entries (newest first)")
 	fmt.Fprintln(w, "  system status                            show agent runtime + counters")
+	fmt.Fprintln(w, "  service list                             list custom systemd services (JSON)")
+	fmt.Fprintln(w, "  service start|stop|restart|reload|enable|disable --name=UNIT.service")
+	fmt.Fprintln(w, "                                           control a systemd unit (requires Power Mode)")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "with --db=PATH commands write directly to the SQLite SSOT (no daemon required).")
 }

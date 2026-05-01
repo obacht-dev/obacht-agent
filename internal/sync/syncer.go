@@ -25,6 +25,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	"github.com/obacht-dev/obacht-agent/internal/telemetry"
 )
@@ -296,6 +297,29 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 			"power_mode":    settings["power_mode"] == "true",
 			"security_mode": settings["security_mode"],
 		}
+	}
+
+	// F2c: snapshot of admin-installed systemd units. Read-only via D-Bus
+	// (no sudo). Failures are non-fatal — an old kernel/dbus-broken host
+	// should still be able to push the rest of its observed state.
+	if svcs, err := system.ListCustomServices(ctx); err == nil {
+		// Project to the wire shape; keep field names snake_case so the
+		// api can persist directly without remapping.
+		out := make([]map[string]any, 0, len(svcs))
+		for _, svc := range svcs {
+			out = append(out, map[string]any{
+				"name":            svc.Name,
+				"description":     svc.Description,
+				"load_state":      svc.LoadState,
+				"active_state":    svc.ActiveState,
+				"sub_state":       svc.SubState,
+				"unit_file_state": svc.UnitFileState,
+				"fragment_path":   svc.FragmentPath,
+			})
+		}
+		payload["systemd_services"] = out
+	} else {
+		s.log.Debug("list custom systemd services", "err", err)
 	}
 	if err := s.client.Emit("agent:observed_state", payload); err != nil {
 		s.log.Debug("emit observed_state", "err", err)

@@ -52,6 +52,8 @@ obacht ALL=(root) NOPASSWD: /usr/bin/systemctl restart *.service
 obacht ALL=(root) NOPASSWD: /usr/bin/systemctl reload *.service
 obacht ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service
 obacht ALL=(root) NOPASSWD: /usr/bin/systemctl stop *.service
+obacht ALL=(root) NOPASSWD: /usr/bin/systemctl enable *.service
+obacht ALL=(root) NOPASSWD: /usr/bin/systemctl disable *.service
 obacht ALL=(root) NOPASSWD: /usr/sbin/iptables -t nat *
 obacht ALL=(root) NOPASSWD: /usr/sbin/ip6tables -t nat *
 `

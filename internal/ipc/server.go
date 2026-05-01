@@ -33,6 +33,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/redact"
+	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
 
@@ -170,6 +171,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/system/status", s.systemStatus)
 	// Phase S3: power-mode toggle (writes to system_settings via audit hook).
 	mux.HandleFunc("POST /v1/admin/system/settings", s.adminSetSystemSetting)
+
+	// Phase F2: read-only enumeration of admin-installed systemd units.
+	// Mutating actions (start/stop/restart/enable/disable) are NOT exposed
+	// over IPC — they happen via `obachtctl service <verb>` which shells
+	// out to `sudo -n systemctl ...` (gated by Power Mode in the sudoers
+	// snippet maintained by obacht-power-toggle).
+	mux.HandleFunc("GET /v1/admin/systemd-services", s.adminListSystemdServices)
 
 	// Template (Bearer per-instance secret required).
 	mux.HandleFunc("GET /v1/template/self", s.templateSelf)
@@ -755,4 +763,21 @@ func (s *Server) adminSetSystemSetting(w http.ResponseWriter, r *http.Request) {
 		Params:        map[string]any{"key": body.Key, "value": body.Value},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": body.Key, "value": body.Value})
+}
+
+// adminListSystemdServices returns the filtered list of admin-installed
+// systemd units (.service) on the host. Read-only — see runtime/system
+// services.go for the filter rules.
+//
+// SECURITY: this endpoint is intentionally not under any auth other than
+// the unix-socket FS perms (mode 0660, group `obacht`). It returns no
+// secrets — only unit names + lifecycle state — so a compromised template
+// container that tricks its way into the admin socket sees public-ish info.
+func (s *Server) adminListSystemdServices(w http.ResponseWriter, r *http.Request) {
+	svcs, err := system.ListCustomServices(r.Context())
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"services": svcs})
 }
