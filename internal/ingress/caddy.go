@@ -529,7 +529,13 @@ func (m *Manager) chmodCertsForAgentRead(ctx context.Context) error {
 		"AttachStdout": true,
 		"AttachStderr": true,
 		"Cmd": []string{"sh", "-c",
-			"if [ -d /data/caddy/certificates ]; then " +
+			// Make /data/caddy and /data/caddy/certificates traversable by
+			// the host-side obacht user (other+rx on directories, other+r on
+			// .crt files). We must also fix the parent /data/caddy dir itself
+			// which Caddy creates as 0700 root — without o+x on that parent
+			// the host obacht user can't descend into certificates/ at all.
+			"chmod o+rx /data /data/caddy 2>/dev/null; " +
+				"if [ -d /data/caddy/certificates ]; then " +
 				"find /data/caddy/certificates -type d -exec chmod o+rx {} + ; " +
 				"find /data/caddy/certificates -name '*.crt' -exec chmod o+r {} + ; " +
 				"fi",
