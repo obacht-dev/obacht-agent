@@ -124,6 +124,10 @@ tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 src_dir="$(find "$tmpdir" -maxdepth 1 -type d -name 'obacht-agent_*' | head -1)"
 install -m 0755 "$src_dir/obacht-agent" "$INSTALL_DIR/obacht-agent"
 install -m 0755 "$src_dir/obachtctl"    "$INSTALL_DIR/obachtctl" 2>/dev/null || true
+# S6.5: symlink obachtctl into PATH so the ssh-gateway can invoke it
+# by name (without a hard-coded absolute path). Idempotent — ln -sf
+# overwrites any stale symlink left by a previous install.
+ln -sf "$INSTALL_DIR/obachtctl" /usr/local/bin/obachtctl
 # S5: privileged helper. Lives outside INSTALL_DIR because the
 # bootstrap sudoers fragment pins this exact path; moving it would
 # require a coordinated sudoers update.
