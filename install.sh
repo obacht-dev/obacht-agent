@@ -117,6 +117,9 @@ echo "==> verifying checksum"
 
 echo "==> installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" /var/log/obacht
+# Ensure INSTALL_DIR is traversable — a previous failed install may have left
+# it at 0700 (leaked umask). Fix idempotently on every run.
+chmod 0755 "$INSTALL_DIR"
 tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 src_dir="$(find "$tmpdir" -maxdepth 1 -type d -name 'obacht-agent_*' | head -1)"
 install -m 0755 "$src_dir/obacht-agent" "$INSTALL_DIR/obacht-agent"
