@@ -214,6 +214,9 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		ObservedState string `json:"observed_state,omitempty"`
 		ObservedAt    int64  `json:"observed_at,omitempty"`
 		ErrorMessage  string `json:"error_message,omitempty"`
+		// Spec v2.1+: tell the api which runtime materialised this
+		// instance so the webapp can render the right details panel.
+		Runtime string `json:"runtime,omitempty"`
 	}
 	type bindOut struct {
 		Domain      string `json:"domain"`
@@ -239,6 +242,7 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 			Version:       i.Version,
 			DesiredState:  string(i.DesiredState),
 			ObservedState: i.ObservedState,
+			Runtime:       string(i.Runtime),
 		}
 		// Surface the reconciler's last error so the api/webapp can
 		// show users WHY an install is stuck instead of forcing them
