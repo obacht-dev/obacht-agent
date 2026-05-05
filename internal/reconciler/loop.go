@@ -164,6 +164,32 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Same garbage-collection pass for compose-runtime instances:
+	// any materialised workspace whose instance row is gone (e.g. after
+	// a hard delete via IPC) gets `compose down -v` + workspace removal
+	// + secret drop. Without this, hard-deleting the row leaves the
+	// containers running forever.
+	if r.compose != nil {
+		composeOrphans, err := r.compose.List(ctx)
+		if err != nil {
+			r.log.Warn("list compose workspaces", "err", err)
+		} else {
+			for _, id := range composeOrphans {
+				if _, ok := desiredIDs[id]; ok {
+					continue
+				}
+				removed, err := r.compose.Remove(ctx, id)
+				if err != nil {
+					r.log.Error("remove orphan compose project", "instance", id, "err", err)
+					continue
+				}
+				if removed {
+					r.log.Info("removed orphan compose project", "instance", id)
+				}
+			}
+		}
+	}
+
 	// Ingress runs last: it reads the SSOT we just converged towards.
 	if r.ingress != nil {
 		if err := r.ingress.Apply(ctx); err != nil {
