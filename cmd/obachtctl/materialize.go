@@ -41,6 +41,41 @@ type matSpec struct {
 	Services []matServiceSpec  `json:"services,omitempty"`
 }
 
+// Subset of compose.Spec we emit (mirrors
+// internal/runtime/compose/compose.go::Spec). Field names match the
+// agent's JSON unmarshal tags so the agent reads it verbatim from
+// instances.config_json.
+type matComposeSpec struct {
+	ComposeBody    string                  `json:"compose_body"`
+	PrimaryService string                  `json:"primary_service"`
+	PrimaryPort    int                     `json:"primary_port"`
+	ImageDigests   map[string]string       `json:"image_digests,omitempty"`
+	SecretsSchema  []matSecretField        `json:"secrets_schema,omitempty"`
+	Services       []matComposeServiceSpec `json:"services,omitempty"`
+	Config         map[string]string       `json:"config,omitempty"`
+	SecretEnvKeys  []string                `json:"secret_env_keys,omitempty"`
+}
+
+type matSecretField struct {
+	Key     string `json:"key"`
+	Length  int    `json:"length"`
+	Charset string `json:"charset,omitempty"`
+}
+
+type matComposeServiceSpec struct {
+	Name          string `json:"name"`
+	TargetService string `json:"targetService"`
+	TargetPort    int    `json:"targetPort"`
+}
+
+// materializedResult is what materialize* funcs return: the runtime kind
+// ("container" or "compose") plus the JSON-encoded config the agent IPC
+// will store under instances.config_json.
+type materializedResult struct {
+	Runtime string
+	Config  []byte
+}
+
 type matPortMap struct {
 	Host      int `json:"host"`
 	Container int `json:"container"`
@@ -61,17 +96,19 @@ type matServiceSpec struct {
 // materializeManifest takes the raw manifest bytes (YAML, since v2
 // templates live as YAML on disk and the registry returns those bytes
 // verbatim for signature integrity) plus the user config values and
-// returns a JSON-encoded container.Spec ready for IPC.
+// returns the runtime kind + the JSON-encoded config (a container.Spec
+// for runtime.type="container", or a compose.Spec for runtime.type=
+// "compose") ready to ship via IPC.
 //
 // instanceID + templateID are exposed to ${instance.id} / ${template.id}
 // substitutions for templates that need them in env/cmd.
-func materializeManifest(manifestBytes []byte, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
+func materializeManifest(manifestBytes []byte, userConfig map[string]any, instanceID, templateID string) (materializedResult, error) {
 	var raw map[string]any
 	// YAML parses YAML AND JSON (a strict superset for our purposes)
 	// so this also handles the legacy v1 path where api JSON-encodes
 	// the parsed manifest before sending.
 	if err := yaml.Unmarshal(manifestBytes, &raw); err != nil {
-		return nil, fmt.Errorf("manifest parse: %w", err)
+		return materializedResult{}, fmt.Errorf("manifest parse: %w", err)
 	}
 
 	// Normalise YAML's map[interface{}]interface{} → map[string]any
@@ -80,41 +117,67 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 
 	spec, _ := raw["spec"].(map[string]any)
 	if spec == nil {
-		return nil, fmt.Errorf("manifest missing spec")
+		return materializedResult{}, fmt.Errorf("manifest missing spec")
 	}
-	runtime, _ := spec["runtime"].(map[string]any)
-	if runtime == nil {
-		return nil, fmt.Errorf("manifest missing spec.runtime")
-	}
-	container, _ := runtime["container"].(map[string]any)
-	if container == nil {
-		return nil, fmt.Errorf("manifest missing spec.runtime.container")
+	runtimeBlock, _ := spec["runtime"].(map[string]any)
+	if runtimeBlock == nil {
+		return materializedResult{}, fmt.Errorf("manifest missing spec.runtime")
 	}
 
-	// S6.5+: merge configSchema defaults under userConfig. The webapp
-	// usually sends them, but if it doesn't (sparse form, legacy plan,
-	// missing --config-json) we still want a working install instead of
-	// a literal `${cfg.contentPath}` ending up in a docker volume name.
+	// Apply configSchema defaults for any keys the webapp didn't fill in,
+	// so downstream substitution sees a complete cfg map regardless of
+	// runtime type. (Spec v2.1 keeps configSchema at spec level.)
 	if userConfig == nil {
 		userConfig = map[string]any{}
 	}
-	if schemaAny, ok := spec["configSchema"].([]any); ok {
-		for _, e := range schemaAny {
-			em, ok := e.(map[string]any)
-			if !ok {
-				continue
-			}
-			key := toString(em["key"])
-			if key == "" {
-				continue
-			}
-			if _, present := userConfig[key]; present {
-				continue
-			}
-			if def, hasDef := em["default"]; hasDef {
-				userConfig[key] = def
-			}
+	applyConfigSchemaDefaults(spec, userConfig)
+
+	runtimeType := toString(runtimeBlock["type"])
+	switch runtimeType {
+	case "", "container":
+		cfg, err := materializeContainer(spec, runtimeBlock, userConfig, instanceID, templateID)
+		if err != nil {
+			return materializedResult{}, err
 		}
+		return materializedResult{Runtime: "container", Config: cfg}, nil
+	case "compose":
+		cfg, err := materializeCompose(spec, runtimeBlock, userConfig, instanceID, templateID)
+		if err != nil {
+			return materializedResult{}, err
+		}
+		return materializedResult{Runtime: "compose", Config: cfg}, nil
+	default:
+		return materializedResult{}, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", runtimeType)
+	}
+}
+
+func applyConfigSchemaDefaults(spec map[string]any, userConfig map[string]any) {
+	schemaAny, ok := spec["configSchema"].([]any)
+	if !ok {
+		return
+	}
+	for _, e := range schemaAny {
+		em, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		key := toString(em["key"])
+		if key == "" {
+			continue
+		}
+		if _, present := userConfig[key]; present {
+			continue
+		}
+		if def, hasDef := em["default"]; hasDef {
+			userConfig[key] = def
+		}
+	}
+}
+
+func materializeContainer(spec, runtime map[string]any, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
+	container, _ := runtime["container"].(map[string]any)
+	if container == nil {
+		return nil, fmt.Errorf("manifest missing spec.runtime.container")
 	}
 
 	subst := newSubstituter(userConfig, instanceID, templateID)
@@ -208,6 +271,142 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 	}
 
 	return json.Marshal(out)
+}
+
+// materializeCompose builds a compose.Spec the agent's compose driver
+// will consume. We do NOT substitute ${secret.X} here — the agent owns
+// the secret store and substitutes at apply time so the secret value
+// never appears on the ssh-gateway exec_plan wire. We DO collect the
+// configSchema-resolved values into spec.config so the driver can
+// substitute ${cfg.X} placeholders.
+func materializeCompose(spec, runtime map[string]any, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
+	composeBlock, _ := runtime["compose"].(map[string]any)
+	if composeBlock == nil {
+		return nil, fmt.Errorf("manifest missing spec.runtime.compose")
+	}
+	body := toString(composeBlock["body"])
+	if strings.TrimSpace(body) == "" {
+		return nil, fmt.Errorf("manifest missing spec.runtime.compose.body")
+	}
+	primaryService := toString(composeBlock["primaryService"])
+	if primaryService == "" {
+		return nil, fmt.Errorf("manifest missing spec.runtime.compose.primaryService")
+	}
+	primaryPort := toInt(composeBlock["primaryPort"])
+	if primaryPort == 0 {
+		return nil, fmt.Errorf("manifest missing spec.runtime.compose.primaryPort")
+	}
+
+	// We DON'T substitute ${cfg.X} into the body here — the agent does it
+	// at apply time using the Config map below. But we DO substitute
+	// ${instance.id} and ${template.id} so the body reflects the right
+	// per-instance volume/network names without forcing the driver to
+	// know about those vars too. Cheap and lossless: those subs would
+	// have happened identically on every reconcile pass anyway.
+	subst := newSubstituter(userConfig, instanceID, templateID)
+	// Mask cfg/secret placeholders so the substituter only resolves
+	// instance.id / template.id; we apply a simple sentinel swap.
+	bodyResolved := substWithoutCfgSecret(subst, body)
+
+	imageDigests := map[string]string{}
+	if raw, ok := composeBlock["imageDigests"].(map[string]any); ok {
+		for k, v := range raw {
+			imageDigests[k] = toString(v)
+		}
+	}
+
+	var secretsSchema []matSecretField
+	if raw, ok := spec["secretsSchema"].([]any); ok {
+		for _, e := range raw {
+			em, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			k := toString(em["key"])
+			if k == "" {
+				continue
+			}
+			length := toInt(em["length"])
+			if length == 0 {
+				length = 32
+			}
+			secretsSchema = append(secretsSchema, matSecretField{
+				Key:     k,
+				Length:  length,
+				Charset: toString(em["charset"]),
+			})
+		}
+	}
+
+	var services []matComposeServiceSpec
+	if raw, ok := spec["services"].([]any); ok {
+		for _, e := range raw {
+			sm, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			targetService := toString(sm["targetService"])
+			if targetService == "" {
+				// Default to primaryService when omitted (single-service
+				// bundles often skip it).
+				targetService = primaryService
+			}
+			services = append(services, matComposeServiceSpec{
+				Name:          toString(sm["name"]),
+				TargetService: targetService,
+				TargetPort:    toInt(sm["targetPort"]),
+			})
+		}
+	}
+
+	var secretEnvKeys []string
+	if raw, ok := spec["secrets"].([]any); ok {
+		for _, e := range raw {
+			if s := toString(e); s != "" {
+				secretEnvKeys = append(secretEnvKeys, s)
+			}
+		}
+	}
+
+	cfgFlat := map[string]string{}
+	for k, v := range userConfig {
+		cfgFlat[k] = toString(v)
+	}
+
+	out := matComposeSpec{
+		ComposeBody:    bodyResolved,
+		PrimaryService: primaryService,
+		PrimaryPort:    primaryPort,
+		ImageDigests:   imageDigests,
+		SecretsSchema:  secretsSchema,
+		Services:       services,
+		Config:         cfgFlat,
+		SecretEnvKeys:  secretEnvKeys,
+	}
+	return json.Marshal(out)
+}
+
+// substWithoutCfgSecret resolves only ${instance.id} / ${template.id} /
+// ${env.X}; leaves ${cfg.X} and ${secret.X} for the agent to handle.
+func substWithoutCfgSecret(s *substituter, in string) string {
+	cur := in
+	for i := 0; i < 4; i++ {
+		next := placeholderRe.ReplaceAllStringFunc(cur, func(match string) string {
+			key := match[2 : len(match)-1]
+			if strings.HasPrefix(key, "cfg.") || strings.HasPrefix(key, "secret.") {
+				return match
+			}
+			if v, ok := s.lookup(key); ok {
+				return v
+			}
+			return match
+		})
+		if next == cur {
+			return next
+		}
+		cur = next
+	}
+	return cur
 }
 
 // findUnresolvedPlaceholders returns any ${...} keys that survived

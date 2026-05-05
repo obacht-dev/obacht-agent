@@ -777,6 +777,7 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 	}
 
 	var configRaw any
+	runtimeKind := "container"
 	if *configJSON != "" {
 		if err := json.Unmarshal([]byte(*configJSON), &configRaw); err != nil {
 			die("--config-json is not valid JSON: %v", err)
@@ -810,14 +811,27 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		if err != nil {
 			die("manifest materialise: %v", err)
 		}
-		if unresolved := findUnresolvedPlaceholders(spec); len(unresolved) > 0 {
-			die("template refers to unset values: %s — provide them via --config-json", strings.Join(unresolved, ", "))
+		if unresolved := findUnresolvedPlaceholders(spec.Config); len(unresolved) > 0 {
+			// For compose runtimes we expect ${secret.X} to survive
+			// materialisation — the agent driver substitutes them at
+			// apply time. Filter those out before complaining.
+			var real []string
+			for _, u := range unresolved {
+				if spec.Runtime == "compose" && (strings.HasPrefix(u, "secret.") || strings.HasPrefix(u, "cfg.")) {
+					continue
+				}
+				real = append(real, u)
+			}
+			if len(real) > 0 {
+				die("template refers to unset values: %s — provide them via --config-json", strings.Join(real, ", "))
+			}
 		}
 		var asAny any
-		if err := json.Unmarshal(spec, &asAny); err != nil {
+		if err := json.Unmarshal(spec.Config, &asAny); err != nil {
 			die("materialise self-check: %v", err)
 		}
 		configRaw = asAny
+		runtimeKind = spec.Runtime
 
 		// Fall back to the manifest's metadata.version when the api
 		// didn't pass --version explicitly. The api's snapshot
@@ -838,7 +852,7 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 	code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/instances", map[string]any{
 		"id":            *iid,
 		"template_id":   *tid,
-		"runtime":       "container",
+		"runtime":       runtimeKind,
 		"version":       *version,
 		"desired_state": "installed",
 		"config":        configRaw,
