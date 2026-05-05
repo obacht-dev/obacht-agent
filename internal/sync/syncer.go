@@ -28,6 +28,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	"github.com/obacht-dev/obacht-agent/internal/telemetry"
@@ -51,7 +52,15 @@ type Syncer struct {
 	pushEvery      time.Duration
 	telemetryEvery time.Duration
 	telemetry      telemetry.Collector
+
+	// Optional — when set, syncer enriches compose-runtime instances
+	// in the observed-state push with per-service status. Nil-safe.
+	compose *compose.Driver
 }
+
+// SetCompose attaches the compose driver so observed-state pushes can
+// include per-service health for bundle instances.
+func (s *Syncer) SetCompose(d *compose.Driver) { s.compose = d }
 
 // New constructs a Syncer. agentVersion should be the build version baked
 // into the binary (or "dev" for local builds). A nil audit writer is
@@ -217,6 +226,9 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		// Spec v2.1+: tell the api which runtime materialised this
 		// instance so the webapp can render the right details panel.
 		Runtime string `json:"runtime,omitempty"`
+		// Spec v2.1+: per-service health for compose bundles. Empty for
+		// single-container instances.
+		ServicesStatus []compose.ServiceStatus `json:"services_status,omitempty"`
 	}
 	type bindOut struct {
 		Domain      string `json:"domain"`
@@ -252,6 +264,16 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		}
 		if !i.ObservedAt.IsZero() {
 			o.ObservedAt = i.ObservedAt.Unix()
+		}
+		// For compose bundles, attach per-service docker status. Cheap
+		// (one `docker ps` per instance), failures are non-fatal — we
+		// just skip the field so the api keeps the previous snapshot.
+		if s.compose != nil && string(i.Runtime) == "compose" {
+			if st, err := s.compose.Status(ctx, i.ID); err == nil {
+				o.ServicesStatus = st
+			} else {
+				s.log.Debug("compose status", "instance", i.ID, "err", err)
+			}
 		}
 		instances = append(instances, o)
 	}

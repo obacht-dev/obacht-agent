@@ -161,6 +161,7 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 	if cfg.Server.URL != "" && authToken != "" {
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
+		syncer.SetCompose(composeDrv)
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		go wsClient.Run(ctx)
 		go syncer.Run(ctx)

@@ -226,6 +226,64 @@ func (d *Driver) List(ctx context.Context) ([]string, error) {
 	return out, nil
 }
 
+// ServiceStatus is a small report on one container inside a compose project.
+// Surfaced via the syncer so the webapp can render per-component health.
+type ServiceStatus struct {
+	Service string `json:"service"`
+	Name    string `json:"name,omitempty"`
+	State   string `json:"state,omitempty"`  // running / exited / created / restarting / paused / dead
+	Health  string `json:"health,omitempty"` // healthy / unhealthy / starting (only when a HEALTHCHECK is defined)
+	Image   string `json:"image,omitempty"`
+}
+
+// Status returns a per-service snapshot for the given compose instance by
+// querying docker directly (no `docker compose ps` so we don't need the
+// compose file to still exist on disk). Filters by the project label that
+// `docker compose --project-name obacht-<id>` sets on every container.
+func (d *Driver) Status(ctx context.Context, instanceID string) ([]ServiceStatus, error) {
+	cmd := exec.CommandContext(
+		ctx, "docker", "ps", "--all", "--no-trunc",
+		"--filter", "label=com.docker.compose.project="+ProjectName(instanceID),
+		"--format", "{{.Names}}|{{.Label \"com.docker.compose.service\"}}|{{.State}}|{{.Status}}|{{.Image}}",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("docker ps for %s: %w", instanceID, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	statuses := make([]ServiceStatus, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 5)
+		if len(parts) < 5 {
+			continue
+		}
+		s := ServiceStatus{
+			Name:    parts[0],
+			Service: parts[1],
+			State:   parts[2],
+			Image:   parts[4],
+		}
+		// docker ps embeds health in the Status column as "(healthy)" /
+		// "(unhealthy)" / "(health: starting)" — extract it so the api
+		// gets a clean field.
+		status := parts[3]
+		switch {
+		case strings.Contains(status, "(healthy)"):
+			s.Health = "healthy"
+		case strings.Contains(status, "(unhealthy)"):
+			s.Health = "unhealthy"
+		case strings.Contains(status, "health: starting"):
+			s.Health = "starting"
+		}
+		statuses = append(statuses, s)
+	}
+	sort.Slice(statuses, func(i, j int) bool { return statuses[i].Service < statuses[j].Service })
+	return statuses, nil
+}
+
 func (d *Driver) runCompose(ctx context.Context, instanceID string, args ...string) error {
 	full := []string{"compose", "--project-name", ProjectName(instanceID), "--file", filepath.Join(d.Workspace(instanceID), "docker-compose.yml")}
 	full = append(full, args...)
