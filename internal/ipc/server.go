@@ -155,6 +155,7 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/admin/instances", s.adminListInstances)
 	mux.HandleFunc("POST /v1/admin/instances", s.adminUpsertInstance)
 	mux.HandleFunc("DELETE /v1/admin/instances/{id}", s.adminDeleteInstance)
+	mux.HandleFunc("POST /v1/admin/instances/{id}/state", s.adminSetInstanceState)
 	mux.HandleFunc("POST /v1/admin/reconcile", s.adminTriggerReconcile)
 	mux.HandleFunc("POST /v1/admin/instances/{id}/secret", s.adminIssueSecret)
 
@@ -306,6 +307,60 @@ func (s *Server) adminDeleteInstance(w http.ResponseWriter, r *http.Request) {
 		s.rec.Trigger()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "marked_removed": id})
+}
+
+// adminSetInstanceState flips the desired_state of an existing
+// instance to "stopped" or "installed" and triggers a reconcile.
+//
+// Lighter-weight than the full upsert path: callers don't need the
+// template id / runtime / config, just the new state. Used by the
+// "Stop" / "Start" buttons in the webapp.
+func (s *Server) adminSetInstanceState(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		State string `json:"state"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<10)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	switch body.State {
+	case string(store.DesiredInstalled), string(store.DesiredStopped):
+	default:
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("state must be 'installed' or 'stopped', got %q", body.State))
+		return
+	}
+	inst, err := s.store.GetInstance(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	if string(inst.DesiredState) == body.State {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "state": body.State, "noop": true})
+		return
+	}
+	inst.DesiredState = store.DesiredState(body.State)
+	if err := s.store.UpsertInstance(r.Context(), *inst); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{
+			Op: "instance.set_state", Actor: "obachtctl", Target: id,
+			Result: audit.ResultError, ErrorMessage: err.Error(),
+			ParamsSummary: "state=" + body.State,
+		})
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{
+		Op: "instance.set_state", Actor: "obachtctl", Target: id,
+		ParamsSummary: "state=" + body.State,
+	})
+	if s.rec != nil {
+		s.rec.Trigger()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "state": body.State})
 }
 
 func (s *Server) adminTriggerReconcile(w http.ResponseWriter, r *http.Request) {

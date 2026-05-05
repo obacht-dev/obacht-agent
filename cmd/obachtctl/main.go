@@ -167,7 +167,7 @@ func (r *runtime) cmdReconcile(ctx context.Context, args []string) {
 
 func (r *runtime) cmdInstance(ctx context.Context, args []string) {
 	if len(args) == 0 {
-		die("usage: obachtctl instance <list|upsert|remove|secret>")
+		die("usage: obachtctl instance <list|upsert|remove|secret|set-state>")
 	}
 	switch args[0] {
 	case "list":
@@ -178,6 +178,8 @@ func (r *runtime) cmdInstance(ctx context.Context, args []string) {
 		r.instanceRemove(ctx, args[1:])
 	case "secret":
 		r.instanceSecret(ctx, args[1:])
+	case "set-state":
+		r.instanceSetState(ctx, args[1:])
 	default:
 		die("unknown instance subcommand: %s", args[0])
 	}
@@ -346,6 +348,29 @@ func (r *runtime) instanceSecret(ctx context.Context, args []string) {
 		die("%v", err)
 	}
 	emit(code, body)
+}
+
+// instanceSetState flips the desired state of an existing instance to
+// "stopped" or "installed" via the lighter-weight IPC route. Unlike
+// `instance upsert`, the caller does NOT need to know the template id
+// or config — the agent reads them from the existing row.
+func (r *runtime) instanceSetState(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("instance set-state", flag.ExitOnError)
+	id := fs.String("id", "", "instance id (required)")
+	state := fs.String("state", "", "installed|stopped (required)")
+	_ = fs.Parse(args)
+	if *id == "" || *state == "" {
+		die("--id and --state are required")
+	}
+	if *state != "installed" && *state != "stopped" {
+		die("--state must be 'installed' or 'stopped'")
+	}
+	body, _ := json.Marshal(map[string]string{"state": *state})
+	code, resp, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/instances/"+*id+"/state", body)
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, resp)
 }
 
 // --- domain / ingress commands ---
