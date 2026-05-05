@@ -46,6 +46,23 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// Some migrations (e.g. 0008) patch sqlite_master directly via
+	// PRAGMA writable_schema. The connection that ran the migration
+	// holds a stale parsed schema until it is closed. Reopen so the
+	// new connection picks up the patched schema on its first use.
+	_ = db.Close()
+	db, err = sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("reopen sqlite %s: %w", path, err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("ping sqlite after reopen: %w", err)
+	}
+	s.db = db
 	return s, nil
 }
 
