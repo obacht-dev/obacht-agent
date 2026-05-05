@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"runtime"
 	"time"
 
@@ -166,6 +167,7 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 
 func (s *Syncer) sendRegister() {
 	ident := compat.Detect("/var/lib/obacht")
+	hostname, _ := os.Hostname()
 	payload := map[string]any{
 		"deviceId":      s.deviceID,
 		"agentVersion":  s.agentVersion,
@@ -174,6 +176,7 @@ func (s *Syncer) sendRegister() {
 		"specVersion":   spec.SupportedSpecVersion,
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
+		"hostname":      hostname,
 		"compat":        ident,
 		"schemaVersion": s.readSchemaVersion(),
 	}
