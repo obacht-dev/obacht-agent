@@ -26,6 +26,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/ipc"
 	"github.com/obacht-dev/obacht-agent/internal/logging"
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
+	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	syncpkg "github.com/obacht-dev/obacht-agent/internal/sync"
@@ -116,6 +117,13 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 
 	rec := reconciler.New(st, docker, log.With("component", "reconciler"), *reconcileEv)
 	rec.SetSocketPath(cfg.Paths.Socket)
+
+	// Compose runtime driver — bundle templates (spec v2.1).
+	if err := os.MkdirAll(cfg.Paths.ComposeRoot, 0o750); err != nil {
+		log.Warn("mkdir compose root", "err", err, "path", cfg.Paths.ComposeRoot)
+	}
+	composeDrv := compose.New(cfg.Paths.ComposeRoot, st, log.With("component", "compose"))
+	rec.SetCompose(composeDrv)
 
 	// Ingress (Caddy). Bootstrapped lazily in the background — pulling the
 	// Caddy image can take a while and we don't want to block IPC startup.

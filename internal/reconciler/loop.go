@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
@@ -21,6 +22,7 @@ type Reconciler struct {
 	store    *store.Store
 	docker   *container.Driver
 	system   *system.Driver
+	compose  *compose.Driver
 	ingress  IngressApplier
 	interval time.Duration
 	log      *slog.Logger
@@ -54,6 +56,10 @@ func New(st *store.Store, docker *container.Driver, log *slog.Logger, interval t
 		trigger:  make(chan struct{}, 1),
 	}
 }
+
+// SetCompose wires a compose driver. Optional: nil disables compose-runtime
+// instances (they are skipped with a warning).
+func (r *Reconciler) SetCompose(c *compose.Driver) { r.compose = c }
 
 // SetIngress wires an ingress manager that will be Apply()-ed at the end of
 // every reconcile pass. Optional — nil disables ingress reconciliation.
@@ -134,6 +140,8 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		switch inst.Runtime {
 		case store.RuntimeContainer:
 			r.reconcileContainer(ctx, inst, observedByInstance)
+		case store.RuntimeCompose:
+			r.reconcileCompose(ctx, inst)
 		case store.RuntimeSystem:
 			r.reconcileSystem(ctx, inst)
 		default:
@@ -332,4 +340,76 @@ func (r *Reconciler) injectIPC(ctx context.Context, instanceID string, spec *con
 		})
 	}
 	return nil
+}
+
+// reconcileCompose converges a single compose-runtime (bundle) instance.
+// Mirrors reconcileContainer but dispatches to the compose driver.
+func (r *Reconciler) reconcileCompose(ctx context.Context, inst store.Instance) {
+	if r.compose == nil {
+		r.log.Warn("compose-runtime instance but no compose driver wired", "instance", inst.ID)
+		return
+	}
+	switch inst.DesiredState {
+	case store.DesiredInstalled:
+		spec, err := compose.ParseSpec(inst.ConfigJSON)
+		if err != nil {
+			if errors.Is(err, compose.ErrEmptySpec) {
+				r.log.Warn("compose instance has empty config_json, skipping", "instance", inst.ID)
+				return
+			}
+			r.log.Error("parse compose spec", "instance", inst.ID, "err", err)
+			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
+				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
+			}
+			return
+		}
+		changed, err := r.compose.Apply(ctx, inst.ID, inst.TemplateID, spec)
+		if err != nil {
+			r.log.Error("apply compose instance", "instance", inst.ID, "err", err)
+			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
+				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
+			}
+			return
+		}
+		if changed {
+			r.log.Info("compose applied", "instance", inst.ID, "template", inst.TemplateID)
+		}
+		// Register the manifest's named services so ingress bindings can
+		// route. For compose runtimes the upstream is the docker-compose
+		// container DNS name, which is `obacht-<id>-<targetService>-1`.
+		for _, svc := range spec.Services {
+			if svc.Name == "" || svc.TargetPort == 0 || svc.TargetService == "" {
+				continue
+			}
+			target := fmt.Sprintf("%s:%d", compose.PrimaryContainerName(inst.ID, svc.TargetService), svc.TargetPort)
+			if err := r.store.UpsertService(ctx, store.InstanceService{
+				InstanceID:  inst.ID,
+				ServiceName: svc.Name,
+				TargetType:  "docker_dns",
+				Target:      target,
+			}); err != nil {
+				r.log.Warn("upsert compose service", "instance", inst.ID, "service", svc.Name, "err", err)
+			}
+		}
+		if err := r.store.SetObservedState(ctx, inst.ID, "installed", ""); err != nil {
+			r.log.Warn("record observed state", "instance", inst.ID, "err", err)
+		}
+	case store.DesiredStopped:
+		// "Stopped" for compose is treated like Remove without GC of secrets
+		// or workspace; we still tear down containers.
+		if _, err := r.compose.Remove(ctx, inst.ID); err != nil {
+			r.log.Error("stop compose instance", "instance", inst.ID, "err", err)
+		}
+	case store.DesiredRemoved:
+		if _, err := r.compose.Remove(ctx, inst.ID); err != nil {
+			r.log.Error("remove compose instance", "instance", inst.ID, "err", err)
+			return
+		}
+		if err := r.store.ReleaseLocksForInstance(ctx, inst.ID); err != nil {
+			r.log.Warn("release locks", "instance", inst.ID, "err", err)
+		}
+		if err := r.store.DeleteInstance(ctx, inst.ID); err != nil {
+			r.log.Error("delete instance row", "instance", inst.ID, "err", err)
+		}
+	}
 }

@@ -37,6 +37,7 @@ type PathsConfig struct {
 	CaddyData   string `yaml:"caddyData"`   // /var/lib/obacht/caddy/data
 	CaddyConfig string `yaml:"caddyConfig"` // /var/lib/obacht/caddy/config
 	AuditLog    string `yaml:"auditLog"`    // append-only JSONL audit log
+	ComposeRoot string `yaml:"composeRoot"` // workspace root for compose-runtime instances
 }
 
 type IngressConfig struct {
@@ -85,6 +86,17 @@ func DefaultAuditLog() string {
 	return "/var/log/obacht/audit.log"
 }
 
+// DefaultComposeRoot returns the workspace root for compose-runtime
+// instances (one subdir per instance).
+func DefaultComposeRoot() string {
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Application Support", "obacht", "compose")
+		}
+	}
+	return "/var/lib/obacht/compose"
+}
+
 // Load reads a config file. Returns a zero-value config + nil error if the
 // file does not exist (caller may decide whether that is fatal).
 func Load(path string) (*Config, error) {
@@ -123,6 +135,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Paths.AuditLog == "" {
 		c.Paths.AuditLog = DefaultAuditLog()
+	}
+	if c.Paths.ComposeRoot == "" {
+		c.Paths.ComposeRoot = DefaultComposeRoot()
 	}
 	if c.Ingress.Image == "" {
 		c.Ingress.Image = "caddy:2-alpine"

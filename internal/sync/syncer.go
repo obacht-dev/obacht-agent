@@ -23,6 +23,9 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/compat"
+	"github.com/obacht-dev/obacht-agent/internal/spec"
+
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
@@ -153,13 +156,16 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 }
 
 func (s *Syncer) sendRegister() {
+	ident := compat.Detect("/var/lib/obacht")
 	payload := map[string]any{
 		"deviceId":      s.deviceID,
 		"agentVersion":  s.agentVersion,
 		"agentV2":       true,
-		"capabilities":  []string{"ingress.caddy", "runtime.container", "ipc.unix"},
+		"capabilities":  []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix"},
+		"specVersion":   spec.SupportedSpecVersion,
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,
+		"compat":        ident,
 		"schemaVersion": s.readSchemaVersion(),
 	}
 	if err := s.client.Emit("agent:register", payload); err != nil {

@@ -13,6 +13,7 @@ type Runtime string
 
 const (
 	RuntimeContainer Runtime = "container"
+	RuntimeCompose   Runtime = "compose"
 	RuntimeSystem    Runtime = "system"
 )
 
