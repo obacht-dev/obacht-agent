@@ -508,7 +508,7 @@ func (r *runtime) cmdAudit(ctx context.Context, args []string) {
 
 func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 	if len(args) == 0 {
-		die("usage: obachtctl system <status|set-power-mode|unlock-power|lock-power>")
+		die("usage: obachtctl system <status|set-power-mode|unlock-power|lock-power|update-agent>")
 	}
 	switch args[0] {
 	case "status":
@@ -524,8 +524,47 @@ func (r *runtime) cmdSystem(ctx context.Context, args []string) {
 		r.systemUnlockPower(ctx, args[1:])
 	case "lock-power":
 		r.systemLockPower(ctx, args[1:])
+	case "update-agent":
+		r.systemUpdateAgent(ctx, args[1:])
 	default:
 		die("unknown system subcommand: %s", args[0])
+	}
+}
+
+// systemUpdateAgent shells out to the privileged self-update wrapper
+// installed at /usr/local/sbin/obacht-self-update. The wrapper itself
+// is a fixed-content shell script that re-runs install.sh in
+// --self-update mode, so the only argv we control is the version tag
+// (or "latest"). The caller does not need to be root — sudo is
+// gated by the obacht-bootstrap sudoers fragment.
+func (r *runtime) systemUpdateAgent(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("system update-agent", flag.ExitOnError)
+	version := fs.String("version", "latest", "release tag (e.g. v0.3.7) or 'latest'")
+	_ = fs.Parse(args)
+	if *version == "" {
+		die("--version cannot be empty")
+	}
+	// Validate against the same regex the helper enforces, so we fail
+	// fast with a useful message rather than letting sudo error out.
+	if *version != "latest" {
+		ok := len(*version) > 1 && (*version)[0] == 'v'
+		if ok {
+			for _, c := range (*version)[1:] {
+				if !(c >= '0' && c <= '9') && c != '.' {
+					ok = false
+					break
+				}
+			}
+		}
+		if !ok {
+			die("--version must be 'latest' or vX.Y.Z, got %q", *version)
+		}
+	}
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "/usr/local/sbin/obacht-self-update", *version)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		die("obacht-self-update failed: %v", err)
 	}
 }
 

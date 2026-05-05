@@ -57,6 +57,7 @@ while [ $# -gt 0 ]; do
     --token)     TOKEN="$2";     shift 2 ;;
     --api-url)   API_URL="$2";   shift 2 ;;
     --version)   RELEASE_TAG="$2"; shift 2 ;;
+    --self-update) SELF_UPDATE=1; shift 1 ;;
     --help|-h)   usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -65,6 +66,19 @@ done
 if [ "$(id -u)" -ne 0 ]; then
   echo "please run as root (sudo)" >&2
   exit 1
+fi
+# In --self-update mode we re-use the existing /etc/obacht/agent-v2.yml
+# (device id + token already provisioned). Skip the required-args check.
+if [ "${SELF_UPDATE:-0}" = "1" ]; then
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "--self-update requires an existing $CONFIG_FILE" >&2
+    exit 2
+  fi
+  # Pull current device-id + token from the YAML so the rest of the
+  # install script (which writes the config) regenerates the same
+  # values. Cheap parsing — config is owned by us.
+  DEVICE_ID="${DEVICE_ID:-$(awk '/^[[:space:]]*deviceId:/{print $2; exit}' "$CONFIG_FILE")}"
+  TOKEN="${TOKEN:-$(awk '/^[[:space:]]*authToken:/{print $2; exit}' "$CONFIG_FILE")}"
 fi
 if [ -z "$DEVICE_ID" ] || [ -z "$TOKEN" ]; then
   echo "--device-id and --token are required" >&2
@@ -134,6 +148,39 @@ ln -sf "$INSTALL_DIR/obachtctl" /usr/local/bin/obachtctl
 if [ -f "$src_dir/obacht-power-toggle" ]; then
   install -m 0755 "$src_dir/obacht-power-toggle" /usr/local/sbin/obacht-power-toggle
 fi
+
+# S5: privileged self-update wrapper. Same trust model as
+# obacht-power-toggle: a fixed-content shell script at a pinned path,
+# allowed via sudoers. Lets the obacht user (and through it, the
+# webapp via ssh-gateway → obachtctl) re-run this very installer to
+# upgrade the agent in place.
+echo "==> writing /usr/local/sbin/obacht-self-update"
+cat > /usr/local/sbin/obacht-self-update <<'SELF'
+#!/usr/bin/env bash
+# Managed by obacht-agent install.sh — fixed content. Only argv is the
+# release tag (or "latest"). Pinned URL means the only attack surface
+# is whatever is published under obacht-dev/obacht-agent on GitHub
+# Releases, which is exactly what install.sh already trusts.
+set -euo pipefail
+ver="${1:-latest}"
+case "$ver" in
+  latest|v[0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "obacht-self-update: invalid version $ver" >&2; exit 2 ;;
+esac
+url="https://github.com/obacht-dev/obacht-agent/releases/${ver}/download/install.sh"
+if [ "$ver" = "latest" ]; then
+  url="https://github.com/obacht-dev/obacht-agent/releases/latest/download/install.sh"
+else
+  url="https://github.com/obacht-dev/obacht-agent/releases/download/${ver}/install.sh"
+fi
+echo "==> obacht-self-update: fetching $url"
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL -o "$tmp" "$url"
+chmod +x "$tmp"
+OBACHT_AGENT_VERSION="$ver" bash "$tmp" --self-update
+SELF
+chmod 0755 /usr/local/sbin/obacht-self-update
 
 # ---------------------------------------------------------------------------
 # S5: create the unprivileged `obacht` user that the agent runs as.
@@ -216,6 +263,12 @@ if [ -x /usr/local/sbin/obacht-power-toggle ]; then
 # This is the ONLY sudoers grant the agent gets at install time.
 obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle enable
 obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle disable
+# Phase F3: lets the same user trigger an in-place upgrade by re-running
+# install.sh. The helper accepts a version tag (or "latest") as its
+# only argv and downloads + verifies install.sh from the pinned GitHub
+# release URL. Sudoers wildcard scopes to a single argv whose value
+# is whitelisted inside the helper itself.
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-self-update *
 SUDO
   chmod 0440 "$tmp_sudoers"
   if command -v visudo >/dev/null 2>&1; then
