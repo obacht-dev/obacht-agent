@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -178,6 +179,11 @@ func (s *Server) routes(mux *http.ServeMux) {
 	// out to `sudo -n systemctl ...` (gated by Power Mode in the sudoers
 	// snippet maintained by obacht-power-toggle).
 	mux.HandleFunc("GET /v1/admin/systemd-services", s.adminListSystemdServices)
+
+	// Read-only container logs for an installed instance. Tail-only,
+	// capped at 5000 lines per request — operator UX for "why did my
+	// thing crash". Shells out to `docker logs`.
+	mux.HandleFunc("GET /v1/admin/instances/{id}/logs", s.adminInstanceLogs)
 
 	// Template (Bearer per-instance secret required).
 	mux.HandleFunc("GET /v1/template/self", s.templateSelf)
@@ -780,4 +786,157 @@ func (s *Server) adminListSystemdServices(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"services": svcs})
+}
+
+// adminInstanceLogs returns docker logs for a specific service of a
+// compose-runtime instance, OR the single managed container of a
+// container-runtime instance. Pure read-only; no auth beyond socket FS
+// perms (same trust model as adminListSystemdServices).
+//
+// Query:
+//   - service:  optional. compose service name (e.g. "ollama"). Required
+//     for compose instances; ignored for container instances. Validated
+//     against `^[a-zA-Z0-9_-]+$` to keep shell-injection out of reach.
+//   - tail:     optional, default 200, max 5000.
+//
+// We pick the container by listing all containers labelled
+// com.docker.compose.project=obacht-<id> and matching service label —
+// this avoids guessing the "-1" suffix and works for replicated services
+// even though we never set replicas > 1 today.
+func (s *Server) adminInstanceLogs(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("instance id required"))
+		return
+	}
+	// Validate id — instance ids are alphanumeric + dash already, but
+	// be paranoid.
+	if !isSafeArg(id) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid instance id"))
+		return
+	}
+	service := r.URL.Query().Get("service")
+	if service != "" && !isSafeArg(service) {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid service name"))
+		return
+	}
+	tail := 200
+	if t := r.URL.Query().Get("tail"); t != "" {
+		if n, err := strconv.Atoi(t); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 5000 {
+				n = 5000
+			}
+			tail = n
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	project := "obacht-" + id
+
+	// Resolve container name. Filter by compose project (always set by
+	// our compose runtime) and, when given, by service label.
+	psArgs := []string{
+		"ps", "-a",
+		"--filter", "label=com.docker.compose.project=" + project,
+		"--format", "{{.Names}}|{{.Label \"com.docker.compose.service\"}}",
+	}
+	out, err := exec.CommandContext(ctx, "docker", psArgs...).Output()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("docker ps: %w", err))
+		return
+	}
+	type entry struct{ name, svc string }
+	var matches []entry
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if service != "" && parts[1] != service {
+			continue
+		}
+		matches = append(matches, entry{name: parts[0], svc: parts[1]})
+	}
+	// Fall back to container-runtime naming (single container, name is
+	// "obacht-<id>") if nothing matched the compose project.
+	if len(matches) == 0 && service == "" {
+		fallback := "obacht-" + id
+		out2, err2 := exec.CommandContext(ctx, "docker", "ps", "-a",
+			"--filter", "name=^"+fallback+"$",
+			"--format", "{{.Names}}").Output()
+		if err2 == nil {
+			if name := strings.TrimSpace(string(out2)); name != "" {
+				matches = append(matches, entry{name: name, svc: ""})
+			}
+		}
+	}
+	if len(matches) == 0 {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("no container found for instance %q service %q", id, service))
+		return
+	}
+	// Always log the FIRST match (we don't have replicated services).
+	container := matches[0].name
+
+	logsArgs := []string{"logs", "--tail", strconv.Itoa(tail), "--timestamps", container}
+	logsOut, err := exec.CommandContext(ctx, "docker", logsArgs...).CombinedOutput()
+	if err != nil && len(logsOut) == 0 {
+		writeErr(w, http.StatusInternalServerError, fmt.Errorf("docker logs: %w", err))
+		return
+	}
+
+	// Build a small list of available services so the UI can populate a
+	// service-picker without a second roundtrip.
+	services := make([]string, 0, len(matches))
+	seen := map[string]bool{}
+	if service == "" {
+		// Re-query without service filter to enumerate all.
+		out3, _ := exec.CommandContext(ctx, "docker", "ps", "-a",
+			"--filter", "label=com.docker.compose.project="+project,
+			"--format", "{{.Label \"com.docker.compose.service\"}}").Output()
+		for _, l := range strings.Split(strings.TrimSpace(string(out3)), "\n") {
+			l = strings.TrimSpace(l)
+			if l == "" || seen[l] {
+				continue
+			}
+			seen[l] = true
+			services = append(services, l)
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"instance":  id,
+		"service":   service,
+		"container": container,
+		"tail":      tail,
+		"logs":      string(logsOut),
+		"services":  services,
+	})
+}
+
+// isSafeArg ensures the value is non-empty and matches the
+// alphanumeric+dash+underscore pattern. Used as an extra guardrail
+// before passing to docker CLI args (which already only takes them as
+// argv elements, not via shell, so injection is structurally
+// impossible — but better explicit than implicit).
+func isSafeArg(s string) bool {
+	if s == "" || len(s) > 200 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= 'a' && c <= 'z') &&
+			!(c >= 'A' && c <= 'Z') &&
+			!(c >= '0' && c <= '9') &&
+			c != '-' && c != '_' && c != '.' {
+			return false
+		}
+	}
+	return true
 }

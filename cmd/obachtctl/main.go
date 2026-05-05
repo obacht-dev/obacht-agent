@@ -77,6 +77,8 @@ func main() {
 		rt.cmdService(ctx, args[1:])
 	case "system":
 		rt.cmdSystem(ctx, args[1:])
+	case "logs":
+		rt.cmdLogs(ctx, args[1:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", args[0])
 		usage(os.Stderr)
@@ -549,6 +551,31 @@ func (r *runtime) systemSetPowerMode(ctx context.Context, args []string) {
 		"key":   "power_mode",
 		"value": val,
 	})
+	if err != nil {
+		die("%v", err)
+	}
+	emit(code, body)
+}
+
+// cmdLogs returns docker logs for an instance's container/service.
+// Read-only; matches the IPC endpoint signature 1:1.
+//
+//	obachtctl logs --instance=<id> [--service=<name>] [--tail=200]
+func (r *runtime) cmdLogs(ctx context.Context, args []string) {
+	fs := flag.NewFlagSet("logs", flag.ExitOnError)
+	instance := fs.String("instance", "", "instance id (required)")
+	service := fs.String("service", "", "compose service name (required for compose instances)")
+	tail := fs.Int("tail", 200, "number of trailing log lines (max 5000)")
+	_ = fs.Parse(args)
+	if *instance == "" {
+		die("--instance is required")
+	}
+	r.requireIPC()
+	q := fmt.Sprintf("?tail=%d", *tail)
+	if *service != "" {
+		q += "&service=" + *service
+	}
+	code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/admin/instances/"+*instance+"/logs"+q, nil)
 	if err != nil {
 		die("%v", err)
 	}
