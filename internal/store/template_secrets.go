@@ -24,6 +24,12 @@ const (
 	CharsetAlphanumericSymbols = "alphanumeric_symbols"
 	CharsetHex                 = "hex"
 	CharsetBase64              = "base64"
+	// CharsetBase64Bytes means: generate `length` raw random bytes and emit
+	// them as standard padded base64. The resulting string is therefore
+	// longer than `length` chars (about 4*ceil(length/3)). Use this when
+	// the consumer (e.g. Laravel APP_KEY) requires the decoded payload to
+	// be exactly `length` bytes long.
+	CharsetBase64Bytes = "base64_bytes"
 )
 
 const (
@@ -55,6 +61,12 @@ func GenerateSecretValue(charset string, length int) (string, error) {
 			return "", err
 		}
 		return base64.RawStdEncoding.EncodeToString(buf)[:length], nil
+	case CharsetBase64Bytes:
+		buf := make([]byte, length)
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		return base64.StdEncoding.EncodeToString(buf), nil
 	default:
 		return "", fmt.Errorf("unknown charset %q", charset)
 	}
