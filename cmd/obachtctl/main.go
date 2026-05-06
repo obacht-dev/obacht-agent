@@ -903,12 +903,17 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 			die("manifest materialise: %v", err)
 		}
 		if unresolved := findUnresolvedPlaceholders(spec.Config); len(unresolved) > 0 {
-			// For compose runtimes we expect ${secret.X} to survive
-			// materialisation — the agent driver substitutes them at
-			// apply time. Filter those out before complaining.
+			// ${secret.X} placeholders are expected to survive
+			// materialisation for both compose AND container runtimes
+			// — the agent's reconciler substitutes them at apply time
+			// using values from the per-instance secret store. ${cfg.X}
+			// is also legal for compose (driver substitutes at apply).
 			var real []string
 			for _, u := range unresolved {
-				if spec.Runtime == "compose" && (strings.HasPrefix(u, "secret.") || strings.HasPrefix(u, "cfg.")) {
+				if strings.HasPrefix(u, "secret.") {
+					continue
+				}
+				if spec.Runtime == "compose" && strings.HasPrefix(u, "cfg.") {
 					continue
 				}
 				real = append(real, u)

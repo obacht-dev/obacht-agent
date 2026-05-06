@@ -105,6 +105,72 @@ type Spec struct {
 	Cmd      []string          `json:"cmd,omitempty"`
 	Labels   map[string]string `json:"labels,omitempty"`
 	Services []ServiceSpec     `json:"services,omitempty"`
+
+	// SecretsSchema lists secret keys to generate per instance. The
+	// reconciler substitutes ${secret.<key>} placeholders in env /
+	// volumes / labels / cmd with values fetched from the agent's
+	// secret store before calling Apply. Mirrors compose.SecretsSchema.
+	SecretsSchema []SecretField `json:"secretsSchema,omitempty"`
+}
+
+// SecretField mirrors manifest spec.secretsSchema entries. Same shape as
+// compose.SecretField — kept duplicated to avoid an import cycle.
+type SecretField struct {
+	Key     string `json:"key"`
+	Length  int    `json:"length,omitempty"`
+	Charset string `json:"charset,omitempty"`
+}
+
+// SecretProvider resolves ${secret.<key>} placeholders. Satisfied by the
+// agent store; tests can pass a stub.
+type SecretProvider interface {
+	EnsureTemplateSecret(ctx context.Context, instanceID, key, charset string, length int) (string, error)
+	DropTemplateSecrets(ctx context.Context, instanceID string) error
+}
+
+// ExpandSecrets resolves any ${secret.<key>} placeholders in env values,
+// volume sources/targets, label values and cmd args using the supplied
+// SecretProvider. Idempotent across reconcile passes — EnsureTemplateSecret
+// returns the existing value once one has been generated.
+func (s *Spec) ExpandSecrets(ctx context.Context, instanceID string, sp SecretProvider) error {
+	if s == nil || len(s.SecretsSchema) == 0 {
+		return nil
+	}
+	if sp == nil {
+		return errors.New("expand secrets: provider not wired")
+	}
+	repl := make(map[string]string, len(s.SecretsSchema))
+	for _, sf := range s.SecretsSchema {
+		if sf.Key == "" {
+			continue
+		}
+		val, err := sp.EnsureTemplateSecret(ctx, instanceID, sf.Key, sf.Charset, sf.Length)
+		if err != nil {
+			return fmt.Errorf("ensure secret %s: %w", sf.Key, err)
+		}
+		repl["${secret."+sf.Key+"}"] = val
+	}
+	sub := func(in string) string {
+		out := in
+		for k, v := range repl {
+			out = strings.ReplaceAll(out, k, v)
+		}
+		return out
+	}
+	for k, v := range s.Env {
+		s.Env[k] = sub(v)
+	}
+	for i := range s.Volumes {
+		s.Volumes[i].Source = sub(s.Volumes[i].Source)
+		s.Volumes[i].Target = sub(s.Volumes[i].Target)
+	}
+	for k, v := range s.Labels {
+		s.Labels[k] = sub(v)
+	}
+	for i := range s.Cmd {
+		s.Cmd[i] = sub(s.Cmd[i])
+	}
+	return nil
 }
 
 // ServiceSpec declares a named service exposed by the container that the

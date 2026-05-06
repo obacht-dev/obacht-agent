@@ -31,14 +31,15 @@ import (
 // internal/runtime/container/docker.go::Spec — the agent IPC layer
 // stores this verbatim into instances.config_json.
 type matSpec struct {
-	Image    string            `json:"image"`
-	Env      map[string]string `json:"env,omitempty"`
-	Ports    []matPortMap      `json:"ports,omitempty"`
-	Volumes  []matVolumeMount  `json:"volumes,omitempty"`
-	Network  string            `json:"network,omitempty"`
-	Cmd      []string          `json:"cmd,omitempty"`
-	Labels   map[string]string `json:"labels,omitempty"`
-	Services []matServiceSpec  `json:"services,omitempty"`
+	Image         string            `json:"image"`
+	Env           map[string]string `json:"env,omitempty"`
+	Ports         []matPortMap      `json:"ports,omitempty"`
+	Volumes       []matVolumeMount  `json:"volumes,omitempty"`
+	Network       string            `json:"network,omitempty"`
+	Cmd           []string          `json:"cmd,omitempty"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	Services      []matServiceSpec  `json:"services,omitempty"`
+	SecretsSchema []matSecretField  `json:"secretsSchema,omitempty"`
 }
 
 // Subset of compose.Spec we emit (mirrors
@@ -266,6 +267,31 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 				Name:       toString(sm["name"]),
 				TargetType: toString(sm["targetType"]),
 				TargetPort: toInt(sm["targetPort"]),
+			})
+		}
+	}
+
+	// secretsSchema flows through verbatim — the agent's reconciler
+	// substitutes ${secret.<key>} placeholders left in env/volumes/
+	// labels/cmd at apply time using values from its secret store.
+	if raw, ok := spec["secretsSchema"].([]any); ok {
+		for _, e := range raw {
+			em, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			k := toString(em["key"])
+			if k == "" {
+				continue
+			}
+			length := toInt(em["length"])
+			if length == 0 {
+				length = 32
+			}
+			out.SecretsSchema = append(out.SecretsSchema, matSecretField{
+				Key:     k,
+				Length:  length,
+				Charset: toString(em["charset"]),
 			})
 		}
 	}

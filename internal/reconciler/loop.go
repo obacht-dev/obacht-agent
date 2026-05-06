@@ -216,6 +216,13 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 			r.log.Error("inject ipc", "instance", inst.ID, "err", err)
 			return
 		}
+		if err := spec.ExpandSecrets(ctx, inst.ID, r.store); err != nil {
+			r.log.Error("expand secrets", "instance", inst.ID, "err", err)
+			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
+				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
+			}
+			return
+		}
 		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply instance", "instance", inst.ID, "err", err)
@@ -262,6 +269,9 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove instance", "instance", inst.ID, "err", err)
 			return
+		}
+		if err := r.store.DropTemplateSecrets(ctx, inst.ID); err != nil {
+			r.log.Warn("drop template secrets", "instance", inst.ID, "err", err)
 		}
 		if err := r.store.ReleaseLocksForInstance(ctx, inst.ID); err != nil {
 			r.log.Warn("release locks", "instance", inst.ID, "err", err)
