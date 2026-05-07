@@ -226,6 +226,9 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		ObservedState string `json:"observed_state,omitempty"`
 		ObservedAt    int64  `json:"observed_at,omitempty"`
 		ErrorMessage  string `json:"error_message,omitempty"`
+		// Echo persisted user config input so the api can retain
+		// device_template_instances.config across snapshot reconciles.
+		Config map[string]any `json:"config,omitempty"`
 		// Spec v2.1+: tell the api which runtime materialised this
 		// instance so the webapp can render the right details panel.
 		Runtime string `json:"runtime,omitempty"`
@@ -258,6 +261,14 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 			DesiredState:  string(i.DesiredState),
 			ObservedState: i.ObservedState,
 			Runtime:       string(i.Runtime),
+		}
+		if i.ConfigJSON != "" {
+			var cfg map[string]any
+			if err := json.Unmarshal([]byte(i.ConfigJSON), &cfg); err == nil {
+				if input, ok := cfg["__input"].(map[string]any); ok && len(input) > 0 {
+					o.Config = map[string]any{"__input": input}
+				}
+			}
 		}
 		// Surface the reconciler's last error so the api/webapp can
 		// show users WHY an install is stuck instead of forcing them

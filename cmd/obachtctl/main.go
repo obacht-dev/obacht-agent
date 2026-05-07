@@ -926,7 +926,15 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		if err := json.Unmarshal(spec.Config, &asAny); err != nil {
 			die("materialise self-check: %v", err)
 		}
-		configRaw = asAny
+		// Preserve the user-provided config (plus schema defaults applied
+		// during materialisation) alongside the materialised runtime spec.
+		// The webapp uses this `__input` map to prefill "Configure" later.
+		if m, ok := asAny.(map[string]any); ok {
+			m["__input"] = userCfg
+			configRaw = m
+		} else {
+			configRaw = asAny
+		}
 		runtimeKind = spec.Runtime
 
 		// Fall back to the manifest's metadata.version when the api
