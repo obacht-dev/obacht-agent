@@ -32,17 +32,19 @@ SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 DEVICE_ID=""
 TOKEN=""
 API_URL="https://api.eu.obacht.dev"
+REGISTRY_URL="https://registry.eu.obacht.dev"
 SKIP_START="${OBACHT_AGENT_SKIP_START:-0}"
 
 usage() {
   cat <<USAGE
 obacht-agent installer
 
-  --device-id   <uuid>   device id (required)
-  --token       <token>  one-time install token (required)
-  --api-url     <url>    api base url (default: $API_URL)
-  --version     <tag>    release tag (default: latest)
-  --help                 show this help
+  --device-id      <uuid>   device id (required)
+  --token          <token>  one-time install token (required)
+  --api-url        <url>    api base url (default: $API_URL)
+  --registry-url   <url>    template registry url (default: $REGISTRY_URL)
+  --version        <tag>    release tag (default: latest)
+  --help                    show this help
 
 env:
   OBACHT_AGENT_REPO=$REPO
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
     --device-id) DEVICE_ID="$2"; shift 2 ;;
     --token)     TOKEN="$2";     shift 2 ;;
     --api-url)   API_URL="$2";   shift 2 ;;
+    --registry-url) REGISTRY_URL="$2"; shift 2 ;;
     --version)   RELEASE_TAG="$2"; shift 2 ;;
     --self-update) SELF_UPDATE=1; shift 1 ;;
     --help|-h)   usage; exit 0 ;;
@@ -293,7 +296,7 @@ server:
   # file, replacing the install token.
   authToken: $TOKEN
 registry:
-  url: https://registry.eu.obacht.dev
+  url: $REGISTRY_URL
 paths:
   stateDb: $STATE_DIR/agent-v2.db
   socket: $RUNTIME_DIR/agent-v2.sock
