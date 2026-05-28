@@ -12,15 +12,15 @@ package trust
 // release binary. Better to fail closed.
 var EmbeddedKeys = []KeyEntry{
 	{
-		Label: "obacht-registry-2026",
-		// Fingerprint E8A98BCECC0397B0. Generated 2026-04-29 by
-		// scripts/sign-template-version --generate-key. Private key
-		// lives at ~/.config/obacht/obacht-registry-2026.key on the
-		// release engineer's workstation (passphrase in 1Password).
-		// Rotation: generate a new key, append to this slice, sign all
-		// versions with both keys, ship the new agent, then remove the
-		// old entry in the next release.
-		PubKey: "untrusted comment: minisign public key: E8A98BCECC0397B0\n" +
-			"RWSwlwPMzoup6CUZxhIqYsRS2p7x0wIi99GB+dv0aDMeqToF2UvJ0YX6\n",
+		Label: "obacht-registry-prod-1",
+		// Fingerprint 7263DA4AA71D7A3A. Generated 2026-05-28 (recovery
+		// after loss of obacht-registry-2026 secret key). Private key
+		// lives at ~/.config/obacht/obacht-registry-prod-1.key on the
+		// release engineer's workstation; back it up immediately to
+		// the password manager. Rotation: generate a new key, append
+		// to this slice, sign all versions with both keys, ship the
+		// new agent, then remove the old entry in the next release.
+		PubKey: "untrusted comment: minisign public key 7263DA4AA71D7A3A\n" +
+			"RWQ6eh2nStpjcld2gQQl2cSn4Hm7J4nHJ3uQzOZWlMRz1riY7+uRhcW4\n",
 	},
 }
