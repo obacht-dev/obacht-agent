@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -38,6 +39,18 @@ import (
 
 // ContainerName is the docker container name we use for Caddy.
 const ContainerName = "obacht-caddy"
+
+// domainRe matches a syntactically valid DNS hostname. Each domain is rendered
+// as an UNQUOTED Caddy site-block label (`<domain> {`), so a value containing
+// whitespace, braces or newlines could inject arbitrary Caddy directives.
+// Reject anything that is not a plain hostname before it reaches the Caddyfile.
+var domainRe = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$`)
+
+// isValidDomain reports whether d is a safe DNS hostname to render into the
+// Caddyfile (total length <= 253, only [A-Za-z0-9.-], valid label structure).
+func isValidDomain(d string) bool {
+	return len(d) <= 253 && domainRe.MatchString(d)
+}
 
 // Manager owns the Caddy lifecycle and Caddyfile generation.
 type Manager struct {
@@ -228,6 +241,14 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 	for _, d := range domains {
 		if d.DesiredStatus == store.DomainStatusRemoved {
 			summary.observed[d.Domain] = store.DomainStatusRemoved
+			continue
+		}
+		// Defense in depth: never render a domain that is not a plain DNS
+		// hostname — it would otherwise be emitted as an unquoted Caddy site
+		// label and could inject directives (SEC-12).
+		if !isValidDomain(d.Domain) {
+			m.log.Warn("skipping domain with invalid name", "domain", d.Domain)
+			summary.observed[d.Domain] = store.DomainStatusError
 			continue
 		}
 		summary.totalDomains++
