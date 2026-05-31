@@ -908,12 +908,18 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 			// — the agent's reconciler substitutes them at apply time
 			// using values from the per-instance secret store. ${cfg.X}
 			// is also legal for compose (driver substitutes at apply).
+			// For compose, any remaining bare ${VAR} is a docker-compose
+			// interpolation variable resolved from the project .env file at
+			// `docker compose up` (custom-docker-composition env field) — it
+			// must NOT be treated as an unset template value here.
 			var real []string
 			for _, u := range unresolved {
 				if strings.HasPrefix(u, "secret.") {
 					continue
 				}
-				if spec.Runtime == "compose" && strings.HasPrefix(u, "cfg.") {
+				if spec.Runtime == "compose" {
+					// cfg.* (driver subst) and bare ${VAR} (.env interp) both
+					// resolve later; nothing is "unset" for compose.
 					continue
 				}
 				real = append(real, u)

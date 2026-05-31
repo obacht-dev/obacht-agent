@@ -87,6 +87,17 @@ type Spec struct {
 	// SecretEnvKeys is the list of env-var-shaped keys to redact from
 	// agent telemetry (mirror of manifest spec.secrets).
 	SecretEnvKeys []string `json:"secret_env_keys,omitempty"`
+
+	// AllowUnpinnedImages relaxes digest-pinning for user-provided compose
+	// bodies (custom-docker-composition): images may be referenced by tag.
+	// When set, the rendered body is additionally validated against the
+	// compose allowlist before `docker compose up` (defence-in-depth).
+	AllowUnpinnedImages bool `json:"allow_unpinned_images,omitempty"`
+
+	// EnvFile is raw .env content (KEY=value lines) written next to the
+	// compose file and used by docker compose for ${VAR} interpolation.
+	// Used by custom-docker-composition's env textarea.
+	EnvFile string `json:"env_file,omitempty"`
 }
 
 // SecretField mirrors manifest spec.secretsSchema entries.
@@ -182,6 +193,15 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 	if err := os.WriteFile(composePath, []byte(body), 0o640); err != nil {
 		return false, fmt.Errorf("write compose: %w", err)
 	}
+
+	// Write the optional .env (custom-compose env textarea) so docker
+	// compose can interpolate ${VAR} references in the body. Always write
+	// (even empty) so a stale .env from a previous config can't linger.
+	envPath := filepath.Join(ws, ".env")
+	if err := os.WriteFile(envPath, []byte(spec.EnvFile), 0o640); err != nil {
+		return false, fmt.Errorf("write env file: %w", err)
+	}
+
 	newHash := sha256Hex([]byte(body))
 	changed := prevHash != newHash
 
@@ -309,7 +329,12 @@ func (d *Driver) Status(ctx context.Context, instanceID string) ([]ServiceStatus
 }
 
 func (d *Driver) runCompose(ctx context.Context, instanceID string, args ...string) error {
-	full := []string{"compose", "--project-name", ProjectName(instanceID), "--file", filepath.Join(d.Workspace(instanceID), "docker-compose.yml")}
+	ws := d.Workspace(instanceID)
+	full := []string{"compose", "--project-name", ProjectName(instanceID), "--file", filepath.Join(ws, "docker-compose.yml")}
+	// Include the per-instance .env for ${VAR} interpolation when present.
+	if envPath := filepath.Join(ws, ".env"); fileExists(envPath) {
+		full = append(full, "--env-file", envPath)
+	}
 	full = append(full, args...)
 	cmd := exec.CommandContext(ctx, "docker", full...)
 	out, err := cmd.CombinedOutput()
@@ -344,8 +369,18 @@ func (d *Driver) renderBody(ctx context.Context, instanceID string, spec Spec) (
 		return "", fmt.Errorf("unsubstituted placeholder: %s", remain)
 	}
 
-	// 3. Pin image digests. Walk every `image:` line; rewrite with @sha256.
-	pinned, err := pinImages(body, spec.ImageDigests)
+	// 3. For untrusted user-provided bodies: enforce the compose allowlist
+	// (defence-in-depth) before we ever run docker compose up.
+	if spec.AllowUnpinnedImages {
+		if err := ValidateComposeBody(body); err != nil {
+			return "", err
+		}
+	}
+
+	// 4. Pin image digests. Walk every `image:` line; rewrite with @sha256.
+	// For custom bodies (AllowUnpinnedImages) missing digests are tolerated
+	// and the image runs by tag.
+	pinned, err := pinImages(body, spec.ImageDigests, spec.AllowUnpinnedImages)
 	if err != nil {
 		return "", err
 	}
@@ -376,8 +411,10 @@ func findUnsubstituted(body string) string {
 }
 
 // pinImages rewrites `image: <ref>` lines to `image: <ref>@sha256:...` using
-// the digests map. Refs already pinned are left alone.
-func pinImages(body string, digests map[string]string) (string, error) {
+// the digests map. Refs already pinned are left alone. When allowUnpinned is
+// true, refs missing from the map are left as their tag instead of failing
+// (used for user-provided custom-compose bodies).
+func pinImages(body string, digests map[string]string, allowUnpinned bool) (string, error) {
 	if digests == nil {
 		digests = map[string]string{}
 	}
@@ -393,7 +430,9 @@ func pinImages(body string, digests map[string]string) (string, error) {
 		}
 		dig, ok := digests[ref]
 		if !ok {
-			missing[ref] = true
+			if !allowUnpinned {
+				missing[ref] = true
+			}
 			return line
 		}
 		return prefix + lq + ref + "@" + dig + rq
@@ -420,4 +459,9 @@ func fileHash(path string) string {
 		return ""
 	}
 	return sha256Hex(b)
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

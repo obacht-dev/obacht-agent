@@ -19,7 +19,7 @@ func TestPinImages(t *testing.T) {
 		"ghost:5":   "sha256:" + strings.Repeat("a", 64),
 		"mysql:8.0": "sha256:" + strings.Repeat("b", 64),
 	}
-	out, err := pinImages(body, digests)
+	out, err := pinImages(body, digests, false)
 	if err != nil {
 		t.Fatalf("pinImages: %v", err)
 	}
@@ -31,9 +31,20 @@ func TestPinImages(t *testing.T) {
 	}
 }
 
+func TestPinImagesAllowUnpinned(t *testing.T) {
+	body := "services:\n  web:\n    image: ghost:5\n"
+	out, err := pinImages(body, map[string]string{}, true)
+	if err != nil {
+		t.Fatalf("pinImages allowUnpinned: %v", err)
+	}
+	if !strings.Contains(out, "image: ghost:5") || strings.Contains(out, "@sha256") {
+		t.Errorf("expected unpinned tag left as-is: %s", out)
+	}
+}
+
 func TestPinImagesMissingDigest(t *testing.T) {
 	body := "services:\n  web:\n    image: ghost:5\n"
-	_, err := pinImages(body, map[string]string{})
+	_, err := pinImages(body, map[string]string{}, false)
 	if err == nil || !strings.Contains(err.Error(), "missing image digest") {
 		t.Errorf("expected missing-digest error, got %v", err)
 	}
@@ -42,7 +53,7 @@ func TestPinImagesMissingDigest(t *testing.T) {
 func TestPinImagesAlreadyPinned(t *testing.T) {
 	digestRef := "ghost:5@sha256:" + strings.Repeat("c", 64)
 	body := "services:\n  web:\n    image: " + digestRef + "\n"
-	out, err := pinImages(body, map[string]string{})
+	out, err := pinImages(body, map[string]string{}, false)
 	if err != nil {
 		t.Fatalf("pinImages: %v", err)
 	}

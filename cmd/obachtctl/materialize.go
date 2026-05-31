@@ -55,6 +55,9 @@ type matComposeSpec struct {
 	Services       []matComposeServiceSpec `json:"services,omitempty"`
 	Config         map[string]string       `json:"config,omitempty"`
 	SecretEnvKeys  []string                `json:"secret_env_keys,omitempty"`
+	// Custom-docker-composition support.
+	AllowUnpinnedImages bool   `json:"allow_unpinned_images,omitempty"`
+	EnvFile             string `json:"env_file,omitempty"`
 }
 
 type matSecretField struct {
@@ -314,13 +317,28 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 	if strings.TrimSpace(body) == "" {
 		return nil, fmt.Errorf("manifest missing spec.runtime.compose.body")
 	}
-	primaryService := toString(composeBlock["primaryService"])
+
+	// Flatten user config first: custom-docker-composition drives the
+	// compose body, primary service/port and env from cfg values, so we
+	// must resolve ${cfg.X} in those structural manifest fields here.
+	cfgFlat := map[string]string{}
+	for k, v := range userConfig {
+		cfgFlat[k] = toString(v)
+	}
+
+	primaryService := resolveCfgPlaceholders(toString(composeBlock["primaryService"]), cfgFlat)
 	if primaryService == "" {
 		return nil, fmt.Errorf("manifest missing spec.runtime.compose.primaryService")
 	}
-	primaryPort := toInt(composeBlock["primaryPort"])
+	primaryPort := toInt(resolveCfgPlaceholders(toString(composeBlock["primaryPort"]), cfgFlat))
 	if primaryPort == 0 {
 		return nil, fmt.Errorf("manifest missing spec.runtime.compose.primaryPort")
+	}
+
+	allowUnpinned := toBool(composeBlock["allowUnpinnedImages"])
+	var envFile string
+	if envKey := toString(composeBlock["envConfigKey"]); envKey != "" {
+		envFile = cfgFlat[envKey]
 	}
 
 	// We DON'T substitute ${cfg.X} into the body here — the agent does it
@@ -376,11 +394,14 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 				// Default to primaryService when omitted (single-service
 				// bundles often skip it).
 				targetService = primaryService
+			} else {
+				targetService = resolveCfgPlaceholders(targetService, cfgFlat)
 			}
+			targetPort := toInt(resolveCfgPlaceholders(toString(sm["targetPort"]), cfgFlat))
 			services = append(services, matComposeServiceSpec{
 				Name:          toString(sm["name"]),
 				TargetService: targetService,
-				TargetPort:    toInt(sm["targetPort"]),
+				TargetPort:    targetPort,
 			})
 		}
 	}
@@ -394,20 +415,17 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 		}
 	}
 
-	cfgFlat := map[string]string{}
-	for k, v := range userConfig {
-		cfgFlat[k] = toString(v)
-	}
-
 	out := matComposeSpec{
-		ComposeBody:    bodyResolved,
-		PrimaryService: primaryService,
-		PrimaryPort:    primaryPort,
-		ImageDigests:   imageDigests,
-		SecretsSchema:  secretsSchema,
-		Services:       services,
-		Config:         cfgFlat,
-		SecretEnvKeys:  secretEnvKeys,
+		ComposeBody:         bodyResolved,
+		PrimaryService:      primaryService,
+		PrimaryPort:         primaryPort,
+		ImageDigests:        imageDigests,
+		SecretsSchema:       secretsSchema,
+		Services:            services,
+		Config:              cfgFlat,
+		SecretEnvKeys:       secretEnvKeys,
+		AllowUnpinnedImages: allowUnpinned,
+		EnvFile:             envFile,
 	}
 	return json.Marshal(out)
 }
@@ -570,6 +588,26 @@ func toBool(v any) bool {
 		return strings.EqualFold(t, "true")
 	}
 	return false
+}
+
+// resolveCfgPlaceholders replaces ${cfg.X} tokens in a structural manifest
+// field (primaryService/primaryPort/services) with the user's config values.
+// Used by custom-docker-composition so those fields can be driven by cfg.
+// Leaves ${secret.X} and other placeholders untouched.
+func resolveCfgPlaceholders(in string, cfg map[string]string) string {
+	if in == "" {
+		return in
+	}
+	return placeholderRe.ReplaceAllStringFunc(in, func(match string) string {
+		key := match[2 : len(match)-1]
+		if !strings.HasPrefix(key, "cfg.") {
+			return match
+		}
+		if v, ok := cfg[strings.TrimPrefix(key, "cfg.")]; ok {
+			return v
+		}
+		return match
+	})
 }
 
 // normaliseMap converts YAML's map[interface{}]interface{} → string-keyed
