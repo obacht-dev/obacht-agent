@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -55,17 +56,42 @@ func (s *Store) EnsureInstanceSecret(ctx context.Context, instanceID string) (st
 
 // LookupInstanceBySecret returns the instance id whose secret matches, or
 // ErrNotFound.
+//
+// SEC-27: the match is done with a constant-time comparison rather than a SQL
+// `WHERE secret = ?` equality, so the lookup time does not leak how many
+// leading bytes of a guessed token were correct. The instance_secrets table
+// holds at most one row per running instance (a handful), so scanning all
+// rows is cheap.
 func (s *Store) LookupInstanceBySecret(ctx context.Context, secret string) (string, error) {
 	if secret == "" {
 		return "", ErrNotFound
 	}
-	var id string
-	err := s.db.QueryRowContext(ctx, `SELECT instance_id FROM instance_secrets WHERE secret = ?`, secret).Scan(&id)
+	rows, err := s.db.QueryContext(ctx, `SELECT instance_id, secret FROM instance_secrets`)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return "", ErrNotFound
-		}
 		return "", err
 	}
-	return id, nil
+	defer rows.Close()
+
+	want := []byte(secret)
+	matchedID := ""
+	found := false
+	for rows.Next() {
+		var id, stored string
+		if err := rows.Scan(&id, &stored); err != nil {
+			return "", err
+		}
+		// Constant-time compare; keep scanning every row so total work does
+		// not depend on which (if any) row matched.
+		if subtle.ConstantTimeCompare([]byte(stored), want) == 1 {
+			matchedID = id
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if !found {
+		return "", ErrNotFound
+	}
+	return matchedID, nil
 }

@@ -138,5 +138,12 @@ func Run(ctx context.Context, log *slog.Logger, st *store.Store, cfg *config.Con
 	}
 	log.Info("bootstrap complete", "device_id", parsed.DeviceID)
 	t.JWT = parsed.DeviceToken
+	// SEC-29: the install token is single-use (enforced server-side) and is no
+	// longer needed once we hold the device JWT. Zero it from the in-memory
+	// config so nothing downstream can re-use or accidentally log it. The JWT
+	// lives in the SQLite store, and Run() loads it from there on every
+	// subsequent start, so the on-disk config's token is now dead weight.
+	cfg.Server.AuthToken = ""
+	t.Bootstrap = ""
 	return t, nil
 }

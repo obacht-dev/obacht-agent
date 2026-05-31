@@ -37,6 +37,21 @@ import (
 // ErrEmptySpec is returned by ParseSpec when config_json is empty.
 var ErrEmptySpec = errors.New("compose spec is empty")
 
+// instanceIDPattern bounds the set of characters allowed in an instance ID so
+// it can be safely used as a path segment and docker project suffix.
+// SEC-28: prevents path traversal (e.g. "../../etc") and shell/compose-name
+// abuse via the instance ID.
+var instanceIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
+
+// validateInstanceID rejects instance IDs that could escape the workspace
+// root or otherwise be unsafe as a path segment / project name.
+func validateInstanceID(instanceID string) error {
+	if !instanceIDPattern.MatchString(instanceID) {
+		return fmt.Errorf("invalid instance id %q", instanceID)
+	}
+	return nil
+}
+
 // PrimaryEdgeNetwork is the shared docker network the primary service of
 // every bundle must join so the host's Caddy can route to it.
 const PrimaryEdgeNetwork = "obacht-edge"
@@ -134,7 +149,10 @@ func PrimaryContainerName(instanceID, primaryService string) string {
 
 // Workspace returns the per-instance workspace directory.
 func (d *Driver) Workspace(instanceID string) string {
-	return filepath.Join(d.root, instanceID)
+	// SEC-28: never let a malformed instance ID escape the workspace root.
+	// Callers validate up front; filepath.Base is a final belt-and-braces
+	// guard so a bad ID can at worst land inside root, never above it.
+	return filepath.Join(d.root, filepath.Base(instanceID))
 }
 
 // Apply renders + writes the compose file and runs `docker compose up -d`.
@@ -142,6 +160,9 @@ func (d *Driver) Workspace(instanceID string) string {
 func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec Spec) (bool, error) {
 	if instanceID == "" {
 		return false, errors.New("apply: instance id required")
+	}
+	if err := validateInstanceID(instanceID); err != nil {
+		return false, fmt.Errorf("apply: %w", err)
 	}
 	if spec.PrimaryService == "" || spec.PrimaryPort == 0 {
 		return false, errors.New("apply: primary_service and primary_port required")
@@ -186,6 +207,9 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 // Remove tears down the compose project and deletes its workspace +
 // secrets. Idempotent.
 func (d *Driver) Remove(ctx context.Context, instanceID string) (bool, error) {
+	if err := validateInstanceID(instanceID); err != nil {
+		return false, fmt.Errorf("remove: %w", err)
+	}
 	ws := d.Workspace(instanceID)
 	composePath := filepath.Join(ws, "docker-compose.yml")
 	if _, err := os.Stat(composePath); err == nil {

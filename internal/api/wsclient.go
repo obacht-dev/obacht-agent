@@ -171,6 +171,12 @@ func (c *Client) session(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// SEC-30: never ship the device JWT over a plaintext websocket to a
+	// non-loopback host. If the configured base URL would downgrade to ws://
+	// for a remote host, fail closed rather than leak the token on the wire.
+	if err := assertSecureWSTarget(wsURL); err != nil {
+		return err
+	}
 	dialer := *websocket.DefaultDialer
 	dialer.HandshakeTimeout = 15 * time.Second
 
@@ -260,8 +266,10 @@ func (c *Client) session(ctx context.Context) error {
 }
 
 func (c *Client) readText(ctx context.Context, conn *websocket.Conn) (string, error) {
-	// We don't want a read to outlive ctx by too much; setting a deadline
-	// each time keeps the goroutine reactive to shutdown.
+	// SEC-30: bound every read with a deadline so a silently-dead or
+	// half-open connection can't hang the read goroutine forever. The server
+	// pings every ~25s (Engine.IO v4), so a 60s ceiling is comfortably above
+	// the keepalive interval while still detecting a stalled peer.
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
@@ -350,6 +358,24 @@ func buildWSURL(baseURL, token string) (string, error) {
 	}
 	u.RawQuery = q.Encode()
 	return u.String(), nil
+}
+
+// assertSecureWSTarget rejects plaintext ws:// to a remote host so the device
+// JWT (carried in the query string and Authorization header) is never exposed
+// on the wire. Loopback (localhost/127.0.0.1/::1) is allowed for local dev.
+func assertSecureWSTarget(wsURL string) error {
+	u, err := url.Parse(wsURL)
+	if err != nil {
+		return fmt.Errorf("parse ws url: %w", err)
+	}
+	if strings.EqualFold(u.Scheme, "wss") {
+		return nil
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return nil
+	}
+	return fmt.Errorf("refusing plaintext ws:// to remote host %q (use https/wss)", host)
 }
 
 func redactToken(s string) string {

@@ -67,6 +67,36 @@ func New(socket string, st *store.Store, rec Reconciler, log *slog.Logger) *Serv
 	return &Server{socket: socket, store: st, rec: rec, log: log}
 }
 
+// connContextKey carries the raw unix conn into request handlers so the
+// SEC-26 peer-credential guard can inspect SO_PEERCRED.
+type connContextKey struct{}
+
+// adminGuard wraps an admin handler with a SEC-26 peer-credential check.
+// Only the agent's own uid or root may invoke /v1/admin/* — a template
+// container that managed to reach the socket is rejected even if it can
+// open the fd.
+func (s *Server) adminGuard(h http.HandlerFunc) http.HandlerFunc {
+	selfUID := os.Getuid()
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, _ := r.Context().Value(connContextKey{}).(net.Conn)
+		uid, err := peerUID(conn)
+		if err != nil {
+			// On platforms where we can't read peer creds (and only there),
+			// peerUID returns -1 with a nil error; fall back to socket-FS
+			// trust. A real error means we couldn't authenticate -> deny.
+			s.log.Warn("ipc admin peercred", "err", err)
+			writeErr(w, http.StatusForbidden, errors.New("peer credential check failed"))
+			return
+		}
+		if uid >= 0 && uid != selfUID && uid != 0 {
+			s.log.Warn("ipc admin denied", "peer_uid", uid, "self_uid", selfUID, "path", r.URL.Path)
+			writeErr(w, http.StatusForbidden, errors.New("admin endpoints require root or the agent uid"))
+			return
+		}
+		h(w, r)
+	}
+}
+
 // SetIngress wires the ingress manager so the server can expose domain/
 // binding mutations and force reloads.
 func (s *Server) SetIngress(m IngressManager) { s.ingress = m }
@@ -98,6 +128,13 @@ func (s *Server) Listen(ctx context.Context) error {
 	s.srv = &http.Server{
 		Handler:           s.logMW(mux),
 		ReadHeaderTimeout: 5 * time.Second,
+		// SEC-26: stash the underlying unix conn so admin handlers can read
+		// the peer's credentials (SO_PEERCRED) and reject callers that aren't
+		// root or the agent's own uid, rather than trusting socket FS perms
+		// alone.
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return context.WithValue(ctx, connContextKey{}, c)
+		},
 	}
 
 	go func() {
@@ -151,40 +188,45 @@ func (w *statusRW) WriteHeader(code int) { w.code = code; w.ResponseWriter.Write
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 
-	// Admin (no bearer token required — trust is FS perms on the socket).
-	mux.HandleFunc("GET /v1/admin/instances", s.adminListInstances)
-	mux.HandleFunc("POST /v1/admin/instances", s.adminUpsertInstance)
-	mux.HandleFunc("DELETE /v1/admin/instances/{id}", s.adminDeleteInstance)
-	mux.HandleFunc("POST /v1/admin/instances/{id}/state", s.adminSetInstanceState)
-	mux.HandleFunc("POST /v1/admin/reconcile", s.adminTriggerReconcile)
-	mux.HandleFunc("POST /v1/admin/instances/{id}/secret", s.adminIssueSecret)
+	// admin wraps a handler with the SEC-26 peer-credential guard so only
+	// root or the agent's own uid (i.e. obachtctl run by an admin, never a
+	// template container) can reach /v1/admin/* endpoints.
+	admin := func(h http.HandlerFunc) http.HandlerFunc { return s.adminGuard(h) }
+
+	// Admin (peer-cred gated; trust is FS perms on the socket + SO_PEERCRED).
+	mux.HandleFunc("GET /v1/admin/instances", admin(s.adminListInstances))
+	mux.HandleFunc("POST /v1/admin/instances", admin(s.adminUpsertInstance))
+	mux.HandleFunc("DELETE /v1/admin/instances/{id}", admin(s.adminDeleteInstance))
+	mux.HandleFunc("POST /v1/admin/instances/{id}/state", admin(s.adminSetInstanceState))
+	mux.HandleFunc("POST /v1/admin/reconcile", admin(s.adminTriggerReconcile))
+	mux.HandleFunc("POST /v1/admin/instances/{id}/secret", admin(s.adminIssueSecret))
 
 	// Phase-3 ingress endpoints.
-	mux.HandleFunc("GET /v1/admin/domains", s.adminListDomains)
-	mux.HandleFunc("POST /v1/admin/domains", s.adminUpsertDomain)
-	mux.HandleFunc("DELETE /v1/admin/domains/{domain}", s.adminDeleteDomain)
-	mux.HandleFunc("POST /v1/admin/bindings", s.adminUpsertBinding)
-	mux.HandleFunc("DELETE /v1/admin/bindings/{domain}", s.adminDeleteBinding)
-	mux.HandleFunc("POST /v1/admin/services", s.adminUpsertService)
-	mux.HandleFunc("POST /v1/admin/ingress/reload", s.adminIngressReload)
+	mux.HandleFunc("GET /v1/admin/domains", admin(s.adminListDomains))
+	mux.HandleFunc("POST /v1/admin/domains", admin(s.adminUpsertDomain))
+	mux.HandleFunc("DELETE /v1/admin/domains/{domain}", admin(s.adminDeleteDomain))
+	mux.HandleFunc("POST /v1/admin/bindings", admin(s.adminUpsertBinding))
+	mux.HandleFunc("DELETE /v1/admin/bindings/{domain}", admin(s.adminDeleteBinding))
+	mux.HandleFunc("POST /v1/admin/services", admin(s.adminUpsertService))
+	mux.HandleFunc("POST /v1/admin/ingress/reload", admin(s.adminIngressReload))
 
 	// Phase S1: audit + system introspection.
-	mux.HandleFunc("GET /v1/admin/audit", s.adminAuditTail)
+	mux.HandleFunc("GET /v1/admin/audit", admin(s.adminAuditTail))
 	mux.HandleFunc("GET /v1/system/status", s.systemStatus)
 	// Phase S3: power-mode toggle (writes to system_settings via audit hook).
-	mux.HandleFunc("POST /v1/admin/system/settings", s.adminSetSystemSetting)
+	mux.HandleFunc("POST /v1/admin/system/settings", admin(s.adminSetSystemSetting))
 
 	// Phase F2: read-only enumeration of admin-installed systemd units.
 	// Mutating actions (start/stop/restart/enable/disable) are NOT exposed
 	// over IPC — they happen via `obachtctl service <verb>` which shells
 	// out to `sudo -n systemctl ...` (gated by Power Mode in the sudoers
 	// snippet maintained by obacht-power-toggle).
-	mux.HandleFunc("GET /v1/admin/systemd-services", s.adminListSystemdServices)
+	mux.HandleFunc("GET /v1/admin/systemd-services", admin(s.adminListSystemdServices))
 
 	// Read-only container logs for an installed instance. Tail-only,
 	// capped at 5000 lines per request — operator UX for "why did my
 	// thing crash". Shells out to `docker logs`.
-	mux.HandleFunc("GET /v1/admin/instances/{id}/logs", s.adminInstanceLogs)
+	mux.HandleFunc("GET /v1/admin/instances/{id}/logs", admin(s.adminInstanceLogs))
 
 	// Template (Bearer per-instance secret required).
 	mux.HandleFunc("GET /v1/template/self", s.templateSelf)

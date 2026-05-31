@@ -413,7 +413,50 @@ func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
 	}
 	// Drain the JSON-stream so the pull completes before we return.
 	_, _ = io.Copy(io.Discard, pullResp.Body)
+	// SEC-25: if the ref is digest-pinned, confirm the daemon actually
+	// materialised that digest before we run it. Docker normally refuses to
+	// pull a mismatched digest, but verifying RepoDigests here fails closed
+	// against a buggy/compromised daemon that returns a substitute image.
+	if err := d.verifyPulledDigest(ctx, image); err != nil {
+		return err
+	}
 	return nil
+}
+
+// verifyPulledDigest checks that, when image is pinned as repo@sha256:<hex>,
+// the locally-present image reports that digest in RepoDigests. For tag-only
+// refs (no @sha256:) it is a no-op. SEC-25.
+func (d *Driver) verifyPulledDigest(ctx context.Context, image string) error {
+	at := strings.Index(image, "@sha256:")
+	if at < 0 {
+		return nil // not digest-pinned; nothing to verify
+	}
+	wantDigest := image[at+1:] // "sha256:<hex>"
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://docker/v1.43/images/"+url.PathEscape(image)+"/json", nil)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return fmt.Errorf("verify digest: inspect: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("verify digest: inspect %d: %s", resp.StatusCode, string(body))
+	}
+	var info struct {
+		RepoDigests []string `json:"RepoDigests"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return fmt.Errorf("verify digest: decode: %w", err)
+	}
+	for _, rd := range info.RepoDigests {
+		// RepoDigests entries look like "repo@sha256:<hex>".
+		if i := strings.Index(rd, "@"); i >= 0 && rd[i+1:] == wantDigest {
+			return nil
+		}
+	}
+	return fmt.Errorf("verify digest: pulled image %q does not report expected digest %s", image, wantDigest)
 }
 
 type createBody struct {
@@ -482,6 +525,10 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 			// would otherwise hit EACCES on the docker-created (root:root
 			// 0755) bind directory. 0777 is acceptable for our self-host
 			// model where the host fs is single-tenant per device.
+			// NOTE (SEC-24): tightening to 0o775 requires chowning the dir to
+			// the container's runtime GID (unknown here), otherwise non-root
+			// container UIDs lose write access. Deferred to a per-template-UID
+			// implementation so it can't break running instances.
 			if err := os.MkdirAll(v.Source, 0o777); err == nil {
 				_ = os.Chmod(v.Source, 0o777)
 			}
