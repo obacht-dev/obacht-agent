@@ -20,6 +20,9 @@ type linuxCollector struct {
 	// Cached previous CPU snapshot for delta calculation across calls.
 	prevTotal, prevIdle uint64
 	hasPrev             bool
+
+	// Cached network info (notably the throttled public-IP lookup).
+	net netInfo
 }
 
 func (c *linuxCollector) Collect() (Sample, error) {
@@ -39,6 +42,7 @@ func (c *linuxCollector) Collect() (Sample, error) {
 	if t, err := readTempCPU(); err == nil {
 		s.TempCPU = &t
 	}
+	s.WireguardIP, s.LocalIP, s.PublicIP = c.net.collect()
 	return s, nil
 }
 

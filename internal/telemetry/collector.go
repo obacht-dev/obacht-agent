@@ -19,6 +19,12 @@ type Sample struct {
 	DiskUsed  *uint64  `json:"disk_used,omitempty"`  // bytes (root fs)
 	DiskTotal *uint64  `json:"disk_total,omitempty"` // bytes (root fs)
 	TempCPU   *float64 `json:"temp_cpu,omitempty"`   // degrees C
+
+	// Networking — the device's three relevant addresses, surfaced in the
+	// dashboard telemetry view. nil when undeterminable.
+	WireguardIP *string `json:"wireguard_ip,omitempty"` // wg0 tunnel address
+	LocalIP     *string `json:"local_ip,omitempty"`     // LAN/private IPv4
+	PublicIP    *string `json:"public_ip,omitempty"`    // ISP-assigned public IP
 }
 
 // Collector reads a current Sample from the host. Implementations are
