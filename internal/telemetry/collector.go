@@ -25,6 +25,17 @@ type Sample struct {
 	WireguardIP *string `json:"wireguard_ip,omitempty"` // wg0 tunnel address
 	LocalIP     *string `json:"local_ip,omitempty"`     // LAN/private IPv4
 	PublicIP    *string `json:"public_ip,omitempty"`    // ISP-assigned public IP
+
+	// System metadata. The backend's telemetry handler reads
+	// system.agent_version and persists it to devices.agent_version on every
+	// push, which keeps the reported version current even when the one-shot
+	// agent:register on (re)connect races ahead of the WS auth handshake.
+	System *SystemInfo `json:"system,omitempty"`
+}
+
+// SystemInfo carries agent-level metadata alongside host metrics.
+type SystemInfo struct {
+	AgentVersion string `json:"agent_version,omitempty"` // bare semver, e.g. "0.3.19"
 }
 
 // Collector reads a current Sample from the host. Implementations are

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +46,12 @@ func main() {
 		oneShot     = flag.Bool("once", false, "run a single reconcile pass and exit (useful for tests)")
 	)
 	flag.Parse()
+
+	// Normalize the build version to clean semver (strip any leading "v" from
+	// the git tag, e.g. "v0.3.19" -> "0.3.19"). The backend stores and compares
+	// agent_version as bare semver, so reporting it with a "v" prefix would
+	// break update-available detection.
+	agentVersion = strings.TrimPrefix(agentVersion, "v")
 
 	log := logging.New(*logLevel)
 	slog.SetDefault(log)

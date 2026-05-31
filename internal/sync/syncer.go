@@ -231,6 +231,11 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 		s.log.Debug("telemetry collect skipped", "err", err)
 		return
 	}
+	// Attach the agent version so the backend persists it on every push.
+	// agent:register also reports it, but that one-shot emit can race the WS
+	// auth handshake and get dropped; the 30s telemetry tick is the reliable
+	// path that keeps devices.agent_version current after a self-update.
+	sample.System = &telemetry.SystemInfo{AgentVersion: s.agentVersion}
 	if err := s.client.Emit("telemetry", sample); err != nil {
 		s.log.Warn("emit telemetry", "err", err)
 	}

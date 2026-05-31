@@ -40,7 +40,9 @@ func trustDir() string {
 	return defaultTrustDir
 }
 
-const cliVersion = "0.1.0"
+// cliVersion is overridden at build time via -ldflags "-X main.cliVersion=...".
+// It must be a var (not a const) for the linker -X injection to take effect.
+var cliVersion = "dev"
 
 func main() {
 	flag.Usage = func() { usage(os.Stderr) }
@@ -58,7 +60,7 @@ func main() {
 
 	switch args[0] {
 	case "version":
-		fmt.Println(cliVersion)
+		fmt.Println(strings.TrimPrefix(cliVersion, "v"))
 	case "health":
 		rt.cmdHealth(ctx)
 	case "instance":

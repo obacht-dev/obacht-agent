@@ -70,10 +70,10 @@ func DefaultStateDB() string {
 func DefaultSocket() string {
 	if runtime.GOOS == "darwin" {
 		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, "Library", "Application Support", "obacht", "agent.sock")
+			return filepath.Join(home, "Library", "Application Support", "obacht", "agent-v2.sock")
 		}
 	}
-	return "/run/obacht/agent.sock"
+	return "/run/obacht/agent-v2.sock"
 }
 
 // DefaultAuditLog returns the canonical audit log path for the host OS.
