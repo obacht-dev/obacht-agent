@@ -350,7 +350,16 @@ func (d *Driver) renderBody(ctx context.Context, instanceID string, spec Spec) (
 	body := spec.ComposeBody
 
 	// 1. ${cfg.<key>} substitution.
-	body = substituteCfg(body, spec.Config)
+	//
+	// For official bodies (AllowUnpinnedImages=false) cfg values fill specific
+	// YAML scalar slots — always written as `"${cfg.x}"` in our templates — so
+	// we YAML-escape the value to stop a hostile config (newline / quote /
+	// control char) from breaking out of its scalar and injecting new keys
+	// (e.g. a `privileged: true` map level). For custom bodies
+	// (AllowUnpinnedImages=true) the *entire* body IS the cfg value
+	// (`body: "${cfg.compose}"`), so escaping would destroy the document;
+	// those are instead fully re-validated by ValidateComposeBody below.
+	body = substituteCfg(body, spec.Config, !spec.AllowUnpinnedImages)
 
 	// 2. ${secret.<key>} substitution.
 	if len(spec.SecretsSchema) > 0 {
@@ -391,7 +400,7 @@ var cfgPlaceholderRe = regexp.MustCompile(`\$\{cfg\.([a-zA-Z_][a-zA-Z0-9_]*)\}`)
 var anyPlaceholderRe = regexp.MustCompile(`\$\{(secret|cfg)\.[a-zA-Z_][a-zA-Z0-9_]*\}`)
 var imageLineRe = regexp.MustCompile(`(?m)^(\s*image:\s*)(['"]?)([^'"\s@]+)(@sha256:[a-f0-9]+)?(['"]?)\s*$`)
 
-func substituteCfg(body string, cfg map[string]string) string {
+func substituteCfg(body string, cfg map[string]string, escape bool) string {
 	return cfgPlaceholderRe.ReplaceAllStringFunc(body, func(match string) string {
 		groups := cfgPlaceholderRe.FindStringSubmatch(match)
 		if len(groups) < 2 {
@@ -401,8 +410,43 @@ func substituteCfg(body string, cfg map[string]string) string {
 		if !ok {
 			return match
 		}
+		if escape {
+			return yamlEscapeInner(val)
+		}
 		return val
 	})
+}
+
+// yamlEscapeInner escapes a string for safe insertion *inside* an existing
+// double-quoted YAML scalar (our official templates write placeholders as
+// "${cfg.x}"). It deliberately does not add outer quotes. Newlines, quotes,
+// backslashes and other control characters are turned into YAML escape
+// sequences so a config value can never break out of its scalar and inject
+// new YAML structure.
+func yamlEscapeInner(v string) string {
+	var b strings.Builder
+	b.Grow(len(v))
+	for _, r := range v {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, `\x%02x`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func findUnsubstituted(body string) string {

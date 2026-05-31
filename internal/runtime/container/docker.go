@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -194,6 +195,34 @@ type VolumeMount struct {
 	Source   string `json:"source"`   // host path or volume name
 	Target   string `json:"target"`   // path in container
 	ReadOnly bool   `json:"readOnly,omitempty"`
+}
+
+// validateBindSource confines an absolute bind-mount source to the instance
+// workspace. Named volumes (no leading "/") are passed through untouched —
+// Docker resolves those by name, they are not host paths. Absolute paths must
+// resolve (after Clean, which collapses "..") to instanceWorkspace itself or a
+// path beneath it; anything else is rejected as a workspace escape.
+func validateBindSource(instanceWorkspace, src string) error {
+	if src == "" {
+		return errors.New("volume source is empty")
+	}
+	if !strings.HasPrefix(src, "/") {
+		return nil // named docker volume, not a host path
+	}
+	if strings.ContainsAny(src, "\x00\n\r") {
+		return fmt.Errorf("bind source %q contains control characters", src)
+	}
+	ws := filepath.Clean(instanceWorkspace)
+	// Guard against a degenerate workspace (empty/odd template or instance id)
+	// that would widen the confinement.
+	if !strings.HasPrefix(ws+"/", "/var/lib/obacht/") || ws == "/var/lib/obacht" {
+		return fmt.Errorf("refusing bind: degenerate instance workspace %q", instanceWorkspace)
+	}
+	clean := filepath.Clean(src)
+	if clean != ws && !strings.HasPrefix(clean, ws+"/") {
+		return fmt.Errorf("bind source %q escapes instance workspace %q", src, ws)
+	}
+	return nil
 }
 
 // hash returns a stable sha256 hex of the spec, used to detect drift.
@@ -564,7 +593,17 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 	}
 
 	binds := make([]string, 0, len(spec.Volumes))
+	// instanceWorkspace is the only host directory tree a container template is
+	// allowed to bind-mount from. Absolute bind sources (after cfg/secret
+	// substitution) that escape this prefix are rejected — this stops a manifest
+	// like `source: "/data/${cfg.subdir}"` + user-config `subdir=../../../` (or
+	// an absolute `/`) from mounting arbitrary host paths (host secrets, the
+	// docker socket, other instances' data) into the container.
+	instanceWorkspace := filepath.Clean("/var/lib/obacht/" + templateID + "/" + instanceID)
 	for _, v := range spec.Volumes {
+		if err := validateBindSource(instanceWorkspace, v.Source); err != nil {
+			return err
+		}
 		mode := "rw"
 		if v.ReadOnly {
 			mode = "ro"

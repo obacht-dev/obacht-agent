@@ -17,11 +17,69 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"regexp"
+	"strings"
 )
 
 // ErrEmptySpec mirrors container.ErrEmptySpec for consistent reconciler-side
 // handling.
 var ErrEmptySpec = errors.New("empty system spec")
+
+// unitNameRe constrains the systemd unit name to a safe shape. It must end in
+// ".service" and contain only systemd-legal unit characters — crucially no
+// path separators, so `filepath.Join(unitDir, UnitName)` can never escape the
+// unit directory (e.g. "../../etc/cron.d/x").
+var unitNameRe = regexp.MustCompile(`^[a-zA-Z0-9@._-]+\.service$`)
+
+// allowedFilePrefixes is the allowlist of directory trees a system template
+// may write supporting files into. The agent runs as root, so without this
+// confinement a (signed-but-hostile, or buggy) manifest could drop files
+// anywhere — /etc/sudoers.d, /etc/cron.d, ~/.ssh, etc. These prefixes match
+// the documented design (sidecar files live under /etc/obacht/system/<id>/)
+// plus the agent's own data/opt trees.
+var allowedFilePrefixes = []string{
+	"/etc/obacht/",
+	"/var/lib/obacht/",
+	"/opt/obacht/",
+}
+
+// validateUnitName rejects unit names that are not a bare "<name>.service"
+// token. This blocks path traversal and stray characters.
+func validateUnitName(name string) error {
+	if len(name) > 128 || !unitNameRe.MatchString(name) {
+		return fmt.Errorf("system spec: invalid unit_name %q (must match %s, <=128 chars)", name, unitNameRe.String())
+	}
+	return nil
+}
+
+// validateFilePath enforces that a supporting file path is absolute, free of
+// traversal, and inside an allowed prefix. This is the last line of defence
+// against arbitrary root file writes via a crafted manifest.
+func validateFilePath(p string) error {
+	if p == "" {
+		return errors.New("system spec: empty file path")
+	}
+	if strings.ContainsAny(p, "\x00\n\r") {
+		return fmt.Errorf("system spec: file path %q contains control characters", p)
+	}
+	if !filepath.IsAbs(p) {
+		return fmt.Errorf("system spec: file path %q must be absolute", p)
+	}
+	// Reject any path that does not survive Clean unchanged: that catches
+	// "..", duplicate slashes and trailing-slash trickery before prefix check.
+	if filepath.Clean(p) != p {
+		return fmt.Errorf("system spec: file path %q is not in canonical form", p)
+	}
+	for _, pre := range allowedFilePrefixes {
+		// Match the prefix on a path-segment boundary. pre ends in "/" so
+		// "/etc/obacht-evil/x" cannot satisfy "/etc/obacht/".
+		if strings.HasPrefix(p, pre) {
+			return nil
+		}
+	}
+	return fmt.Errorf("system spec: file path %q is outside the allowed prefixes %v", p, allowedFilePrefixes)
+}
 
 // Spec describes one system instance. It is parsed from `instance.config_json`.
 //
@@ -60,8 +118,29 @@ func ParseSpec(configJSON string) (Spec, error) {
 	if err := json.Unmarshal([]byte(configJSON), &s); err != nil {
 		return Spec{}, fmt.Errorf("parse system spec: %w", err)
 	}
-	if s.UnitName == "" || s.UnitTemplate == "" {
-		return Spec{}, fmt.Errorf("system spec: unit_name and unit_template are required")
+	if err := s.Validate(); err != nil {
+		return Spec{}, err
 	}
 	return s, nil
+}
+
+// Validate enforces the security invariants for a system spec: a safe unit
+// name and confined, traversal-free supporting-file paths. Callers must run
+// this before any file is written; ParseSpec already does.
+func (s Spec) Validate() error {
+	if s.UnitName == "" || s.UnitTemplate == "" {
+		return fmt.Errorf("system spec: unit_name and unit_template are required")
+	}
+	if err := validateUnitName(s.UnitName); err != nil {
+		return err
+	}
+	for _, f := range s.Files {
+		if f.Path == "" {
+			continue
+		}
+		if err := validateFilePath(f.Path); err != nil {
+			return err
+		}
+	}
+	return nil
 }

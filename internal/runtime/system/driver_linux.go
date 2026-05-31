@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/coreos/go-systemd/v22/dbus"
@@ -50,7 +52,19 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 	if instanceID == "" || spec.UnitName == "" {
 		return fmt.Errorf("apply system: instance id and unit name are required")
 	}
+	// Defence in depth: re-validate the spec here even though ParseSpec already
+	// does. This guarantees no caller can reach the privileged file writes with
+	// an unvalidated unit name or supporting-file path.
+	if err := spec.Validate(); err != nil {
+		return fmt.Errorf("apply system: %w", err)
+	}
 	unitPath := filepath.Join(d.unitDir, spec.UnitName)
+	// validateUnitName already forbids path separators, so Join cannot escape
+	// d.unitDir; assert it anyway so a future change to the regex can't silently
+	// reintroduce traversal.
+	if !withinDir(d.unitDir, unitPath) {
+		return fmt.Errorf("apply system: unit path %q escapes %q", unitPath, d.unitDir)
+	}
 
 	// 1) write supporting files
 	if err := d.writeFiles(instanceID, spec.Files); err != nil {
@@ -171,6 +185,11 @@ func (d *Driver) writeFiles(instanceID string, files []File) error {
 		if f.Path == "" {
 			continue
 		}
+		// Re-validate per file: defence in depth against a caller that built a
+		// Spec without going through ParseSpec/Validate.
+		if err := validateFilePath(f.Path); err != nil {
+			return err
+		}
 		mode := os.FileMode(0o644)
 		if f.Mode != "" {
 			n, err := strconv.ParseUint(f.Mode, 8, 32)
@@ -189,9 +208,23 @@ func (d *Driver) writeFiles(instanceID string, files []File) error {
 	return nil
 }
 
+// withinDir reports whether target resolves to a path inside dir (or dir
+// itself), comparing on a path-segment boundary so "/a/bc" is not "within"
+// "/a/b".
+func withinDir(dir, target string) bool {
+	dir = filepath.Clean(dir)
+	target = filepath.Clean(target)
+	if target == dir {
+		return true
+	}
+	return strings.HasPrefix(target, dir+string(os.PathSeparator))
+}
+
 // writeIfDifferent writes data to path only if the existing content differs.
 // Returns true if a write happened (so callers can decide whether to reload
-// systemd / restart the unit).
+// systemd / restart the unit). The write is symlink-safe: the temp file is
+// created with O_EXCL|O_NOFOLLOW so a pre-planted symlink at the temp path
+// cannot redirect the write elsewhere.
 func writeIfDifferent(path string, data []byte, mode os.FileMode) (bool, error) {
 	existing, err := os.ReadFile(path)
 	if err == nil && string(existing) == string(data) {
@@ -200,10 +233,29 @@ func writeIfDifferent(path string, data []byte, mode os.FileMode) (bool, error) 
 		return false, nil
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	// Remove a stale/hostile temp entry first; then create fresh, refusing to
+	// follow a symlink.
+	_ = os.Remove(tmp)
+	fh, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, mode)
+	if err != nil {
+		return false, err
+	}
+	if _, err := fh.Write(data); err != nil {
+		fh.Close()
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	if err := fh.Chmod(mode); err != nil {
+		fh.Close()
+		_ = os.Remove(tmp)
+		return false, err
+	}
+	if err := fh.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return false, err
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
 		return false, err
 	}
 	return true, nil

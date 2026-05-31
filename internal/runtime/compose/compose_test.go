@@ -95,4 +95,60 @@ func TestParseSpecEmpty(t *testing.T) {
 	}
 }
 
+// TestRenderBodyCfgYAMLInjection proves a hostile config value placed inside a
+// quoted official scalar cannot break out to inject new YAML keys / structure.
+func TestRenderBodyCfgYAMLInjection(t *testing.T) {
+	d := New("/tmp/test-compose-driver", fakeSecrets{}, nil)
+	// Official template style: cfg value lives inside a double-quoted scalar.
+	const body = "services:\n" +
+		"  web:\n" +
+		"    image: ghost:5\n" +
+		"    environment:\n" +
+		"      SITE: \"${cfg.site}\"\n"
+	// Attacker tries to close the scalar and inject privileged + a new key.
+	malicious := "x\"\n    privileged: true\n    cap_add:\n      - SYS_ADMIN\ninjected: \"y"
+	spec := Spec{
+		ComposeBody:    body,
+		PrimaryService: "web", PrimaryPort: 2368,
+		ImageDigests: map[string]string{"ghost:5": "sha256:" + strings.Repeat("a", 64)},
+		Config:       map[string]string{"site": malicious},
+	}
+	out, err := d.renderBody(context.Background(), "demo-1", spec)
+	if err != nil {
+		t.Fatalf("renderBody: %v", err)
+	}
+	if strings.Contains(out, "\n    privileged: true") {
+		t.Fatalf("YAML injection succeeded — privileged leaked into structure:\n%s", out)
+	}
+	if strings.Contains(out, "\ninjected:") {
+		t.Fatalf("YAML injection succeeded — new top-level key leaked:\n%s", out)
+	}
+	// The escaped value must still parse as valid YAML and stay one scalar.
+	if !strings.Contains(out, `SITE: "x\"`) {
+		t.Fatalf("expected escaped scalar, got:\n%s", out)
+	}
+}
+
+// TestRenderBodyCustomNoEscape proves the custom-compose path (AllowUnpinnedImages)
+// injects the user body verbatim (the whole document is the cfg value) and is
+// guarded by the allowlist instead of escaping.
+func TestRenderBodyCustomNoEscape(t *testing.T) {
+	d := New("/tmp/test-compose-driver", fakeSecrets{}, nil)
+	userBody := "services:\n  app:\n    image: traefik/whoami:latest\n    restart: unless-stopped\n"
+	spec := Spec{
+		ComposeBody:         "${cfg.compose}",
+		PrimaryService:      "app",
+		PrimaryPort:         80,
+		AllowUnpinnedImages: true,
+		Config:              map[string]string{"compose": userBody},
+	}
+	out, err := d.renderBody(context.Background(), "demo-2", spec)
+	if err != nil {
+		t.Fatalf("renderBody custom: %v", err)
+	}
+	if !strings.Contains(out, "image: traefik/whoami:latest") {
+		t.Fatalf("expected verbatim user body, got:\n%s", out)
+	}
+}
+
 func max(a, b int) int { if a > b { return a }; return b }
