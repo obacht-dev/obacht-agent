@@ -20,8 +20,10 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/compat"
@@ -34,6 +36,16 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	"github.com/obacht-dev/obacht-agent/internal/telemetry"
 )
+
+// deviceJWTMetaKey is the agent_meta key under which bootstrap persists the
+// device JWT. Kept in sync with internal/bootstrap (metaJWT) so a refreshed
+// token is loaded on the next start.
+const deviceJWTMetaKey = "device_jwt"
+
+// tokenRefreshEvery controls how often the agent asks the backend for a fresh
+// device token. SEC-9: tokens are 90-day; refreshing twice a day keeps the
+// agent authenticated with a wide margin even across reboots/outages.
+const tokenRefreshEvery = 12 * time.Hour
 
 // Triggerable is the subset of *reconciler.Reconciler we depend on.
 type Triggerable interface {
@@ -135,6 +147,14 @@ func (s *Syncer) Run(ctx context.Context) {
 	defer t.Stop()
 	telem := time.NewTicker(s.telemetryEvery)
 	defer telem.Stop()
+	tokenRefresh := time.NewTicker(tokenRefreshEvery)
+	defer tokenRefresh.Stop()
+
+	// SEC-9: do one refresh shortly after start so a device still holding a
+	// legacy long-lived token upgrades to a short-lived, version-stamped one
+	// without waiting for the first 12h tick.
+	s.refreshDeviceToken(ctx)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -143,8 +163,59 @@ func (s *Syncer) Run(ctx context.Context) {
 			s.pushObserved(ctx)
 		case <-telem.C:
 			s.pushTelemetry(ctx)
+		case <-tokenRefresh.C:
+			s.refreshDeviceToken(ctx)
 		}
 	}
+}
+
+// refreshDeviceToken asks the backend for a fresh device JWT (SEC-9) and
+// persists it to the store + the live WS client. Device tokens are now
+// short-lived (90d); refreshing on a timer keeps the agent authenticated
+// without operator intervention. All failures are non-fatal: the current
+// token remains valid until it expires, and a revoked token simply keeps
+// getting 401s here until an operator re-bootstraps the device.
+func (s *Syncer) refreshDeviceToken(ctx context.Context) {
+	cur := s.client.Token()
+	if cur == "" {
+		return
+	}
+	url := strings.TrimRight(s.client.BaseURL(), "/") + "/auth/device/refresh"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
+	if err != nil {
+		s.log.Warn("token refresh: build request", "err", err)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+cur)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		s.log.Warn("token refresh: request failed", "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		s.log.Warn("token refresh: non-200", "status", resp.StatusCode)
+		return
+	}
+	var parsed struct {
+		DeviceToken string `json:"device_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil || parsed.DeviceToken == "" {
+		s.log.Warn("token refresh: decode response", "err", err)
+		return
+	}
+	if parsed.DeviceToken == cur {
+		return // unchanged; nothing to persist
+	}
+	if err := s.store.SetMeta(ctx, deviceJWTMetaKey, parsed.DeviceToken); err != nil {
+		s.log.Warn("token refresh: persist", "err", err)
+		return
+	}
+	s.client.SetToken(parsed.DeviceToken)
+	s.log.Info("device token refreshed")
 }
 
 // pushTelemetry collects host metrics and emits the "telemetry" WS event.

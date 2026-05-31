@@ -34,30 +34,46 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 )
 
 const (
 	sudoersPath = "/etc/sudoers.d/obacht-power"
 
-	// The content is intentionally the smallest grant we need: the
-	// unprivileged `obacht` user can run only obacht-power-controlled
-	// system commands, listed individually with full paths so a path
-	// hijack can't trick sudo. This grows as new "power"-level
-	// templates need new commands; keep it audited.
+	// systemctlPath is the only binary `svc` will ever exec. Pinned with a
+	// full path so a PATH hijack can't substitute it.
+	systemctlPath = "/usr/bin/systemctl"
+
+	// The content is intentionally the smallest grant we need. SEC-13: the
+	// unprivileged `obacht` user is granted ONLY the `svc` subcommand of this
+	// very binary — never raw systemctl with a `*.service` wildcard (which
+	// fnmatch-expands to multiple space-separated units, allowing a
+	// "obacht-x.service evil.service" smuggle) and never the vestigial
+	// iptables/ip6tables rules (which were never invoked by any agent code).
+	// `svc` itself validates the verb against a closed allow-list and the
+	// unit against ^obacht-…\.(service|timer)$ as a single token before it
+	// execs systemctl, so this grant cannot touch non-obacht units.
 	powerSudoersContent = `# Managed by obacht-power-toggle. Do not edit by hand.
-# Phase S5: Power Mode is ENABLED. The obacht user can now run a
-# specifically-listed set of root commands needed by privileged
-# templates. To disable, run: sudo obacht-power-toggle disable
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl restart *.service
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl reload *.service
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl start *.service
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl stop *.service
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl enable *.service
-obacht ALL=(root) NOPASSWD: /usr/bin/systemctl disable *.service
-obacht ALL=(root) NOPASSWD: /usr/sbin/iptables -t nat *
-obacht ALL=(root) NOPASSWD: /usr/sbin/ip6tables -t nat *
+# Phase S5: Power Mode is ENABLED. The obacht user can run obacht-scoped
+# systemd actions, mediated by the validating 'svc' subcommand below.
+# To disable, run: sudo obacht-power-toggle disable
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle svc *
 `
 )
+
+// allowedSvcVerbs is the closed allow-list of systemctl actions `svc` exposes.
+var allowedSvcVerbs = map[string]bool{
+	"start":   true,
+	"stop":    true,
+	"restart": true,
+	"reload":  true,
+	"enable":  true,
+	"disable": true,
+}
+
+// svcUnitRe constrains the unit to a single obacht-owned service/timer token.
+// No spaces, no globs — this is the wildcard-smuggle defense.
+var svcUnitRe = regexp.MustCompile(`^obacht-[a-zA-Z0-9@._-]+\.(service|timer)$`)
 
 func main() {
 	if len(os.Args) < 2 {
@@ -81,6 +97,9 @@ func main() {
 			os.Exit(2)
 		}
 		fmt.Println("power mode disabled")
+	case "svc":
+		mustRoot()
+		os.Exit(svc(os.Args[2:]))
 	case "status":
 		if status() {
 			fmt.Println("enabled")
@@ -96,7 +115,39 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle {enable|disable|status}")
+	fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle {enable|disable|status|svc <verb> <unit>}")
+}
+
+// svc validates a (verb, unit) pair and, only if both pass the closed
+// allow-list + obacht-unit regex, execs `systemctl <verb> <unit>` as root.
+// This is the single privileged entrypoint the `obacht` user is granted in
+// Power Mode (SEC-13). Returning a non-zero exit code propagates systemctl's
+// own status to the caller.
+func svc(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle svc <verb> <unit>")
+		return 2
+	}
+	verb, unit := args[0], args[1]
+	if !allowedSvcVerbs[verb] {
+		fmt.Fprintf(os.Stderr, "svc: verb %q not allowed\n", verb)
+		return 2
+	}
+	if !svcUnitRe.MatchString(unit) {
+		fmt.Fprintf(os.Stderr, "svc: unit %q must match ^obacht-…\\.(service|timer)$\n", unit)
+		return 2
+	}
+	cmd := exec.Command(systemctlPath, verb, unit)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, "svc:", err)
+		return 1
+	}
+	return 0
 }
 
 func mustRoot() {

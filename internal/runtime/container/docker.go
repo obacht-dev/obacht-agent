@@ -30,6 +30,7 @@ import (
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -459,6 +460,54 @@ func (d *Driver) verifyPulledDigest(ctx context.Context, image string) error {
 	return fmt.Errorf("verify digest: pulled image %q does not report expected digest %s", image, wantDigest)
 }
 
+// imageRunUID inspects the image config and returns the numeric UID/GID the
+// container will run as. resolved is false when the image declares a
+// non-numeric user name we cannot map to a UID without the image's passwd
+// database. SEC-24: lets us chown bind dirs to the exact runtime UID instead
+// of making them world-writable. An empty USER means the container runs as
+// root (uid 0), which resolves cleanly.
+func (d *Driver) imageRunUID(ctx context.Context, image string) (uid, gid int, resolved bool) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://docker/v1.43/images/"+url.PathEscape(image)+"/json", nil)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return 0, 0, false
+	}
+	var info struct {
+		Config struct {
+			User string `json:"User"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return 0, 0, false
+	}
+	u := strings.TrimSpace(info.Config.User)
+	if u == "" {
+		return 0, 0, true // no USER set -> runs as root (uid 0)
+	}
+	// USER may be "uid", "uid:gid", "name", or "name:group". We can only
+	// resolve the purely-numeric forms without the image's /etc/passwd.
+	userPart, groupPart := u, ""
+	if i := strings.IndexByte(u, ':'); i >= 0 {
+		userPart, groupPart = u[:i], u[i+1:]
+	}
+	uid, err = strconv.Atoi(userPart)
+	if err != nil {
+		return 0, 0, false // named user, cannot resolve
+	}
+	gid = uid
+	if groupPart != "" {
+		if g, gerr := strconv.Atoi(groupPart); gerr == nil {
+			gid = g
+		}
+	}
+	return uid, gid, true
+}
+
 type createBody struct {
 	Image        string                       `json:"Image"`
 	Cmd          []string                     `json:"Cmd,omitempty"`
@@ -520,17 +569,37 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 		if v.ReadOnly {
 			mode = "ro"
 		} else {
-			// Pre-create the host directory with permissive perms. Templates
-			// like etherpad run as a non-root UID inside the container and
-			// would otherwise hit EACCES on the docker-created (root:root
-			// 0755) bind directory. 0777 is acceptable for our self-host
-			// model where the host fs is single-tenant per device.
-			// NOTE (SEC-24): tightening to 0o775 requires chowning the dir to
-			// the container's runtime GID (unknown here), otherwise non-root
-			// container UIDs lose write access. Deferred to a per-template-UID
-			// implementation so it can't break running instances.
-			if err := os.MkdirAll(v.Source, 0o777); err == nil {
-				_ = os.Chmod(v.Source, 0o777)
+			// Pre-create the host directory for this bind mount. SEC-24:
+			// templates like etherpad run as a non-root UID inside the
+			// container and would otherwise hit EACCES on the docker-created
+			// (root:root 0755) bind directory. Rather than making the dir
+			// world-writable (0o777), resolve the image's runtime UID/GID and
+			// chown the directory to it so only that container identity — and
+			// root — can write. "other" gets no access.
+			//
+			// When the image declares a *non-numeric* USER we cannot map to a
+			// UID without the image's /etc/passwd, we fall back to the
+			// historical permissive 0o777 so we can never break a running
+			// template. This narrows the world-writable surface to just the
+			// minority of images that ship a named, unresolvable user.
+			if err := os.MkdirAll(v.Source, 0o750); err == nil {
+				if uid, gid, ok := d.imageRunUID(ctx, spec.Image); ok {
+					if uid == 0 {
+						// Container runs as root; root-owned 0o755 is enough.
+						_ = os.Chmod(v.Source, 0o755)
+					} else {
+						_ = os.Chmod(v.Source, 0o750)
+						_ = os.Chown(v.Source, uid, gid)
+					}
+				} else {
+					// Unresolvable named user: preserve permissive behavior so
+					// the container can still write. Logged for visibility.
+					if d.log != nil {
+						d.log.Warn("bind dir left world-writable: image declares a non-numeric USER",
+							"image", spec.Image, "dir", v.Source)
+					}
+					_ = os.Chmod(v.Source, 0o777)
+				}
 			}
 		}
 		binds = append(binds, fmt.Sprintf("%s:%s:%s", v.Source, v.Target, mode))

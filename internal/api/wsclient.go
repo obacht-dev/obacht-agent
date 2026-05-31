@@ -80,7 +80,21 @@ func (c *Client) Handler(event string) EventHandler {
 func (c *Client) BaseURL() string { return c.url }
 
 // Token returns the auth JWT.
-func (c *Client) Token() string { return c.token }
+func (c *Client) Token() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.token
+}
+
+// SetToken replaces the auth JWT used for subsequent (re)connects. SEC-9:
+// the syncer calls this after a successful token refresh. The new token is
+// picked up by the next session() dial; we don't tear down a live connection
+// just to swap the credential.
+func (c *Client) SetToken(token string) {
+	c.mu.Lock()
+	c.token = token
+	c.mu.Unlock()
+}
 
 // OnConnect registers a callback invoked after every successful (re)connect.
 func (c *Client) OnConnect(cb func()) {
@@ -167,7 +181,10 @@ func (c *Client) disconnect() {
 // session runs one full connect/handshake/read-loop cycle. Returns when the
 // connection drops or ctx is cancelled.
 func (c *Client) session(ctx context.Context) error {
-	wsURL, err := buildWSURL(c.url, c.token)
+	c.mu.Lock()
+	token := c.token
+	c.mu.Unlock()
+	wsURL, err := buildWSURL(c.url, token)
 	if err != nil {
 		return err
 	}
@@ -183,7 +200,7 @@ func (c *Client) session(ctx context.Context) error {
 	header := http.Header{}
 	// Belt-and-suspenders: also send the JWT in Authorization, the gateway
 	// already accepts it from headers as a fallback.
-	header.Set("Authorization", "Bearer "+c.token)
+	header.Set("Authorization", "Bearer "+token)
 
 	c.log.Info("ws dial", "url", redactToken(wsURL))
 	conn, resp, err := dialer.DialContext(ctx, wsURL, header)

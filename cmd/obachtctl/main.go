@@ -983,11 +983,15 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 // ---------------------------------------------------------------------------
 
 // validUnitName matches systemd unit names: alphanumerics, dot, dash,
-// underscore, '@' (for templated units). We require a `.service` suffix
-// so the api-side plan-builder can't trick us into touching timers,
-// sockets, mounts, etc.
+// underscore, '@' (for templated units). We require both the `obacht-`
+// prefix and a `.service` suffix (SEC-13) so the api-side plan-builder can
+// never trick us into touching foreign units, timers, sockets or mounts.
+// The privileged `obacht-power-toggle svc` helper enforces the same shape.
 func isValidServiceUnitName(name string) bool {
 	if len(name) == 0 || len(name) > 128 {
+		return false
+	}
+	if !strings.HasPrefix(name, "obacht-") {
 		return false
 	}
 	if !strings.HasSuffix(name, ".service") {
@@ -1046,6 +1050,8 @@ func (r *runtime) serviceControl(ctx context.Context, verb string, args []string
 	name := fs.String("name", "", "unit name, must end in .service (required)")
 	_ = fs.Bool("json", true, "output JSON (default; only mode currently supported)")
 	systemctlPath := fs.String("systemctl", "/usr/bin/systemctl", "path to systemctl (override for tests)")
+	togglePath := fs.String("toggle-binary", "/usr/local/sbin/obacht-power-toggle",
+		"path to obacht-power-toggle (override for tests)")
 	skipSudo := fs.Bool("skip-sudo", false, "invoke systemctl directly (for root / tests)")
 	noPowerCheck := fs.Bool("skip-power-check", false, "bypass the Power Mode pre-flight (tests only)")
 	_ = fs.Parse(args)
@@ -1053,7 +1059,7 @@ func (r *runtime) serviceControl(ctx context.Context, verb string, args []string
 		die("--name UNIT.service is required")
 	}
 	if !isValidServiceUnitName(*name) {
-		die("invalid unit name %q: must match [a-zA-Z0-9._@-]+\\.service", *name)
+		die("invalid unit name %q: must match obacht-[a-zA-Z0-9._@-]+\\.service", *name)
 	}
 
 	if !*noPowerCheck {
@@ -1062,8 +1068,14 @@ func (r *runtime) serviceControl(ctx context.Context, verb string, args []string
 		}
 	}
 
+	// SEC-13: route the privileged systemctl call through the validating
+	// `obacht-power-toggle svc` helper rather than granting the obacht user
+	// raw `sudo systemctl <verb> *.service`. The helper re-validates the verb
+	// and the (single, obacht-scoped) unit before it execs systemctl, closing
+	// the `*.service` wildcard multi-unit smuggle. The --skip-sudo path
+	// (root / tests) still calls systemctl directly.
 	cmdName := "sudo"
-	cmdArgs := []string{"-n", *systemctlPath, verb, *name}
+	cmdArgs := []string{"-n", *togglePath, "svc", verb, *name}
 	if *skipSudo {
 		cmdName = *systemctlPath
 		cmdArgs = []string{verb, *name}
