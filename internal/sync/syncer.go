@@ -196,8 +196,8 @@ func (s *Syncer) refreshDeviceToken(ctx context.Context) {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		s.log.Warn("token refresh: non-200", "status", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		s.log.Warn("token refresh: non-2xx", "status", resp.StatusCode)
 		return
 	}
 	var parsed struct {
