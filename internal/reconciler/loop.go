@@ -371,8 +371,9 @@ func (r *Reconciler) injectIPC(ctx context.Context, instanceID string, spec *con
 	}
 	if !hasSocketBind {
 		spec.Volumes = append(spec.Volumes, container.VolumeMount{
-			Source: r.socketPath,
-			Target: containerSocket,
+			Source:       r.socketPath,
+			Target:       containerSocket,
+			AgentManaged: true,
 		})
 	}
 	return nil

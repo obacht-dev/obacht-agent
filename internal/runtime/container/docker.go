@@ -192,9 +192,17 @@ type PortMap struct {
 
 // VolumeMount mounts a host path or named volume into the container.
 type VolumeMount struct {
-	Source   string `json:"source"`   // host path or volume name
-	Target   string `json:"target"`   // path in container
+	Source   string `json:"source"` // host path or volume name
+	Target   string `json:"target"` // path in container
 	ReadOnly bool   `json:"readOnly,omitempty"`
+	// AgentManaged marks a mount injected by the agent itself (today: the IPC
+	// socket the reconciler binds in via injectIPC). Such a mount binds a
+	// trusted agent-owned host path that legitimately lives outside the instance
+	// workspace and points at an existing socket/file, not a directory we own —
+	// so it bypasses both workspace confinement and the bind-dir pre-create.
+	// json:"-" so a template manifest can never set it and smuggle an arbitrary
+	// host source past validateBindSource.
+	AgentManaged bool `json:"-"`
 }
 
 // validateBindSource confines an absolute bind-mount source to the instance
@@ -223,6 +231,38 @@ func validateBindSource(instanceWorkspace, src string) error {
 		return fmt.Errorf("bind source %q escapes instance workspace %q", src, ws)
 	}
 	return nil
+}
+
+// resolveBinds renders the docker bind specs ("src:target:mode") for a
+// container's declared volumes and reports which host directories must be
+// pre-created (the rw, non-agent mounts). Manifest/user-controlled sources are
+// confined to instanceWorkspace via validateBindSource; agent-injected mounts
+// (the IPC socket, marked AgentManaged) bypass both confinement and pre-create
+// because their source is a trusted agent-owned socket that intentionally lives
+// outside the workspace. Keeping this pure — no docker, no filesystem writes —
+// is what makes the confinement rules unit-testable; the absence of that test
+// is what let the injected socket mount trip the workspace-escape check for
+// every container template (agent ≥ v0.3.18).
+func resolveBinds(instanceWorkspace string, vols []VolumeMount) (binds, preCreateDirs []string, err error) {
+	binds = make([]string, 0, len(vols))
+	for _, v := range vols {
+		mode := "rw"
+		if v.ReadOnly {
+			mode = "ro"
+		}
+		if v.AgentManaged {
+			binds = append(binds, fmt.Sprintf("%s:%s:%s", v.Source, v.Target, mode))
+			continue
+		}
+		if err := validateBindSource(instanceWorkspace, v.Source); err != nil {
+			return nil, nil, err
+		}
+		if !v.ReadOnly {
+			preCreateDirs = append(preCreateDirs, v.Source)
+		}
+		binds = append(binds, fmt.Sprintf("%s:%s:%s", v.Source, v.Target, mode))
+	}
+	return binds, preCreateDirs, nil
 }
 
 // hash returns a stable sha256 hex of the spec, used to detect drift.
@@ -538,19 +578,19 @@ func (d *Driver) imageRunUID(ctx context.Context, image string) (uid, gid int, r
 }
 
 type createBody struct {
-	Image        string                       `json:"Image"`
-	Cmd          []string                     `json:"Cmd,omitempty"`
-	Env          []string                     `json:"Env,omitempty"`
-	Labels       map[string]string            `json:"Labels"`
-	ExposedPorts map[string]struct{}          `json:"ExposedPorts,omitempty"`
-	HostConfig   hostConfig                   `json:"HostConfig"`
-	NetworkingConfig *networkingConfig        `json:"NetworkingConfig,omitempty"`
+	Image            string              `json:"Image"`
+	Cmd              []string            `json:"Cmd,omitempty"`
+	Env              []string            `json:"Env,omitempty"`
+	Labels           map[string]string   `json:"Labels"`
+	ExposedPorts     map[string]struct{} `json:"ExposedPorts,omitempty"`
+	HostConfig       hostConfig          `json:"HostConfig"`
+	NetworkingConfig *networkingConfig   `json:"NetworkingConfig,omitempty"`
 }
 
 type hostConfig struct {
-	Binds        []string                  `json:"Binds,omitempty"`
-	PortBindings map[string][]portBinding  `json:"PortBindings,omitempty"`
-	NetworkMode  string                    `json:"NetworkMode,omitempty"`
+	Binds         []string                 `json:"Binds,omitempty"`
+	PortBindings  map[string][]portBinding `json:"PortBindings,omitempty"`
+	NetworkMode   string                   `json:"NetworkMode,omitempty"`
 	RestartPolicy struct {
 		Name string `json:"Name"`
 	} `json:"RestartPolicy"`
@@ -592,7 +632,6 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 		bindings[key] = []portBinding{{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", p.Host)}}
 	}
 
-	binds := make([]string, 0, len(spec.Volumes))
 	// instanceWorkspace is the only host directory tree a container template is
 	// allowed to bind-mount from. Absolute bind sources (after cfg/secret
 	// substitution) that escape this prefix are rejected — this stops a manifest
@@ -600,48 +639,43 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 	// an absolute `/`) from mounting arbitrary host paths (host secrets, the
 	// docker socket, other instances' data) into the container.
 	instanceWorkspace := filepath.Clean("/var/lib/obacht/" + templateID + "/" + instanceID)
-	for _, v := range spec.Volumes {
-		if err := validateBindSource(instanceWorkspace, v.Source); err != nil {
-			return err
+	binds, preCreateDirs, err := resolveBinds(instanceWorkspace, spec.Volumes)
+	if err != nil {
+		return err
+	}
+	// Pre-create the host directory for each rw bind mount. SEC-24: templates
+	// like etherpad run as a non-root UID inside the container and would
+	// otherwise hit EACCES on the docker-created (root:root 0755) bind
+	// directory. Rather than making the dir world-writable (0o777), resolve the
+	// image's runtime UID/GID and chown the directory to it so only that
+	// container identity — and root — can write. "other" gets no access.
+	//
+	// When the image declares a *non-numeric* USER we cannot map to a UID
+	// without the image's /etc/passwd, so we fall back to the historical
+	// permissive 0o777 so we can never break a running template. This narrows
+	// the world-writable surface to just the minority of images that ship a
+	// named, unresolvable user.
+	for _, src := range preCreateDirs {
+		if err := os.MkdirAll(src, 0o750); err != nil {
+			continue
 		}
-		mode := "rw"
-		if v.ReadOnly {
-			mode = "ro"
-		} else {
-			// Pre-create the host directory for this bind mount. SEC-24:
-			// templates like etherpad run as a non-root UID inside the
-			// container and would otherwise hit EACCES on the docker-created
-			// (root:root 0755) bind directory. Rather than making the dir
-			// world-writable (0o777), resolve the image's runtime UID/GID and
-			// chown the directory to it so only that container identity — and
-			// root — can write. "other" gets no access.
-			//
-			// When the image declares a *non-numeric* USER we cannot map to a
-			// UID without the image's /etc/passwd, we fall back to the
-			// historical permissive 0o777 so we can never break a running
-			// template. This narrows the world-writable surface to just the
-			// minority of images that ship a named, unresolvable user.
-			if err := os.MkdirAll(v.Source, 0o750); err == nil {
-				if uid, gid, ok := d.imageRunUID(ctx, spec.Image); ok {
-					if uid == 0 {
-						// Container runs as root; root-owned 0o755 is enough.
-						_ = os.Chmod(v.Source, 0o755)
-					} else {
-						_ = os.Chmod(v.Source, 0o750)
-						_ = os.Chown(v.Source, uid, gid)
-					}
-				} else {
-					// Unresolvable named user: preserve permissive behavior so
-					// the container can still write. Logged for visibility.
-					if d.log != nil {
-						d.log.Warn("bind dir left world-writable: image declares a non-numeric USER",
-							"image", spec.Image, "dir", v.Source)
-					}
-					_ = os.Chmod(v.Source, 0o777)
-				}
+		if uid, gid, ok := d.imageRunUID(ctx, spec.Image); ok {
+			if uid == 0 {
+				// Container runs as root; root-owned 0o755 is enough.
+				_ = os.Chmod(src, 0o755)
+			} else {
+				_ = os.Chmod(src, 0o750)
+				_ = os.Chown(src, uid, gid)
 			}
+		} else {
+			// Unresolvable named user: preserve permissive behavior so the
+			// container can still write. Logged for visibility.
+			if d.log != nil {
+				d.log.Warn("bind dir left world-writable: image declares a non-numeric USER",
+					"image", spec.Image, "dir", src)
+			}
+			_ = os.Chmod(src, 0o777)
 		}
-		binds = append(binds, fmt.Sprintf("%s:%s:%s", v.Source, v.Target, mode))
 	}
 
 	body := createBody{
