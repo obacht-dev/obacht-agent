@@ -440,8 +440,7 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 			r.requireIPC()
 			code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/bindings", map[string]any{
 				"domain":      *domain,
-				"target_type": "host_port",
-				"target":      fmt.Sprintf("127.0.0.1:%d", *localPort),
+				"local_port":  *localPort,
 				"mode":        *mode,
 				"path_prefix": *prefix,
 			})
