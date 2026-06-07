@@ -1,12 +1,13 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package telemetry
 
 import "errors"
 
-// NewCollector on non-Linux platforms returns a stub that always errors.
-// The Syncer logs and skips the push, so the agent stays functional for
-// local dev (e.g. macOS) without telemetry.
+// NewCollector on platforms without a real collector (i.e. neither Linux nor
+// macOS) returns a stub that always errors. The Syncer logs and skips the push,
+// so the agent stays functional without telemetry. macOS now has its own
+// collector (collector_darwin.go).
 func NewCollector() Collector { return &noopCollector{} }
 
 type noopCollector struct{}
