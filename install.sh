@@ -325,6 +325,13 @@ Type=simple
 # obacht-power-toggle binary via the bootstrap sudoers entry.
 User=obacht
 Group=obacht
+# Bind-mount dirs for templates are pre-created by the agent and must be
+# writable by the container's runtime uid (often non-root, e.g. grafana=472)
+# AND by the agent's own file-browser. The agent owns the dir but needs
+# CAP_CHOWN to hand ownership to the container uid (and CAP_FOWNER to fix a
+# pre-existing root-owned dir). This adds no real privilege: the agent is in
+# the docker group and can already launch privileged containers.
+AmbientCapabilities=CAP_CHOWN CAP_FOWNER
 ExecStart=$INSTALL_DIR/obacht-agent -config $CONFIG_FILE
 Restart=always
 RestartSec=3

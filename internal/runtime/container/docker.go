@@ -643,38 +643,53 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 	if err != nil {
 		return err
 	}
-	// Pre-create the host directory for each rw bind mount. SEC-24: templates
-	// like etherpad run as a non-root UID inside the container and would
-	// otherwise hit EACCES on the docker-created (root:root 0755) bind
-	// directory. Rather than making the dir world-writable (0o777), resolve the
-	// image's runtime UID/GID and chown the directory to it so only that
-	// container identity — and root — can write. "other" gets no access.
+	// Pre-create the host directory for each rw bind mount so it is writable by
+	// BOTH the container's runtime identity AND the agent's own file-browser,
+	// which serves uploads/deletes as the unprivileged `obacht` agent user
+	// (gid os.Getegid()), not root.
 	//
-	// When the image declares a *non-numeric* USER we cannot map to a UID
-	// without the image's /etc/passwd, so we fall back to the historical
-	// permissive 0o777 so we can never break a running template. This narrows
-	// the world-writable surface to just the minority of images that ship a
-	// named, unresolvable user.
+	// SEC-24: templates run as varied UIDs — root (caddy), a non-root *numeric*
+	// uid (grafana=472, etherpad), or a non-numeric USER we cannot map without
+	// the image's /etc/passwd. We own the dir after MkdirAll, but the container
+	// usually needs to write as its own uid, so we chown the dir to that uid.
+	// That chown (and chmod of a pre-existing root-owned dir) needs CAP_CHOWN /
+	// CAP_FOWNER, granted to the agent via the systemd unit — the agent is
+	// already in the docker group (root-equivalent: it can launch privileged
+	// containers), so this adds no real privilege but lets the chown actually
+	// succeed instead of silently failing under the unprivileged user.
+	//
+	// Owner = container uid; group = the agent's gid (+ setgid so new entries
+	// inherit it) so the file-browser can write too. "other" gets nothing — and
+	// the dir lives under /var/lib/obacht (0750), which already excludes the
+	// world. Non-numeric users we can't map fall back to world-writable (still
+	// contained by that 0750 parent) so we never break a running template.
+	agentGID := os.Getegid()
 	for _, src := range preCreateDirs {
 		if err := os.MkdirAll(src, 0o750); err != nil {
+			if d.log != nil {
+				d.log.Warn("pre-create bind dir", "err", err, "dir", src)
+			}
 			continue
 		}
-		if uid, gid, ok := d.imageRunUID(ctx, spec.Image); ok {
-			if uid == 0 {
-				// Container runs as root; root-owned 0o755 is enough.
-				_ = os.Chmod(src, 0o755)
-			} else {
-				_ = os.Chmod(src, 0o750)
-				_ = os.Chown(src, uid, gid)
+		uid, _, ok := d.imageRunUID(ctx, spec.Image)
+		if !ok {
+			// Unresolvable named user: keep it group-owned by the agent but
+			// fall back to world-writable so the container can still write.
+			_ = os.Chown(src, -1, agentGID)
+			if err := os.Chmod(src, 0o777); err != nil && d.log != nil {
+				d.log.Warn("chmod bind dir", "err", err, "dir", src)
 			}
-		} else {
-			// Unresolvable named user: preserve permissive behavior so the
-			// container can still write. Logged for visibility.
 			if d.log != nil {
 				d.log.Warn("bind dir left world-writable: image declares a non-numeric USER",
 					"image", spec.Image, "dir", src)
 			}
-			_ = os.Chmod(src, 0o777)
+			continue
+		}
+		if err := os.Chown(src, uid, agentGID); err != nil && d.log != nil {
+			d.log.Warn("chown bind dir", "err", err, "dir", src, "uid", uid, "gid", agentGID)
+		}
+		if err := os.Chmod(src, 0o770|os.ModeSetgid); err != nil && d.log != nil {
+			d.log.Warn("chmod bind dir", "err", err, "dir", src)
 		}
 	}
 
