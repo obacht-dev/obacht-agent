@@ -15,10 +15,18 @@ import (
 
 // Config is the on-disk shape of agent.yml.
 type Config struct {
-	Server   ServerConfig   `yaml:"server"`
-	Registry RegistryConfig `yaml:"registry"`
-	Paths    PathsConfig    `yaml:"paths"`
-	Ingress  IngressConfig  `yaml:"ingress"`
+	Server    ServerConfig    `yaml:"server"`
+	Registry  RegistryConfig  `yaml:"registry"`
+	Paths     PathsConfig     `yaml:"paths"`
+	Ingress   IngressConfig   `yaml:"ingress"`
+	Telemetry TelemetryConfig `yaml:"telemetry"`
+}
+
+type TelemetryConfig struct {
+	// WireguardIP pins the obacht WG IP reported in telemetry instead of
+	// detecting it from interfaces (macOS, where a personal WireGuard could
+	// share the mesh range). Empty = auto-detect.
+	WireguardIP string `yaml:"wireguardIp"`
 }
 
 type ServerConfig struct {

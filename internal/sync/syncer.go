@@ -66,6 +66,11 @@ type Syncer struct {
 	telemetryEvery time.Duration
 	telemetry      telemetry.Collector
 
+	// Optional — when set, overrides the detected WireGuard IP in telemetry.
+	// macOS passes its enrollment-assigned obacht WG IP here so it reports the
+	// right address (and not, say, a personal WireGuard in the same range).
+	wgIPOverride string
+
 	// Optional — when set, syncer enriches compose-runtime instances
 	// in the observed-state push with per-service status. Nil-safe.
 	compose *compose.Driver
@@ -74,6 +79,9 @@ type Syncer struct {
 // SetCompose attaches the compose driver so observed-state pushes can
 // include per-service health for bundle instances.
 func (s *Syncer) SetCompose(d *compose.Driver) { s.compose = d }
+
+// SetWireguardIPOverride pins the WireGuard IP reported in telemetry (macOS).
+func (s *Syncer) SetWireguardIPOverride(ip string) { s.wgIPOverride = ip }
 
 // New constructs a Syncer. agentVersion should be the build version baked
 // into the binary (or "dev" for local builds). A nil audit writer is
@@ -230,6 +238,10 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 	if err != nil {
 		s.log.Debug("telemetry collect skipped", "err", err)
 		return
+	}
+	if s.wgIPOverride != "" {
+		ip := s.wgIPOverride
+		sample.WireguardIP = &ip
 	}
 	// Attach the agent version so the backend persists it on every push.
 	// agent:register also reports it, but that one-shot emit can race the WS

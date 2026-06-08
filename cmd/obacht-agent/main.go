@@ -44,6 +44,7 @@ func main() {
 		dockerSock  = flag.String("docker-socket", envOr("DOCKER_HOST_SOCKET", container.DefaultSocketPath()), "path to docker.sock")
 		reconcileEv = flag.Duration("reconcile-interval", 30*time.Second, "reconcile loop period")
 		oneShot     = flag.Bool("once", false, "run a single reconcile pass and exit (useful for tests)")
+		wgIP        = flag.String("wireguard-ip", "", "override the obacht WG IP reported in telemetry (macOS)")
 	)
 	flag.Parse()
 
@@ -60,6 +61,9 @@ func main() {
 	if err != nil {
 		log.Error("load config", "err", err, "path", *configPath)
 		os.Exit(1)
+	}
+	if *wgIP != "" {
+		cfg.Telemetry.WireguardIP = *wgIP
 	}
 	log.Info("agent starting",
 		"config", configOrDefault(*configPath),
@@ -170,6 +174,7 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
 		syncer.SetCompose(composeDrv)
+		syncer.SetWireguardIPOverride(cfg.Telemetry.WireguardIP)
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		logspkg.New(wsClient, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)
