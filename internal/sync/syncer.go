@@ -33,6 +33,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
+	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	"github.com/obacht-dev/obacht-agent/internal/telemetry"
 )
@@ -74,6 +75,13 @@ type Syncer struct {
 	// Optional — when set, syncer enriches compose-runtime instances
 	// in the observed-state push with per-service status. Nil-safe.
 	compose *compose.Driver
+
+	// Optional — user-signed mutation support (agent:signed_mutation).
+	// verifier holds the locally pinned user pubkeys; ingress lets verified
+	// domain ops reload Caddy. Both nil-safe; without pinned keys the
+	// capability is not advertised and the handler denies everything.
+	verifier *signedmut.Verifier
+	ingress  IngressManager
 }
 
 // SetCompose attaches the compose driver so observed-state pushes can
@@ -150,6 +158,12 @@ func (s *Syncer) Run(ctx context.Context) {
 	} {
 		s.client.On(op, deny(op))
 	}
+
+	// The ONE inbound mutation path: user-signed envelopes, verified
+	// locally against enrollment-pinned keys (internal/signedmut). The
+	// deny list above stays — unsigned desired-state pushes are never
+	// accepted, with or without this handler.
+	s.client.On("agent:signed_mutation", s.handleSignedMutation)
 
 	t := time.NewTicker(s.pushEvery)
 	defer t.Stop()
@@ -256,11 +270,18 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 func (s *Syncer) sendRegister() {
 	ident := compat.Detect("/var/lib/obacht")
 	hostname, _ := os.Hostname()
+	capabilities := []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix"}
+	// Advertise signed-mutation support only when at least one user key is
+	// pinned — the api/webapp route mutations by this capability, and a
+	// device that would deny everything must not attract them.
+	if s.verifier != nil && s.verifier.KeyCount() > 0 {
+		capabilities = append(capabilities, "signed-mutation")
+	}
 	payload := map[string]any{
 		"deviceId":      s.deviceID,
 		"agentVersion":  s.agentVersion,
 		"agentV2":       true,
-		"capabilities":  []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix"},
+		"capabilities":  capabilities,
 		"specVersion":   spec.SupportedSpecVersion,
 		"os":            runtime.GOOS,
 		"arch":          runtime.GOARCH,

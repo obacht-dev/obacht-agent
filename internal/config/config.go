@@ -46,6 +46,7 @@ type PathsConfig struct {
 	CaddyConfig string `yaml:"caddyConfig"` // /var/lib/obacht/caddy/config
 	AuditLog    string `yaml:"auditLog"`    // append-only JSONL audit log
 	ComposeRoot string `yaml:"composeRoot"` // workspace root for compose-runtime instances
+	UserKeysDir string `yaml:"userKeysDir"` // pinned user pubkeys for signed mutations (*.pub)
 }
 
 type IngressConfig struct {
@@ -105,6 +106,17 @@ func DefaultComposeRoot() string {
 	return "/var/lib/obacht/compose"
 }
 
+// DefaultUserKeysDir returns where enrollment pins the user's signing
+// pubkeys (one *.pub per key) for signed-mutation verification.
+func DefaultUserKeysDir() string {
+	if runtime.GOOS == "darwin" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "Library", "Application Support", "obacht", "user-keys.d")
+		}
+	}
+	return "/var/lib/obacht/user-keys.d"
+}
+
 // Load reads a config file. Returns a zero-value config + nil error if the
 // file does not exist (caller may decide whether that is fatal).
 func Load(path string) (*Config, error) {
@@ -146,6 +158,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Paths.ComposeRoot == "" {
 		c.Paths.ComposeRoot = DefaultComposeRoot()
+	}
+	if c.Paths.UserKeysDir == "" {
+		c.Paths.UserKeysDir = DefaultUserKeysDir()
 	}
 	if c.Ingress.Image == "" {
 		c.Ingress.Image = "caddy:2-alpine"

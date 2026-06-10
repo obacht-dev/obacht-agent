@@ -30,6 +30,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
+	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	syncpkg "github.com/obacht-dev/obacht-agent/internal/sync"
 )
@@ -175,6 +176,21 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
 		syncer.SetCompose(composeDrv)
 		syncer.SetWireguardIPOverride(cfg.Telemetry.WireguardIP)
+
+		// Signed mutations: load the user pubkeys pinned at enrollment.
+		// No keys -> capability not advertised, handler denies everything.
+		userKeys, keyProblems := signedmut.LoadUserKeys(cfg.Paths.UserKeysDir)
+		for _, p := range keyProblems {
+			log.Warn("user key skipped", "err", p)
+		}
+		if len(userKeys) > 0 {
+			labels := make([]string, 0, len(userKeys))
+			for _, k := range userKeys {
+				labels = append(labels, k.Label+" ("+k.Fingerprint()+")")
+			}
+			log.Info("signed mutations enabled", "keys", strings.Join(labels, ", "))
+		}
+		syncer.SetSignedMutations(signedmut.NewVerifier(userKeys), ingMgr)
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		logspkg.New(wsClient, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)
