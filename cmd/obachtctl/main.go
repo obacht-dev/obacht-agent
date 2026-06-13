@@ -7,8 +7,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,24 +21,9 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/config"
+	"github.com/obacht-dev/obacht-agent/internal/manifest"
 	"github.com/obacht-dev/obacht-agent/internal/store"
-	"github.com/obacht-dev/obacht-agent/internal/trust"
-	"gopkg.in/yaml.v3"
 )
-
-// trustDir is where the agent operator drops minisign .pub files for
-// the registry signing key(s). Overridable via OBACHT_TRUST_DIR for
-// tests. We fail-closed: if both --manifest-base64 and --signature-
-// base64 are provided to `template install`, verification is required
-// and a missing trust dir means rejection.
-const defaultTrustDir = "/etc/obacht/trust.d"
-
-func trustDir() string {
-	if d := os.Getenv("OBACHT_TRUST_DIR"); d != "" {
-		return d
-	}
-	return defaultTrustDir
-}
 
 // cliVersion is overridden at build time via -ldflags "-X main.cliVersion=...".
 // It must be a var (not a const) for the linker -X injection to take effect.
@@ -845,15 +830,15 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		die("--manifest-base64 and --signature-base64 must be used together")
 	}
 	if *manifestB64 != "" {
-		manifest, err := decodeB64(*manifestB64)
+		manifestBytes, err := manifest.DecodeBase64(*manifestB64)
 		if err != nil {
 			die("--manifest-base64 not valid base64: %v", err)
 		}
-		sig, err := decodeB64(*signatureB64)
+		sig, err := manifest.DecodeBase64(*signatureB64)
 		if err != nil {
 			die("--signature-base64 not valid base64: %v", err)
 		}
-		if err := verifyManifest(manifest, sig); err != nil {
+		if err := manifest.Verify(manifestBytes, sig, manifest.TrustDir()); err != nil {
 			die("template signature rejected: %v", err)
 		}
 		// S5.4: enforce manifest's spec.minSudoLevel against the host's
@@ -861,7 +846,7 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 		// privileges must NOT install while Power Mode is locked — the
 		// operator has to explicitly call `obachtctl system unlock-
 		// power` first (which itself is a deliberate two-step flow).
-		if level := extractMinSudoLevel(manifest); level == "power" {
+		if level := manifest.ExtractMinSudoLevel(manifestBytes); level == "power" {
 			if err := r.assertPowerModeEnabled(ctx); err != nil {
 				die("template requires power mode: %v", err)
 			}
@@ -887,7 +872,7 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 	// through verbatim — it must already BE a container.Spec in that
 	// case.
 	if *manifestB64 != "" {
-		manifestBytes, err := decodeB64(*manifestB64)
+		manifestBytes, err := manifest.DecodeBase64(*manifestB64)
 		if err != nil {
 			die("--manifest-base64 not valid base64: %v", err)
 		}
@@ -899,59 +884,21 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 				die("--config-json must be a JSON object when materialising from manifest")
 			}
 		}
-		spec, err := materializeManifest(manifestBytes, userCfg, *iid, *tid)
+		// Shared with the daemon's signed-mutation dispatcher
+		// (internal/manifest.BuildInstanceConfig): materialise +
+		// unresolved-placeholder gate + __input preservation + version
+		// resolution are one implementation.
+		built, err := manifest.BuildInstanceConfig(manifestBytes, userCfg, *iid, *tid, *version)
 		if err != nil {
-			die("manifest materialise: %v", err)
-		}
-		if unresolved := findUnresolvedPlaceholders(spec.Config); len(unresolved) > 0 {
-			// ${secret.X} placeholders are expected to survive
-			// materialisation for both compose AND container runtimes
-			// — the agent's reconciler substitutes them at apply time
-			// using values from the per-instance secret store. ${cfg.X}
-			// is also legal for compose (driver substitutes at apply).
-			// For compose, any remaining bare ${VAR} is a docker-compose
-			// interpolation variable resolved from the project .env file at
-			// `docker compose up` (custom-docker-composition env field) — it
-			// must NOT be treated as an unset template value here.
-			var real []string
-			for _, u := range unresolved {
-				if strings.HasPrefix(u, "secret.") {
-					continue
-				}
-				if spec.Runtime == "compose" {
-					// cfg.* (driver subst) and bare ${VAR} (.env interp) both
-					// resolve later; nothing is "unset" for compose.
-					continue
-				}
-				real = append(real, u)
+			var unset *manifest.UnsetValuesError
+			if errors.As(err, &unset) {
+				die("%s — provide them via --config-json", unset.Error())
 			}
-			if len(real) > 0 {
-				die("template refers to unset values: %s — provide them via --config-json", strings.Join(real, ", "))
-			}
+			die("%v", err)
 		}
-		var asAny any
-		if err := json.Unmarshal(spec.Config, &asAny); err != nil {
-			die("materialise self-check: %v", err)
-		}
-		// Preserve the user-provided config (plus schema defaults applied
-		// during materialisation) alongside the materialised runtime spec.
-		// The webapp uses this `__input` map to prefill "Configure" later.
-		if m, ok := asAny.(map[string]any); ok {
-			m["__input"] = userCfg
-			configRaw = m
-		} else {
-			configRaw = asAny
-		}
-		runtimeKind = spec.Runtime
-
-		// Fall back to the manifest's metadata.version when the api
-		// didn't pass --version explicitly. The api's snapshot
-		// reconciler refuses to upsert empty versions (NOT NULL).
-		if *version == "" {
-			if mv := extractManifestVersion(manifestBytes); mv != "" {
-				*version = mv
-			}
-		}
+		configRaw = built.Config
+		runtimeKind = built.Runtime
+		*version = built.Version
 	}
 	if *version == "" {
 		// Last-resort fallback so the api/supabase upsert never sees
@@ -1111,64 +1058,6 @@ func (r *runtime) serviceControl(ctx context.Context, verb string, args []string
 	}
 }
 
-// verifyManifest builds the trust bundle (embedded keys + /etc/obacht/
-// trust.d/*.pub) and checks the minisign signature. Returns nil on
-// success, non-nil error otherwise.
-func verifyManifest(manifest, sig []byte) error {
-	entries := append([]trust.KeyEntry(nil), trust.EmbeddedKeys...)
-	dirEntries, err := trust.LoadFromDir(trustDir())
-	if err != nil {
-		return fmt.Errorf("read trust dir %s: %w", trustDir(), err)
-	}
-	entries = append(entries, dirEntries...)
-	bundle, err := trust.New(entries)
-	if err != nil {
-		return fmt.Errorf("build trust bundle: %w", err)
-	}
-	return bundle.Verify(manifest, sig)
-}
-
-// extractMinSudoLevel parses just enough of the manifest to find
-// spec.minSudoLevel. We do not unmarshal into the full manifest type
-// to keep this command independent of the obacht-template-spec/go
-// module (and to be permissive if the manifest carries extra fields).
-//
-// Returns "" if the field is absent (which is treated the same as
-// "none" by the caller). Returns "power" only if the manifest
-// explicitly opts in.
-func extractMinSudoLevel(manifest []byte) string {
-	var probe struct {
-		Spec struct {
-			MinSudoLevel string `json:"minSudoLevel" yaml:"minSudoLevel"`
-		} `json:"spec" yaml:"spec"`
-	}
-	if err := json.Unmarshal(manifest, &probe); err != nil {
-		// The api always sends JSON; YAML manifests are converted
-		// upstream. If JSON parsing fails we treat the manifest as
-		// not opting into power-mode. Callers still validate the
-		// signature, so a tampered field would have been rejected.
-		return ""
-	}
-	return probe.Spec.MinSudoLevel
-}
-
-// extractManifestVersion pulls metadata.version out of the manifest as
-// a fallback when the api doesn't pass --version explicitly. The agent
-// stores instances.version and the api's snapshot reconciler refuses
-// to upsert empty strings (supabase column is NOT NULL), so we always
-// want SOMETHING here.
-func extractManifestVersion(manifest []byte) string {
-	var probe struct {
-		Metadata struct {
-			Version string `json:"version" yaml:"version"`
-		} `json:"metadata" yaml:"metadata"`
-	}
-	if err := yaml.Unmarshal(manifest, &probe); err != nil {
-		return ""
-	}
-	return probe.Metadata.Version
-}
-
 // assertPowerModeEnabled queries the agent's IPC /v1/system/status
 // endpoint and returns nil if `power_mode == "enabled"`. Any other
 // value (or any error reaching the endpoint) is fail-closed.
@@ -1250,23 +1139,6 @@ func emit(code int, body []byte) {
 func die(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "obachtctl: "+format+"\n", a...)
 	os.Exit(1)
-}
-
-// decodeB64 accepts both standard and url-safe base64, with or
-// without padding. The api could realistically emit either depending
-// on which Node helper it uses, so we try both.
-func decodeB64(s string) ([]byte, error) {
-	s = strings.TrimSpace(s)
-	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	if b, err := base64.RawStdEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
-		return b, nil
-	}
-	return base64.RawURLEncoding.DecodeString(s)
 }
 
 func usage(w *os.File) {
