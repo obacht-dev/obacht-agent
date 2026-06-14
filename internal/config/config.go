@@ -53,6 +53,16 @@ type IngressConfig struct {
 	Disabled bool   `yaml:"disabled"` // skip caddy management entirely
 	Image    string `yaml:"image"`    // override caddy image (default caddy:2-alpine)
 	Network  string `yaml:"network"`  // docker network name (default obacht-edge)
+	// Published host ports for Caddy. Default 80/443 (Pi). On the Mac the
+	// VM Caddy must bind the unprivileged 8080/8443 that the host ingress
+	// forwarder + obacht-proxy stream target.
+	HTTPPort  int `yaml:"httpPort"`
+	HTTPSPort int `yaml:"httpsPort"`
+	// Containerized: dockerd runs in a VM whose filesystem the agent's host
+	// paths don't reach (macOS). Deliver the Caddyfile into the container
+	// via the docker archive API and keep /data in a named volume instead
+	// of host bind-mounts. Default false (Pi: bind-mount host paths).
+	Containerized bool `yaml:"containerized"`
 }
 
 // DefaultPath returns the canonical config location for the host OS.
@@ -167,5 +177,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Ingress.Network == "" {
 		c.Ingress.Network = "obacht-edge"
+	}
+	if c.Ingress.HTTPPort == 0 {
+		c.Ingress.HTTPPort = 80
+	}
+	if c.Ingress.HTTPSPort == 0 {
+		c.Ingress.HTTPSPort = 443
 	}
 }

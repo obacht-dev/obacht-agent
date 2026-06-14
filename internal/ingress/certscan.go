@@ -20,6 +20,13 @@ import (
 //
 //	<CaddyData>/caddy/certificates/<acme-dir>/<domain>/<domain>.crt
 func (m *Manager) ScanCerts(ctx context.Context) error {
+	if m.cfg.Containerized {
+		// Certs live in the named docker volume inside the VM, not on a
+		// host path we can read. The cert is still issued + served; only
+		// the expiry/issuer telemetry is unavailable here (TODO: read via
+		// docker exec / Caddy admin API). Don't error-spam every reconcile.
+		return nil
+	}
 	root := filepath.Join(m.paths.CaddyData, "caddy", "certificates")
 	domains, err := m.store.ListDomains(ctx)
 	if err != nil {
