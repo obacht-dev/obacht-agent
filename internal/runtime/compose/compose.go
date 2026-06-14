@@ -211,6 +211,13 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 		return changed, fmt.Errorf("compose up: %w", err)
 	}
 
+	// Ensure the edge network exists before connecting. On the Mac the
+	// agent runs with ingress disabled (Caddy lives in the VM), so the
+	// ingress bootstrap that normally creates obacht-edge never runs.
+	// `network create` is idempotent enough here — a non-zero exit when it
+	// already exists is ignored (the connect below is the real check).
+	_ = exec.CommandContext(ctx, "docker", "network", "create", PrimaryEdgeNetwork).Run()
+
 	// Connect the primary service container to the edge network so Caddy
 	// can resolve it. docker network connect is idempotent (returns 304).
 	primaryContainer := PrimaryContainerName(instanceID, spec.PrimaryService)

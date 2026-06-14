@@ -693,6 +693,17 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 		}
 	}
 
+	// Ensure the target network exists before create. On the Mac the agent
+	// runs with ingress disabled (Caddy lives in the VM), so the ingress
+	// bootstrap that normally creates obacht-edge never runs — without this
+	// the create fails with "network obacht-edge not found". Idempotent:
+	// a no-op when the network already exists (the Pi case).
+	if spec.Network != "" {
+		if err := d.EnsureNetwork(ctx, spec.Network); err != nil {
+			return fmt.Errorf("ensure network %q: %w", spec.Network, err)
+		}
+	}
+
 	body := createBody{
 		Image:        spec.Image,
 		Cmd:          spec.Cmd,
