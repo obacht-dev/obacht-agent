@@ -77,6 +77,32 @@ func New(socketPath string) *Driver {
 // Docker REST API without re-implementing the unix-socket dialler.
 func (d *Driver) HTTP() *http.Client { return d.http }
 
+// doWithRetry issues an idempotent request, retrying once on a transient
+// transport error. On the Mac, dockerd lives in a VM behind a vsock bridge
+// that occasionally drops a single connection (EOF / connection refused)
+// then recovers; a one-shot retry hides that blip so callers (e.g. the
+// reconciler's List) don't see spurious failures. Only use for body-less,
+// idempotent requests (GETs).
+func (d *Driver) doWithRetry(req *http.Request) (*http.Response, error) {
+	resp, err := d.http.Do(req)
+	if err == nil || !isTransientNetErr(err) {
+		return resp, err
+	}
+	time.Sleep(150 * time.Millisecond)
+	return d.http.Do(req.Clone(req.Context()))
+}
+
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe")
+}
+
 // PullImage pulls an image if it is not already present locally.
 func (d *Driver) PullImage(ctx context.Context, image string) error {
 	return d.pullIfMissing(ctx, image)
@@ -320,7 +346,7 @@ func (d *Driver) List(ctx context.Context) ([]ManagedContainer, error) {
 	q.Set("all", "true")
 	q.Set("filters", string(filters))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/v1.43/containers/json?"+q.Encode(), nil)
-	resp, err := d.http.Do(req)
+	resp, err := d.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
