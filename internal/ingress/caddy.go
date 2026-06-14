@@ -200,7 +200,12 @@ func (m *Manager) caddyfilePath() string { return filepath.Join(m.paths.CaddyCon
 func (m *Manager) writeCaddyfile(body string) error {
 	// Always stage to the host path: on the Pi this IS the bind-mounted
 	// file; in containerized mode it's the source copyCaddyfileToContainer
-	// streams into the VM container.
+	// streams into the VM container. Create the parent dir here so Apply
+	// works even when Bootstrap bailed early (e.g. the VM dockerd wasn't
+	// ready yet and ensureDirs never ran).
+	if err := os.MkdirAll(filepath.Dir(m.caddyfilePath()), 0o755); err != nil {
+		return fmt.Errorf("mkdir caddy config dir: %w", err)
+	}
 	return os.WriteFile(m.caddyfilePath(), []byte(body), 0o644)
 }
 
