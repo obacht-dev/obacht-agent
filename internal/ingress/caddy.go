@@ -546,6 +546,12 @@ func (m *Manager) createCaddyContainer(ctx context.Context) error {
 	// Pi: bind-mount the host data + config dirs as before.
 	if m.cfg.Containerized {
 		hostConfig["Binds"] = []string{caddyDataVolume + ":/data:rw"}
+		// In the Mac VM, docker's embedded resolver (127.0.0.11) on the
+		// obacht-edge user network has no working upstream, so Caddy can't
+		// resolve the ACME directory and never gets a cert. Point the
+		// container at public resolvers so ACME (and any outbound lookup)
+		// works. Harmless on the Pi, but only needed in containerized mode.
+		hostConfig["Dns"] = []string{"1.1.1.1", "8.8.8.8"}
 	} else {
 		hostConfig["Binds"] = []string{
 			m.paths.CaddyData + ":/data:rw",
