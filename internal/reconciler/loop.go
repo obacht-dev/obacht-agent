@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,29 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
+
+// isTransientDockerErr reports whether err is a docker *transport* failure
+// (the daemon was momentarily unreachable) rather than a real container
+// fault. On the Mac the dockerd lives in a VM behind a vsock bridge that can
+// blip (EOF / connection refused) for a single reconcile pass; treating that
+// as a per-instance "error" observed-state poisons the UI with a spurious
+// "Something went wrong" until the next pass. We skip the observed write
+// instead and let the next pass (docker back) report the true state.
+func isTransientDockerErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, sub := range []string{
+		"connection refused", "EOF", "dial unix",
+		"broken pipe", "connection reset", "no such file or directory",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
 
 // Reconciler runs the desired-vs-observed convergence loop.
 type Reconciler struct {
@@ -226,6 +250,12 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply instance", "instance", inst.ID, "err", err)
+			if isTransientDockerErr(err) {
+				// docker momentarily unreachable (VM/bridge blip) — not an
+				// instance fault. Leave observed state untouched; next pass
+				// reports the truth once the bridge is back.
+				return
+			}
 			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
 				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
 			}
@@ -403,6 +433,9 @@ func (r *Reconciler) reconcileCompose(ctx context.Context, inst store.Instance) 
 		changed, err := r.compose.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply compose instance", "instance", inst.ID, "err", err)
+			if isTransientDockerErr(err) {
+				return // transient docker blip — see reconcileContainer
+			}
 			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
 				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
 			}
