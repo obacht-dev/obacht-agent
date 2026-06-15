@@ -330,7 +330,7 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 	subst := newSubstituter(userConfig, instanceID, templateID)
 
 	out := map[string]any{}
-	for _, k := range []string{"kind", "binary", "binary_url", "binary_digest", "data_dir"} {
+	for _, k := range []string{"kind", "binary", "binary_url", "binary_digest", "archive", "data_dir"} {
 		if v, ok := hs[k].(string); ok && v != "" {
 			out[k] = subst.string(v)
 		}

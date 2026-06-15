@@ -19,7 +19,8 @@ spec:
       host_service:
         kind: ollama
         binary: ollama
-        binary_url: https://github.com/ollama/ollama/releases/download/v0.1/ollama-darwin
+        archive: tgz
+        binary_url: https://github.com/ollama/ollama/releases/download/v0.1/ollama-darwin.tgz
         binary_digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
         args: ["serve"]
         env:
@@ -40,6 +41,7 @@ func TestMaterialize_SystemHostService(t *testing.T) {
 			Binary       string            `json:"binary"`
 			BinaryURL    string            `json:"binary_url"`
 			BinaryDigest string            `json:"binary_digest"`
+			Archive      string            `json:"archive"`
 			Args         []string          `json:"args"`
 			Env          map[string]string `json:"env"`
 		} `json:"host_service"`
@@ -50,6 +52,9 @@ func TestMaterialize_SystemHostService(t *testing.T) {
 	hs := parsed.HostService
 	if hs.Binary != "ollama" || len(hs.Args) != 1 || hs.Args[0] != "serve" {
 		t.Fatalf("unexpected host_service: %+v", hs)
+	}
+	if hs.Archive != "tgz" {
+		t.Fatalf("archive not carried through materialize: %q", hs.Archive)
 	}
 	// ${instance.id} must have been substituted in env.
 	if got := hs.Env["OLLAMA_MODELS"]; got != "/var/lib/inst-123/models" {
