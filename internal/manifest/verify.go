@@ -77,6 +77,27 @@ func ExtractVersion(manifestBytes []byte) string {
 	return probe.Metadata.Version
 }
 
+// HasHostService reports whether the manifest declares a
+// spec.runtime.system.host_service block — i.e. it is the macOS host-service
+// flavor of the system runtime (launchd on the host) rather than a systemd
+// unit. Used to allow exactly this one kind of system template through the
+// signed-mutation path on darwin, where the host-service driver exists.
+func HasHostService(manifestBytes []byte) bool {
+	var probe struct {
+		Spec struct {
+			Runtime struct {
+				System struct {
+					HostService map[string]any `json:"host_service" yaml:"host_service"`
+				} `json:"system" yaml:"system"`
+			} `json:"runtime" yaml:"runtime"`
+		} `json:"spec" yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(manifestBytes, &probe); err != nil {
+		return false
+	}
+	return len(probe.Spec.Runtime.System.HostService) > 0
+}
+
 // RuntimeType returns spec.runtime.type ("container" | "compose" |
 // "system" | …) without a full manifest parse. Used to reject
 // system-runtime templates on platforms with no systemd target (Mac VM)

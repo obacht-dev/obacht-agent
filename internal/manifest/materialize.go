@@ -150,6 +150,17 @@ func Materialize(manifestBytes []byte, userConfig map[string]any, instanceID, te
 			return Result{}, err
 		}
 		return Result{Runtime: "compose", Config: cfg}, nil
+	case "system":
+		// Only the macOS host-service flavor is materialised here. systemd
+		// system templates (Pi) are NOT installed via this path — they push a
+		// raw config_json over obachtctl IPC — so for any system manifest
+		// WITHOUT a host_service block we return the exact same error as before
+		// (keeps the Pi/legacy behaviour byte-identical).
+		cfg, err := materializeSystem(spec, runtimeBlock, userConfig, instanceID, templateID)
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{Runtime: "system", Config: cfg}, nil
 	default:
 		return Result{}, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", runtimeType)
 	}
@@ -300,6 +311,50 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 	}
 
 	return json.Marshal(out)
+}
+
+// materializeSystem produces the config_json for a macOS host-service instance
+// from spec.runtime.system.host_service, substituting ${cfg.X}/${instance.id}/
+// ${template.id} in its string fields. The output is shaped to match
+// runtime/system.Spec (a {"host_service": {...}} object) so the darwin system
+// driver's ParseSpec consumes it directly. A system manifest WITHOUT a
+// host_service block returns the exact same "unsupported" error the default
+// switch case produces, keeping non-host-service system manifests unchanged.
+func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
+	_ = spec
+	sysBlock, _ := runtime["system"].(map[string]any)
+	hs, _ := sysBlock["host_service"].(map[string]any)
+	if hs == nil {
+		return nil, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", "system")
+	}
+	subst := newSubstituter(userConfig, instanceID, templateID)
+
+	out := map[string]any{}
+	for _, k := range []string{"kind", "binary", "binary_url", "binary_digest", "data_dir"} {
+		if v, ok := hs[k].(string); ok && v != "" {
+			out[k] = subst.string(v)
+		}
+	}
+	if argsAny, ok := hs["args"].([]any); ok {
+		args := make([]string, 0, len(argsAny))
+		for _, a := range argsAny {
+			args = append(args, subst.string(toString(a)))
+		}
+		out["args"] = args
+	}
+	if envAny, ok := hs["env"].(map[string]any); ok {
+		env := make(map[string]string, len(envAny))
+		for k, v := range envAny {
+			env[k] = subst.string(toString(v))
+		}
+		out["env"] = env
+	}
+
+	cfg, err := json.Marshal(map[string]any{"host_service": out})
+	if err != nil {
+		return nil, fmt.Errorf("encode system host-service spec: %w", err)
+	}
+	return cfg, nil
 }
 
 // materializeCompose builds a compose.Spec the agent's compose driver

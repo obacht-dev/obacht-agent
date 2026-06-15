@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
@@ -223,9 +224,10 @@ func (s *Syncer) dispatchSignedMutation(ctx context.Context, m *signedmut.Mutati
 //  2. the manifest's own minisign signature is verified here against the
 //     embedded registry trust bundle (a compromised backend can neither
 //     forge the user sig nor the registry sig — both must hold, I4);
-//  3. system-runtime templates are rejected (no systemd in the Mac VM);
-//  4. power-mode/native-host templates are rejected (Phase 5 / host
-//     services not wired yet);
+//  3. system-runtime templates are rejected — EXCEPT the macOS host-service
+//     flavor (launchd on the host, e.g. Ollama) on darwin, which Phase 5
+//     wires up; systemd system templates stay rejected (no systemd in the VM);
+//  4. power-mode templates are rejected (not wired yet);
 //  5. the manifest is materialised through the SAME code obachtctl uses
 //     (internal/manifest.BuildInstanceConfig) — no drift.
 func (s *Syncer) dispatchInstanceUpsert(ctx context.Context, m *signedmut.Mutation) error {
@@ -261,7 +263,15 @@ func (s *Syncer) dispatchInstanceUpsert(ctx context.Context, m *signedmut.Mutati
 		return fmt.Errorf("manifest signature rejected: %w", err)
 	}
 	if rt := manifest.RuntimeType(manifestBytes); rt == "system" {
-		return errors.New("system-runtime templates are not supported on this device")
+		// The macOS host-service flavor (launchd on the host, e.g. Ollama) is
+		// the one system runtime allowed via the signed path, and only on
+		// darwin where the host-service driver exists. Everything else stays
+		// rejected: there is no systemd in the Mac VM, and Pis install systemd
+		// templates over obachtctl/SSH, never this path. On linux this branch
+		// is byte-identical to before (the condition is always false there).
+		if !(runtime.GOOS == "darwin" && manifest.HasHostService(manifestBytes)) {
+			return errors.New("system-runtime templates are not supported on this device")
+		}
 	}
 	if manifest.ExtractMinSudoLevel(manifestBytes) == "power" {
 		return errors.New("templates requiring power mode are not yet supported on this device")

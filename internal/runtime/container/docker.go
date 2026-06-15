@@ -201,6 +201,28 @@ func (s *Spec) ExpandSecrets(ctx context.Context, instanceID string, sp SecretPr
 	return nil
 }
 
+// ExpandHostVars resolves agent-host placeholders that the API cannot know at
+// install time. Currently just ${host.gateway} = the VZ gateway IP a VM
+// container uses to reach a macOS host-service (e.g. Ollama). No-op when
+// gatewayIP is empty (Pis), so the placeholder simply never appears there.
+func (s *Spec) ExpandHostVars(gatewayIP string) {
+	if s == nil || gatewayIP == "" {
+		return
+	}
+	sub := func(in string) string {
+		return strings.ReplaceAll(in, "${host.gateway}", gatewayIP)
+	}
+	for k, v := range s.Env {
+		s.Env[k] = sub(v)
+	}
+	for i := range s.Cmd {
+		s.Cmd[i] = sub(s.Cmd[i])
+	}
+	for k, v := range s.Labels {
+		s.Labels[k] = sub(v)
+	}
+}
+
 // ServiceSpec declares a named service exposed by the container that the
 // ingress layer can route domain traffic to. targetType="container_port"
 // resolves via docker DNS on the shared edge network.

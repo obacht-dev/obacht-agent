@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -99,6 +100,96 @@ type Spec struct {
 	UnitTemplate     string `json:"unit_template"`
 	Files            []File `json:"files,omitempty"`
 	ExclusivityGroup string `json:"exclusivity_group,omitempty"`
+
+	// HostService, when set, makes this a macOS host-service instance instead
+	// of a systemd unit (Pi). It is mutually exclusive with the systemd fields
+	// above and is only ever materialized for Mac devices. The Pi (linux)
+	// driver never receives a spec with HostService set, and even if it did its
+	// Apply requires UnitName and would fail harmlessly. See driver_darwin.go.
+	HostService *HostServiceSpec `json:"host_service,omitempty"`
+}
+
+// HostServiceSpec describes a service obacht runs directly on the macOS host
+// (outside the VM) as a user LaunchAgent — e.g. Ollama, which needs full
+// system/GPU access. The agent downloads the pinned binary, writes a
+// `dev.obacht.hostsvc.<instance>` plist, and manages it with launchctl. The
+// shape is deliberately STRUCTURED (no raw plist / shell): the only freedom a
+// (registry-signed) manifest has is to pick an allowlisted binary, its argv,
+// and environment — never an arbitrary command. See validate() for the rules.
+type HostServiceSpec struct {
+	Kind         string            `json:"kind"`              // free-form label, e.g. "ollama"
+	Binary       string            `json:"binary"`            // must be in allowedHostBinaries; for an archive, the binary's name inside it
+	BinaryURL    string            `json:"binary_url"`        // pinned https download (host allowlisted)
+	BinaryDigest string            `json:"binary_digest"`     // "sha256:<hex>" — verified before extract/exec
+	Archive      string            `json:"archive,omitempty"` // "" = raw binary; "tgz" = gzip tarball to extract
+	Args         []string          `json:"args,omitempty"`
+	Env          map[string]string `json:"env,omitempty"`
+	DataDir      string            `json:"data_dir,omitempty"` // optional; agent picks a default otherwise
+}
+
+// allowedHostBinaries is the allowlist of binaries the host-service runtime may
+// run on the Mac. Keep this tiny: each entry is a program obacht is willing to
+// execute outside the VM sandbox on the user's machine.
+var allowedHostBinaries = map[string]bool{
+	"ollama": true,
+}
+
+// hostBinaryRe constrains the binary file name to a safe leaf (no path
+// separators, no traversal) so it can only ever name a file inside obacht's
+// managed bin dir.
+var hostBinaryRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+
+// allowedDownloadHosts restricts where the pinned binary may be fetched from.
+// The sha256 digest is the real protection; this is defence in depth so a
+// (signed-but-wrong) manifest cannot point the downloader at an arbitrary host.
+var allowedDownloadHosts = map[string]bool{
+	"ollama.com":                    true,
+	"github.com":                    true,
+	"objects.githubusercontent.com": true,
+}
+
+func (h HostServiceSpec) validate() error {
+	if !allowedHostBinaries[h.Binary] || !hostBinaryRe.MatchString(h.Binary) {
+		return fmt.Errorf("host service: binary %q not allowed", h.Binary)
+	}
+	if h.BinaryURL == "" || h.BinaryDigest == "" {
+		return errors.New("host service: binary_url and binary_digest are required")
+	}
+	if !strings.HasPrefix(h.BinaryDigest, "sha256:") || len(h.BinaryDigest) != len("sha256:")+64 {
+		return fmt.Errorf("host service: binary_digest %q must be sha256:<64 hex>", h.BinaryDigest)
+	}
+	if h.Archive != "" && h.Archive != "tgz" {
+		return fmt.Errorf("host service: archive %q not supported (only \"tgz\")", h.Archive)
+	}
+	u, err := url.Parse(h.BinaryURL)
+	if err != nil || u.Scheme != "https" || !allowedDownloadHosts[u.Host] {
+		return fmt.Errorf("host service: binary_url %q must be https and in %v", h.BinaryURL, keysOf(allowedDownloadHosts))
+	}
+	for _, a := range h.Args {
+		if strings.ContainsAny(a, "\x00\n\r") {
+			return fmt.Errorf("host service: arg %q contains control characters", a)
+		}
+	}
+	for k, v := range h.Env {
+		if k == "" || strings.ContainsAny(k, "\x00\n\r=") || strings.ContainsAny(v, "\x00\n\r") {
+			return fmt.Errorf("host service: env key/value for %q contains control characters", k)
+		}
+	}
+	if h.DataDir != "" {
+		if !filepath.IsAbs(h.DataDir) || filepath.Clean(h.DataDir) != h.DataDir ||
+			strings.ContainsAny(h.DataDir, "\x00\n\r") {
+			return fmt.Errorf("host service: data_dir %q must be a clean absolute path", h.DataDir)
+		}
+	}
+	return nil
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // File is a supporting file rendered alongside the unit. Mode defaults to
@@ -128,6 +219,11 @@ func ParseSpec(configJSON string) (Spec, error) {
 // name and confined, traversal-free supporting-file paths. Callers must run
 // this before any file is written; ParseSpec already does.
 func (s Spec) Validate() error {
+	// A host-service instance (macOS) validates its own structured shape and is
+	// mutually exclusive with the systemd fields.
+	if s.HostService != nil {
+		return s.HostService.validate()
+	}
 	if s.UnitName == "" || s.UnitTemplate == "" {
 		return fmt.Errorf("system spec: unit_name and unit_template are required")
 	}

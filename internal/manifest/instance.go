@@ -57,6 +57,13 @@ func BuildInstanceConfig(manifestBytes []byte, userConfig map[string]any, instan
 			if strings.HasPrefix(u, "secret.") {
 				continue
 			}
+			// ${host.*} (e.g. ${host.gateway}) is resolved by the agent at apply
+			// time from host facts the api can't know — like ${secret.*}, it must
+			// survive materialisation. Only ever used by macOS host-service
+			// templates; no Pi template emits it, so this is inert on Pis.
+			if strings.HasPrefix(u, "host.") {
+				continue
+			}
 			if spec.Runtime == "compose" {
 				continue
 			}

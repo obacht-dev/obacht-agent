@@ -55,6 +55,11 @@ type Reconciler struct {
 	// the agent IPC at OBACHT_AGENT_SOCKET. Empty disables injection.
 	socketPath string
 
+	// hostGatewayIP is the VZ gateway IP a VM container uses to reach the
+	// macOS host (where host-services like Ollama listen). Resolves the
+	// ${host.gateway} placeholder. Empty on Pis — no host-services there.
+	hostGatewayIP string
+
 	trigger chan struct{}
 	mu      sync.Mutex
 	last    time.Time
@@ -94,6 +99,11 @@ func (r *Reconciler) SetIngress(i IngressApplier) { r.ingress = i }
 // OBACHT_AGENT_SOCKET=<path>. A per-instance secret is also auto-issued
 // and exposed as OBACHT_INSTANCE_SECRET.
 func (r *Reconciler) SetSocketPath(p string) { r.socketPath = p }
+
+// SetHostGateway sets the VZ gateway IP used to resolve ${host.gateway} in
+// container specs (so a VM container can reach a macOS host-service). Empty on
+// Pis. macOS only.
+func (r *Reconciler) SetHostGateway(ip string) { r.hostGatewayIP = ip }
 
 // Trigger requests an immediate reconcile pass. Coalesces if one is pending.
 func (r *Reconciler) Trigger() {
@@ -247,6 +257,10 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 			}
 			return
 		}
+		// Resolve ${host.gateway} so a VM container (e.g. OpenWebUI) can reach a
+		// macOS host-service (e.g. Ollama on the VZ gateway). No-op on Pis (the
+		// gateway is empty there and Pi specs never use the placeholder).
+		spec.ExpandHostVars(r.hostGatewayIP)
 		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply instance", "instance", inst.ID, "err", err)

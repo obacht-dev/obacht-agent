@@ -23,10 +23,10 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/bootstrap"
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/files"
-	logspkg "github.com/obacht-dev/obacht-agent/internal/logs"
 	"github.com/obacht-dev/obacht-agent/internal/ingress"
 	"github.com/obacht-dev/obacht-agent/internal/ipc"
 	"github.com/obacht-dev/obacht-agent/internal/logging"
+	logspkg "github.com/obacht-dev/obacht-agent/internal/logs"
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
@@ -46,6 +46,7 @@ func main() {
 		reconcileEv = flag.Duration("reconcile-interval", 30*time.Second, "reconcile loop period")
 		oneShot     = flag.Bool("once", false, "run a single reconcile pass and exit (useful for tests)")
 		wgIP        = flag.String("wireguard-ip", "", "override the obacht WG IP reported in telemetry (macOS)")
+		hostGateway = flag.String("host-gateway", envOr("OBACHT_HOST_GATEWAY", ""), "VZ gateway IP that VM containers use to reach the macOS host; resolves ${host.gateway} (macOS host-services)")
 	)
 	flag.Parse()
 
@@ -109,7 +110,7 @@ func main() {
 		Params:        map[string]any{"version": agentVersion},
 	})
 
-tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
+	tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
 	if err != nil && !errors.Is(err, bootstrap.ErrSkipped) {
 		// Bootstrap failure is logged but not fatal: the device may simply
 		// have lost connectivity. Reconciler keeps running locally and the
@@ -130,6 +131,7 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 
 	rec := reconciler.New(st, docker, log.With("component", "reconciler"), *reconcileEv)
 	rec.SetSocketPath(cfg.Paths.Socket)
+	rec.SetHostGateway(*hostGateway)
 
 	// Compose runtime driver — bundle templates (spec v2.1).
 	if err := os.MkdirAll(cfg.Paths.ComposeRoot, 0o750); err != nil {
