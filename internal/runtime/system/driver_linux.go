@@ -177,6 +177,10 @@ func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {
 	return prop.Value.String(), nil
 }
 
+// GarbageCollect is a no-op on linux (host-service orphan GC is darwin-only;
+// systemd units are managed explicitly via Apply/Remove).
+func (d *Driver) GarbageCollect(ctx context.Context, keep map[string]bool) {}
+
 func (d *Driver) writeFiles(instanceID string, files []File) error {
 	if len(files) == 0 {
 		return nil

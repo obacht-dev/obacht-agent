@@ -131,6 +131,34 @@ func (d *Driver) Remove(ctx context.Context, instanceID, _ string) error {
 	return nil
 }
 
+// GarbageCollect boots out and removes any obacht host-service LaunchAgent whose
+// instance id is NOT in keep — i.e. services orphaned by a wiped/re-enrolled
+// SSOT. Without this an old Ollama keeps running and holds :11434, so the
+// re-installed instance can't bind and exits. keep holds instance ids.
+func (d *Driver) GarbageCollect(ctx context.Context, keep map[string]bool) {
+	keepLabels := make(map[string]bool, len(keep))
+	for id := range keep {
+		keepLabels[hostLabel(id)] = true
+	}
+	entries, err := os.ReadDir(d.agentDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, labelPrefix) || !strings.HasSuffix(name, ".plist") {
+			continue
+		}
+		label := strings.TrimSuffix(name, ".plist")
+		if keepLabels[label] {
+			continue
+		}
+		_ = d.runLaunchctl(ctx, "bootout", d.guiDomain()+"/"+label) // ignore: may not be loaded
+		_ = os.Remove(filepath.Join(d.agentDir, name))
+		d.log.Info("gc orphan host-service", "label", label)
+	}
+}
+
 // Status maps launchd state to the systemd-style vocabulary the rest of the
 // agent uses ("active"/"inactive"), or "" if unknown. unitName is the label.
 func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {

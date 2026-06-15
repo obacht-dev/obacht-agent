@@ -183,6 +183,18 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Garbage-collect orphaned host-service launchd jobs (macOS): a host service
+	// left behind by a wiped/re-enrolled SSOT keeps running and can hold a port
+	// (e.g. Ollama on :11434), making the re-installed instance exit on bind.
+	// Keep only the system instances that should currently be installed.
+	systemKeep := make(map[string]bool)
+	for _, inst := range desired {
+		if inst.Runtime == store.RuntimeSystem && inst.DesiredState == store.DesiredInstalled {
+			systemKeep[inst.ID] = true
+		}
+	}
+	r.system.GarbageCollect(ctx, systemKeep)
+
 	// Garbage-collect orphans: managed containers whose instance row is gone.
 	for id, c := range observedByInstance {
 		if _, ok := desiredIDs[id]; ok {

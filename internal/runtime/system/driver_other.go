@@ -28,3 +28,6 @@ func (d *Driver) Remove(ctx context.Context, instanceID, unitName string) error 
 func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {
 	return "", nil
 }
+
+// GarbageCollect is a no-op here (host-service orphan GC is darwin-only).
+func (d *Driver) GarbageCollect(ctx context.Context, keep map[string]bool) {}
