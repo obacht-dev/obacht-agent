@@ -595,6 +595,34 @@ func (m *Manager) createCaddyContainer(ctx context.Context) error {
 		}
 	}
 
+	if err := m.startCaddy(ctx); err != nil {
+		// A libnetwork port-reservation leak makes start fail forever with
+		// "port is already allocated" even though no live container uses the
+		// port: after an unclean VM/dockerd stop, a dangling endpoint from a
+		// previous Caddy keeps the host-port reservation. We can't restart the
+		// VM's dockerd from here, but force-disconnecting the dangling endpoint
+		// releases the port. Mac VM only — on the Pi dockerd is native/stable
+		// and this path stays byte-identical to before.
+		if m.cfg.Containerized && strings.Contains(err.Error(), "port is already allocated") {
+			m.log.Warn("caddy host port already allocated; recovering stale port bindings", "err", err)
+			if rerr := m.recoverStalePortBindings(ctx); rerr != nil {
+				m.log.Warn("stale port-binding recovery failed", "err", rerr)
+			}
+			if err2 := m.startCaddy(ctx); err2 != nil {
+				return fmt.Errorf("start caddy after port-leak recovery: %w", err2)
+			}
+		} else {
+			return err
+		}
+	}
+	// Give Caddy a moment to spin up before any reload.
+	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// startCaddy issues the container start and maps a non-2xx into an error whose
+// message carries the daemon's reason (e.g. "port is already allocated").
+func (m *Manager) startCaddy(ctx context.Context) error {
 	startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		"http://docker/v1.43/containers/"+ContainerName+"/start", nil)
 	sresp, err := m.docker.HTTP().Do(startReq)
@@ -606,8 +634,114 @@ func (m *Manager) createCaddyContainer(ctx context.Context) error {
 		raw, _ := io.ReadAll(sresp.Body)
 		return fmt.Errorf("start caddy %d: %s", sresp.StatusCode, string(raw))
 	}
-	// Give Caddy a moment to spin up before any reload.
-	time.Sleep(500 * time.Millisecond)
+	return nil
+}
+
+// recoverStalePortBindings releases a leaked host-port reservation by
+// force-disconnecting endpoints whose container no longer exists (the leak's
+// cause). It only touches dangling endpoints, so it's safe to run; it never
+// disconnects a live container. Best-effort: if the leak is deeper than a
+// dangling endpoint, only a fresh dockerd (VM restart) clears it.
+func (m *Manager) recoverStalePortBindings(ctx context.Context) error {
+	live, err := m.liveContainerIDs(ctx)
+	if err != nil {
+		return fmt.Errorf("list containers: %w", err)
+	}
+	disconnected := 0
+	for _, network := range []string{m.cfg.Network, "bridge"} {
+		eps, err := m.networkEndpointContainerIDs(ctx, network)
+		if err != nil {
+			m.log.Warn("inspect network for stale endpoints", "net", network, "err", err)
+			continue
+		}
+		for cid := range eps {
+			if live[cid] {
+				continue // a real, existing container — leave it alone
+			}
+			if err := m.networkDisconnect(ctx, network, cid); err != nil {
+				m.log.Warn("disconnect stale endpoint", "net", network, "endpoint", cid, "err", err)
+				continue
+			}
+			disconnected++
+			m.log.Info("released stale network endpoint", "net", network, "endpoint", cid)
+		}
+	}
+	if disconnected == 0 {
+		m.log.Warn("port-leak recovery found no stale endpoints; a VM/dockerd restart may be required")
+	}
+	return nil
+}
+
+// liveContainerIDs returns the set of all container IDs that currently exist
+// (running or stopped).
+func (m *Manager) liveContainerIDs(ctx context.Context) (map[string]bool, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://docker/v1.43/containers/json?all=true", nil)
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("containers list %d: %s", resp.StatusCode, string(raw))
+	}
+	var arr []struct {
+		ID string `json:"Id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&arr); err != nil {
+		return nil, err
+	}
+	live := make(map[string]bool, len(arr))
+	for _, c := range arr {
+		live[c.ID] = true
+	}
+	return live, nil
+}
+
+// networkEndpointContainerIDs returns the keys of a network's Containers map —
+// the container IDs (or orphan endpoint IDs) that hold an endpoint on it.
+func (m *Manager) networkEndpointContainerIDs(ctx context.Context, network string) (map[string]struct{}, error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
+		"http://docker/v1.43/networks/"+network, nil)
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("network inspect %d: %s", resp.StatusCode, string(raw))
+	}
+	var net struct {
+		Containers map[string]json.RawMessage `json:"Containers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&net); err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{}, len(net.Containers))
+	for cid := range net.Containers {
+		out[cid] = struct{}{}
+	}
+	return out, nil
+}
+
+// networkDisconnect force-disconnects a container/endpoint from a network,
+// which releases any host-port reservation it held.
+func (m *Manager) networkDisconnect(ctx context.Context, network, container string) error {
+	body, _ := json.Marshal(map[string]any{"Container": container, "Force": true})
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"http://docker/v1.43/networks/"+network+"/disconnect", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := m.docker.HTTP().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 && resp.StatusCode != 204 {
+		raw, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("disconnect %d: %s", resp.StatusCode, string(raw))
+	}
 	return nil
 }
 
