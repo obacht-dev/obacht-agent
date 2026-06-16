@@ -272,6 +272,24 @@ func (s *Syncer) dispatchInstanceUpsert(ctx context.Context, m *signedmut.Mutati
 		if !(runtime.GOOS == "darwin" && manifest.HasHostService(manifestBytes)) {
 			return errors.New("system-runtime templates are not supported on this device")
 		}
+		// Host-services are singletons per template: the launchd unit binds a
+		// fixed host resource (e.g. Ollama's TCP port), so a second instance of
+		// the same template can never run — it just fails to bind. Reject a
+		// duplicate install (a different instance id for an already-installed
+		// template). Re-upserting the SAME instance id (config/version update) is
+		// fine and falls through.
+		if desired := store.DesiredState(p.DesiredState); desired != store.DesiredRemoved {
+			existing, err := s.store.ListInstances(ctx)
+			if err != nil {
+				return fmt.Errorf("check existing host-services: %w", err)
+			}
+			for _, e := range existing {
+				if e.Runtime == store.RuntimeSystem && e.TemplateID == p.TemplateID &&
+					e.ID != p.InstanceID && e.DesiredState != store.DesiredRemoved {
+					return fmt.Errorf("host-service %q is already installed on this device (instance %s); remove it before installing another", p.TemplateID, e.ID)
+				}
+			}
+		}
 	}
 	if manifest.ExtractMinSudoLevel(manifestBytes) == "power" {
 		return errors.New("templates requiring power mode are not yet supported on this device")
