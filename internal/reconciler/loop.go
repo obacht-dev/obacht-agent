@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,29 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
+
+// isTransientDockerErr reports whether err is a docker *transport* failure
+// (the daemon was momentarily unreachable) rather than a real container
+// fault. On the Mac the dockerd lives in a VM behind a vsock bridge that can
+// blip (EOF / connection refused) for a single reconcile pass; treating that
+// as a per-instance "error" observed-state poisons the UI with a spurious
+// "Something went wrong" until the next pass. We skip the observed write
+// instead and let the next pass (docker back) report the true state.
+func isTransientDockerErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, sub := range []string{
+		"connection refused", "EOF", "dial unix",
+		"broken pipe", "connection reset", "no such file or directory",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
 
 // Reconciler runs the desired-vs-observed convergence loop.
 type Reconciler struct {
@@ -30,6 +54,11 @@ type Reconciler struct {
 	// SocketPath is mounted into container instances so templates can reach
 	// the agent IPC at OBACHT_AGENT_SOCKET. Empty disables injection.
 	socketPath string
+
+	// hostGatewayIP is the VZ gateway IP a VM container uses to reach the
+	// macOS host (where host-services like Ollama listen). Resolves the
+	// ${host.gateway} placeholder. Empty on Pis — no host-services there.
+	hostGatewayIP string
 
 	trigger chan struct{}
 	mu      sync.Mutex
@@ -70,6 +99,11 @@ func (r *Reconciler) SetIngress(i IngressApplier) { r.ingress = i }
 // OBACHT_AGENT_SOCKET=<path>. A per-instance secret is also auto-issued
 // and exposed as OBACHT_INSTANCE_SECRET.
 func (r *Reconciler) SetSocketPath(p string) { r.socketPath = p }
+
+// SetHostGateway sets the VZ gateway IP used to resolve ${host.gateway} in
+// container specs (so a VM container can reach a macOS host-service). Empty on
+// Pis. macOS only.
+func (r *Reconciler) SetHostGateway(ip string) { r.hostGatewayIP = ip }
 
 // Trigger requests an immediate reconcile pass. Coalesces if one is pending.
 func (r *Reconciler) Trigger() {
@@ -149,6 +183,18 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		}
 	}
 
+	// Garbage-collect orphaned host-service launchd jobs (macOS): a host service
+	// left behind by a wiped/re-enrolled SSOT keeps running and can hold a port
+	// (e.g. Ollama on :11434), making the re-installed instance exit on bind.
+	// Keep only the system instances that should currently be installed.
+	systemKeep := make(map[string]bool)
+	for _, inst := range desired {
+		if inst.Runtime == store.RuntimeSystem && inst.DesiredState == store.DesiredInstalled {
+			systemKeep[inst.ID] = true
+		}
+	}
+	r.system.GarbageCollect(ctx, systemKeep)
+
 	// Garbage-collect orphans: managed containers whose instance row is gone.
 	for id, c := range observedByInstance {
 		if _, ok := desiredIDs[id]; ok {
@@ -223,9 +269,19 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 			}
 			return
 		}
+		// Resolve ${host.gateway} so a VM container (e.g. OpenWebUI) can reach a
+		// macOS host-service (e.g. Ollama on the VZ gateway). No-op on Pis (the
+		// gateway is empty there and Pi specs never use the placeholder).
+		spec.ExpandHostVars(r.hostGatewayIP)
 		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply instance", "instance", inst.ID, "err", err)
+			if isTransientDockerErr(err) {
+				// docker momentarily unreachable (VM/bridge blip) — not an
+				// instance fault. Leave observed state untouched; next pass
+				// reports the truth once the bridge is back.
+				return
+			}
 			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
 				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
 			}
@@ -403,6 +459,9 @@ func (r *Reconciler) reconcileCompose(ctx context.Context, inst store.Instance) 
 		changed, err := r.compose.Apply(ctx, inst.ID, inst.TemplateID, spec)
 		if err != nil {
 			r.log.Error("apply compose instance", "instance", inst.ID, "err", err)
+			if isTransientDockerErr(err) {
+				return // transient docker blip — see reconcileContainer
+			}
 			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
 				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
 			}

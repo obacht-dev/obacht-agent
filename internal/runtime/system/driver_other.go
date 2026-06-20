@@ -1,8 +1,8 @@
-//go:build !linux
+//go:build !linux && !darwin
 
-// On non-Linux hosts (developer macOS) we provide a stub so the agent still
-// compiles. Apply/Remove are no-ops that log a warning. The Pi targets
-// always use the linux build.
+// On platforms that are neither linux (systemd) nor darwin (launchd
+// host-services) we provide a stub so the agent still compiles. Apply/Remove
+// are no-ops that log a warning.
 
 package system
 
@@ -28,3 +28,6 @@ func (d *Driver) Remove(ctx context.Context, instanceID, unitName string) error 
 func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {
 	return "", nil
 }
+
+// GarbageCollect is a no-op here (host-service orphan GC is darwin-only).
+func (d *Driver) GarbageCollect(ctx context.Context, keep map[string]bool) {}

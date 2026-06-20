@@ -1,4 +1,4 @@
-package main
+package manifest
 
 import (
 	"encoding/json"
@@ -12,7 +12,7 @@ func TestMaterializeWhoami(t *testing.T) {
 	if err != nil {
 		t.Skipf("registry sibling not present: %v", err)
 	}
-	out, err := materializeManifest(bytes, map[string]any{"name": "hello-pi"}, "inst-1", "whoami")
+	out, err := Materialize(bytes, map[string]any{"name": "hello-pi"}, "inst-1", "whoami")
 	if err != nil {
 		t.Fatalf("materialise: %v", err)
 	}
@@ -46,7 +46,7 @@ spec:
       image: alpine
       cmd: ["echo", "${cfg.unknown}"]
 `
-	out, err := materializeManifest([]byte(yml), map[string]any{}, "i", "t")
+	out, err := Materialize([]byte(yml), map[string]any{}, "i", "t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ spec:
       env:
         INSTANCE: ${instance.id}
 `
-	out, err := materializeManifest([]byte(yml), nil, "abc-123", "t")
+	out, err := Materialize([]byte(yml), nil, "abc-123", "t")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ spec:
       label: Site title
       default: My Blog
 `)
-	out, err := materializeManifest(manifest, map[string]any{"site_title": "Hello"}, "ghost-1", "ghost-bundle")
+	out, err := Materialize(manifest, map[string]any{"site_title": "Hello"}, "ghost-1", "ghost-bundle")
 	if err != nil {
 		t.Fatalf("materialise: %v", err)
 	}

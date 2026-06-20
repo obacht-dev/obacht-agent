@@ -5,6 +5,7 @@ package telemetry
 import "testing"
 
 // Smoke test for the macOS collector: it must report real disk + total RAM.
+// On native (cgo) builds it also reports CPU% and used RAM.
 func TestDarwinCollectSmoke(t *testing.T) {
 	s, err := NewCollector().Collect()
 	if err != nil {
@@ -16,19 +17,28 @@ func TestDarwinCollectSmoke(t *testing.T) {
 	if s.DiskTotal == nil || *s.DiskTotal == 0 {
 		t.Error("expected non-zero DiskTotal")
 	}
-	var ramT, diskU, diskT uint64
+	cpu := "<nil>"
+	if s.CPUUsage != nil {
+		cpu = "set"
+	}
+	ramUsed := "<nil>"
+	if s.RAMUsed != nil {
+		ramUsed = "set"
+	}
+	var ramT, ramU, diskU uint64
 	if s.RAMTotal != nil {
 		ramT = *s.RAMTotal
+	}
+	if s.RAMUsed != nil {
+		ramU = *s.RAMUsed
 	}
 	if s.DiskUsed != nil {
 		diskU = *s.DiskUsed
 	}
-	if s.DiskTotal != nil {
-		diskT = *s.DiskTotal
+	var cpuV float64
+	if s.CPUUsage != nil {
+		cpuV = *s.CPUUsage
 	}
-	local := "<nil>"
-	if s.LocalIP != nil {
-		local = *s.LocalIP
-	}
-	t.Logf("darwin telemetry: ramTotal=%d disk=%d/%d localIP=%s", ramT, diskU, diskT, local)
+	t.Logf("darwin telemetry: cpu=%s(%.1f%%) ramUsed=%s(%d) ramTotal=%d disk=%d",
+		cpu, cpuV, ramUsed, ramU, ramT, diskU)
 }

@@ -1,4 +1,4 @@
-package main
+package manifest
 
 // S6.5 manifest → container.Spec materializer.
 //
@@ -72,10 +72,10 @@ type matComposeServiceSpec struct {
 	TargetPort    int    `json:"targetPort"`
 }
 
-// materializedResult is what materialize* funcs return: the runtime kind
+// Result is what materialize* funcs return: the runtime kind
 // ("container" or "compose") plus the JSON-encoded config the agent IPC
 // will store under instances.config_json.
-type materializedResult struct {
+type Result struct {
 	Runtime string
 	Config  []byte
 }
@@ -97,7 +97,7 @@ type matServiceSpec struct {
 	TargetPort int    `json:"targetPort"`
 }
 
-// materializeManifest takes the raw manifest bytes (YAML, since v2
+// Materialize takes the raw manifest bytes (YAML, since v2
 // templates live as YAML on disk and the registry returns those bytes
 // verbatim for signature integrity) plus the user config values and
 // returns the runtime kind + the JSON-encoded config (a container.Spec
@@ -106,13 +106,13 @@ type matServiceSpec struct {
 //
 // instanceID + templateID are exposed to ${instance.id} / ${template.id}
 // substitutions for templates that need them in env/cmd.
-func materializeManifest(manifestBytes []byte, userConfig map[string]any, instanceID, templateID string) (materializedResult, error) {
+func Materialize(manifestBytes []byte, userConfig map[string]any, instanceID, templateID string) (Result, error) {
 	var raw map[string]any
 	// YAML parses YAML AND JSON (a strict superset for our purposes)
 	// so this also handles the legacy v1 path where api JSON-encodes
 	// the parsed manifest before sending.
 	if err := yaml.Unmarshal(manifestBytes, &raw); err != nil {
-		return materializedResult{}, fmt.Errorf("manifest parse: %w", err)
+		return Result{}, fmt.Errorf("manifest parse: %w", err)
 	}
 
 	// Normalise YAML's map[interface{}]interface{} → map[string]any
@@ -121,11 +121,11 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 
 	spec, _ := raw["spec"].(map[string]any)
 	if spec == nil {
-		return materializedResult{}, fmt.Errorf("manifest missing spec")
+		return Result{}, fmt.Errorf("manifest missing spec")
 	}
 	runtimeBlock, _ := spec["runtime"].(map[string]any)
 	if runtimeBlock == nil {
-		return materializedResult{}, fmt.Errorf("manifest missing spec.runtime")
+		return Result{}, fmt.Errorf("manifest missing spec.runtime")
 	}
 
 	// Apply configSchema defaults for any keys the webapp didn't fill in,
@@ -141,17 +141,28 @@ func materializeManifest(manifestBytes []byte, userConfig map[string]any, instan
 	case "", "container":
 		cfg, err := materializeContainer(spec, runtimeBlock, userConfig, instanceID, templateID)
 		if err != nil {
-			return materializedResult{}, err
+			return Result{}, err
 		}
-		return materializedResult{Runtime: "container", Config: cfg}, nil
+		return Result{Runtime: "container", Config: cfg}, nil
 	case "compose":
 		cfg, err := materializeCompose(spec, runtimeBlock, userConfig, instanceID, templateID)
 		if err != nil {
-			return materializedResult{}, err
+			return Result{}, err
 		}
-		return materializedResult{Runtime: "compose", Config: cfg}, nil
+		return Result{Runtime: "compose", Config: cfg}, nil
+	case "system":
+		// Only the macOS host-service flavor is materialised here. systemd
+		// system templates (Pi) are NOT installed via this path — they push a
+		// raw config_json over obachtctl IPC — so for any system manifest
+		// WITHOUT a host_service block we return the exact same error as before
+		// (keeps the Pi/legacy behaviour byte-identical).
+		cfg, err := materializeSystem(spec, runtimeBlock, userConfig, instanceID, templateID)
+		if err != nil {
+			return Result{}, err
+		}
+		return Result{Runtime: "system", Config: cfg}, nil
 	default:
-		return materializedResult{}, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", runtimeType)
+		return Result{}, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", runtimeType)
 	}
 }
 
@@ -300,6 +311,50 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 	}
 
 	return json.Marshal(out)
+}
+
+// materializeSystem produces the config_json for a macOS host-service instance
+// from spec.runtime.system.host_service, substituting ${cfg.X}/${instance.id}/
+// ${template.id} in its string fields. The output is shaped to match
+// runtime/system.Spec (a {"host_service": {...}} object) so the darwin system
+// driver's ParseSpec consumes it directly. A system manifest WITHOUT a
+// host_service block returns the exact same "unsupported" error the default
+// switch case produces, keeping non-host-service system manifests unchanged.
+func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
+	_ = spec
+	sysBlock, _ := runtime["system"].(map[string]any)
+	hs, _ := sysBlock["host_service"].(map[string]any)
+	if hs == nil {
+		return nil, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", "system")
+	}
+	subst := newSubstituter(userConfig, instanceID, templateID)
+
+	out := map[string]any{}
+	for _, k := range []string{"kind", "binary", "binary_url", "binary_digest", "archive", "data_dir"} {
+		if v, ok := hs[k].(string); ok && v != "" {
+			out[k] = subst.string(v)
+		}
+	}
+	if argsAny, ok := hs["args"].([]any); ok {
+		args := make([]string, 0, len(argsAny))
+		for _, a := range argsAny {
+			args = append(args, subst.string(toString(a)))
+		}
+		out["args"] = args
+	}
+	if envAny, ok := hs["env"].(map[string]any); ok {
+		env := make(map[string]string, len(envAny))
+		for k, v := range envAny {
+			env[k] = subst.string(toString(v))
+		}
+		out["env"] = env
+	}
+
+	cfg, err := json.Marshal(map[string]any{"host_service": out})
+	if err != nil {
+		return nil, fmt.Errorf("encode system host-service spec: %w", err)
+	}
+	return cfg, nil
 }
 
 // materializeCompose builds a compose.Spec the agent's compose driver
@@ -453,11 +508,11 @@ func substWithoutCfgSecret(s *substituter, in string) string {
 	return cur
 }
 
-// findUnresolvedPlaceholders returns any ${...} keys that survived
+// FindUnresolvedPlaceholders returns any ${...} keys that survived
 // substitution in user-facing fields. Used by templateInstall to
 // fail fast with a clear message instead of letting docker reject
 // a `${cfg.X}` literal as an invalid volume name.
-func findUnresolvedPlaceholders(specJSON []byte) []string {
+func FindUnresolvedPlaceholders(specJSON []byte) []string {
 	matches := placeholderRe.FindAllStringSubmatch(string(specJSON), -1)
 	if len(matches) == 0 {
 		return nil

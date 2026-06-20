@@ -77,6 +77,32 @@ func New(socketPath string) *Driver {
 // Docker REST API without re-implementing the unix-socket dialler.
 func (d *Driver) HTTP() *http.Client { return d.http }
 
+// doWithRetry issues an idempotent request, retrying once on a transient
+// transport error. On the Mac, dockerd lives in a VM behind a vsock bridge
+// that occasionally drops a single connection (EOF / connection refused)
+// then recovers; a one-shot retry hides that blip so callers (e.g. the
+// reconciler's List) don't see spurious failures. Only use for body-less,
+// idempotent requests (GETs).
+func (d *Driver) doWithRetry(req *http.Request) (*http.Response, error) {
+	resp, err := d.http.Do(req)
+	if err == nil || !isTransientNetErr(err) {
+		return resp, err
+	}
+	time.Sleep(150 * time.Millisecond)
+	return d.http.Do(req.Clone(req.Context()))
+}
+
+func isTransientNetErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "EOF") ||
+		strings.Contains(s, "connection refused") ||
+		strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe")
+}
+
 // PullImage pulls an image if it is not already present locally.
 func (d *Driver) PullImage(ctx context.Context, image string) error {
 	return d.pullIfMissing(ctx, image)
@@ -173,6 +199,28 @@ func (s *Spec) ExpandSecrets(ctx context.Context, instanceID string, sp SecretPr
 		s.Cmd[i] = sub(s.Cmd[i])
 	}
 	return nil
+}
+
+// ExpandHostVars resolves agent-host placeholders that the API cannot know at
+// install time. Currently just ${host.gateway} = the VZ gateway IP a VM
+// container uses to reach a macOS host-service (e.g. Ollama). No-op when
+// gatewayIP is empty (Pis), so the placeholder simply never appears there.
+func (s *Spec) ExpandHostVars(gatewayIP string) {
+	if s == nil || gatewayIP == "" {
+		return
+	}
+	sub := func(in string) string {
+		return strings.ReplaceAll(in, "${host.gateway}", gatewayIP)
+	}
+	for k, v := range s.Env {
+		s.Env[k] = sub(v)
+	}
+	for i := range s.Cmd {
+		s.Cmd[i] = sub(s.Cmd[i])
+	}
+	for k, v := range s.Labels {
+		s.Labels[k] = sub(v)
+	}
 }
 
 // ServiceSpec declares a named service exposed by the container that the
@@ -320,7 +368,7 @@ func (d *Driver) List(ctx context.Context) ([]ManagedContainer, error) {
 	q.Set("all", "true")
 	q.Set("filters", string(filters))
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/v1.43/containers/json?"+q.Encode(), nil)
-	resp, err := d.http.Do(req)
+	resp, err := d.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
@@ -690,6 +738,17 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 		}
 		if err := os.Chmod(src, 0o770|os.ModeSetgid); err != nil && d.log != nil {
 			d.log.Warn("chmod bind dir", "err", err, "dir", src)
+		}
+	}
+
+	// Ensure the target network exists before create. On the Mac the agent
+	// runs with ingress disabled (Caddy lives in the VM), so the ingress
+	// bootstrap that normally creates obacht-edge never runs — without this
+	// the create fails with "network obacht-edge not found". Idempotent:
+	// a no-op when the network already exists (the Pi case).
+	if spec.Network != "" {
+		if err := d.EnsureNetwork(ctx, spec.Network); err != nil {
+			return fmt.Errorf("ensure network %q: %w", spec.Network, err)
 		}
 	}
 

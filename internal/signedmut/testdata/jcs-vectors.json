@@ -1,0 +1,91 @@
+[
+  {
+    "name": "flat object keys sorted",
+    "input": {
+      "b": 1,
+      "a": 2,
+      "c": 0
+    },
+    "expected": "{\"a\":2,\"b\":1,\"c\":0}"
+  },
+  {
+    "name": "nested objects and arrays",
+    "input": {
+      "z": {
+        "y": [
+          1,
+          2,
+          {
+            "b": false,
+            "a": null
+          }
+        ]
+      },
+      "a": "x"
+    },
+    "expected": "{\"a\":\"x\",\"z\":{\"y\":[1,2,{\"a\":null,\"b\":false}]}}"
+  },
+  {
+    "name": "string escaping minimal set",
+    "input": {
+      "s": "quote\" backslash\\ tab\t newline\n cr\r bell\u0007"
+    },
+    "expected": "{\"s\":\"quote\\\" backslash\\\\ tab\\t newline\\n cr\\r bell\\u0007\"}"
+  },
+  {
+    "name": "html chars NOT escaped (Go default would break this)",
+    "input": {
+      "s": "<&>"
+    },
+    "expected": "{\"s\":\"<&>\"}"
+  },
+  {
+    "name": "non-ascii emitted literally as utf-8",
+    "input": {
+      "s": "obacht ümläut — 🚀"
+    },
+    "expected": "{\"s\":\"obacht ümläut — 🚀\"}"
+  },
+  {
+    "name": "negative and large safe integers",
+    "input": {
+      "n": -42,
+      "big": 9007199254740991
+    },
+    "expected": "{\"big\":9007199254740991,\"n\":-42}"
+  },
+  {
+    "name": "empty containers",
+    "input": {
+      "o": {},
+      "a": []
+    },
+    "expected": "{\"a\":[],\"o\":{}}"
+  },
+  {
+    "name": "key sort is by utf-16 code units",
+    "input": {
+      "é": 1,
+      "z": 2,
+      "a": 3
+    },
+    "expected": "{\"a\":3,\"z\":2,\"é\":1}"
+  },
+  {
+    "name": "realistic domain.upsert mutation",
+    "input": {
+      "v": 1,
+      "device_id": "6f1c2a3b-0000-4111-8222-333344445555",
+      "op": "domain.upsert",
+      "params": {
+        "domain": "blog.example.com",
+        "desired_status": "bound"
+      },
+      "nonce": "0d9f4d8c-5a8e-4f1a-9d0a-aaaabbbbcccc",
+      "iat": 1765432100,
+      "exp": 1765432220,
+      "key_id": "k-123"
+    },
+    "expected": "{\"device_id\":\"6f1c2a3b-0000-4111-8222-333344445555\",\"exp\":1765432220,\"iat\":1765432100,\"key_id\":\"k-123\",\"nonce\":\"0d9f4d8c-5a8e-4f1a-9d0a-aaaabbbbcccc\",\"op\":\"domain.upsert\",\"params\":{\"desired_status\":\"bound\",\"domain\":\"blog.example.com\"},\"v\":1}"
+  }
+]

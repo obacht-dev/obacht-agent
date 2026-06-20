@@ -23,13 +23,14 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/bootstrap"
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/files"
-	logspkg "github.com/obacht-dev/obacht-agent/internal/logs"
 	"github.com/obacht-dev/obacht-agent/internal/ingress"
 	"github.com/obacht-dev/obacht-agent/internal/ipc"
 	"github.com/obacht-dev/obacht-agent/internal/logging"
+	logspkg "github.com/obacht-dev/obacht-agent/internal/logs"
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
+	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	syncpkg "github.com/obacht-dev/obacht-agent/internal/sync"
 )
@@ -44,6 +45,8 @@ func main() {
 		dockerSock  = flag.String("docker-socket", envOr("DOCKER_HOST_SOCKET", container.DefaultSocketPath()), "path to docker.sock")
 		reconcileEv = flag.Duration("reconcile-interval", 30*time.Second, "reconcile loop period")
 		oneShot     = flag.Bool("once", false, "run a single reconcile pass and exit (useful for tests)")
+		wgIP        = flag.String("wireguard-ip", "", "override the obacht WG IP reported in telemetry (macOS)")
+		hostGateway = flag.String("host-gateway", envOr("OBACHT_HOST_GATEWAY", ""), "VZ gateway IP that VM containers use to reach the macOS host; resolves ${host.gateway} (macOS host-services)")
 	)
 	flag.Parse()
 
@@ -60,6 +63,9 @@ func main() {
 	if err != nil {
 		log.Error("load config", "err", err, "path", *configPath)
 		os.Exit(1)
+	}
+	if *wgIP != "" {
+		cfg.Telemetry.WireguardIP = *wgIP
 	}
 	log.Info("agent starting",
 		"config", configOrDefault(*configPath),
@@ -104,7 +110,7 @@ func main() {
 		Params:        map[string]any{"version": agentVersion},
 	})
 
-tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
+	tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agentVersion)
 	if err != nil && !errors.Is(err, bootstrap.ErrSkipped) {
 		// Bootstrap failure is logged but not fatal: the device may simply
 		// have lost connectivity. Reconciler keeps running locally and the
@@ -125,12 +131,17 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 
 	rec := reconciler.New(st, docker, log.With("component", "reconciler"), *reconcileEv)
 	rec.SetSocketPath(cfg.Paths.Socket)
+	rec.SetHostGateway(*hostGateway)
 
 	// Compose runtime driver — bundle templates (spec v2.1).
 	if err := os.MkdirAll(cfg.Paths.ComposeRoot, 0o750); err != nil {
 		log.Warn("mkdir compose root", "err", err, "path", cfg.Paths.ComposeRoot)
 	}
-	composeDrv := compose.New(cfg.Paths.ComposeRoot, st, log.With("component", "compose"))
+	composeDrv := compose.New(cfg.Paths.ComposeRoot, st, compose.DockerCLI{
+		Bin:       cfg.Docker.Bin,
+		Host:      cfg.Docker.Host,
+		ConfigDir: cfg.Docker.ConfigDir,
+	}, log.With("component", "compose"))
 	rec.SetCompose(composeDrv)
 
 	// Ingress (Caddy). Bootstrapped lazily in the background — pulling the
@@ -170,6 +181,22 @@ tok, err := bootstrap.Run(ctx, log.With("component", "bootstrap"), st, cfg, agen
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
 		syncer.SetCompose(composeDrv)
+		syncer.SetWireguardIPOverride(cfg.Telemetry.WireguardIP)
+
+		// Signed mutations: load the user pubkeys pinned at enrollment.
+		// No keys -> capability not advertised, handler denies everything.
+		userKeys, keyProblems := signedmut.LoadUserKeys(cfg.Paths.UserKeysDir)
+		for _, p := range keyProblems {
+			log.Warn("user key skipped", "err", p)
+		}
+		if len(userKeys) > 0 {
+			labels := make([]string, 0, len(userKeys))
+			for _, k := range userKeys {
+				labels = append(labels, k.Label+" ("+k.Fingerprint()+")")
+			}
+			log.Info("signed mutations enabled", "keys", strings.Join(labels, ", "))
+		}
+		syncer.SetSignedMutations(signedmut.NewVerifier(userKeys), ingMgr)
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		logspkg.New(wsClient, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)

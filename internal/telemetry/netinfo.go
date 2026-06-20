@@ -64,19 +64,39 @@ func (n *netInfo) cachedPublicIP() string {
 	return n.publicIP
 }
 
-// wireguardIP returns the first IPv4 bound to the wg0 interface, or "".
+// obachtWGNet is the obacht WireGuard mesh supernet. The device's address on it
+// is the "Obacht Network IP". It lives on wg0 (Linux/Pi) or a utunN (macOS), so
+// we detect it by range rather than by interface name.
+var obachtWGNet = mustCIDR("10.137.0.0/16")
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// wireguardIP returns the device's IPv4 on the obacht WireGuard mesh, or "".
+// Scans interfaces for an address in obachtWGNet so it works for both the Pi's
+// wg0 and the Mac's utun (the tunnel must be up).
 func wireguardIP() string {
-	iface, err := net.InterfaceByName("wg0")
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
-	addrs, err := iface.Addrs()
-	if err != nil {
-		return ""
-	}
-	for _, a := range addrs {
-		if ip := ipv4Of(a); ip != "" {
-			return ip
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if ip := ipv4Of(a); ip != "" && obachtWGNet.Contains(net.ParseIP(ip)) {
+				return ip
+			}
 		}
 	}
 	return ""

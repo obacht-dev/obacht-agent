@@ -63,7 +63,7 @@ func TestPinImagesAlreadyPinned(t *testing.T) {
 }
 
 func TestRenderBodyCfgAndSecret(t *testing.T) {
-	d := New("/tmp/test-compose-driver", fakeSecrets{}, nil)
+	d := New("/tmp/test-compose-driver", fakeSecrets{}, DockerCLI{}, nil)
 	spec := Spec{
 		ComposeBody: "services:\n  web:\n    image: ghost:5\n    environment:\n      DB_PASS: ${secret.db_password}\n      SITE: ${cfg.site_title}\n",
 		PrimaryService: "web", PrimaryPort: 2368,
@@ -98,7 +98,7 @@ func TestParseSpecEmpty(t *testing.T) {
 // TestRenderBodyCfgYAMLInjection proves a hostile config value placed inside a
 // quoted official scalar cannot break out to inject new YAML keys / structure.
 func TestRenderBodyCfgYAMLInjection(t *testing.T) {
-	d := New("/tmp/test-compose-driver", fakeSecrets{}, nil)
+	d := New("/tmp/test-compose-driver", fakeSecrets{}, DockerCLI{}, nil)
 	// Official template style: cfg value lives inside a double-quoted scalar.
 	const body = "services:\n" +
 		"  web:\n" +
@@ -133,7 +133,7 @@ func TestRenderBodyCfgYAMLInjection(t *testing.T) {
 // injects the user body verbatim (the whole document is the cfg value) and is
 // guarded by the allowlist instead of escaping.
 func TestRenderBodyCustomNoEscape(t *testing.T) {
-	d := New("/tmp/test-compose-driver", fakeSecrets{}, nil)
+	d := New("/tmp/test-compose-driver", fakeSecrets{}, DockerCLI{}, nil)
 	userBody := "services:\n  app:\n    image: traefik/whoami:latest\n    restart: unless-stopped\n"
 	spec := Spec{
 		ComposeBody:         "${cfg.compose}",
