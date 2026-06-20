@@ -137,7 +137,11 @@ func main() {
 	if err := os.MkdirAll(cfg.Paths.ComposeRoot, 0o750); err != nil {
 		log.Warn("mkdir compose root", "err", err, "path", cfg.Paths.ComposeRoot)
 	}
-	composeDrv := compose.New(cfg.Paths.ComposeRoot, st, log.With("component", "compose"))
+	composeDrv := compose.New(cfg.Paths.ComposeRoot, st, compose.DockerCLI{
+		Bin:       cfg.Docker.Bin,
+		Host:      cfg.Docker.Host,
+		ConfigDir: cfg.Docker.ConfigDir,
+	}, log.With("component", "compose"))
 	rec.SetCompose(composeDrv)
 
 	// Ingress (Caddy). Bootstrapped lazily in the background — pulling the

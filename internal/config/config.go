@@ -20,6 +20,21 @@ type Config struct {
 	Paths     PathsConfig     `yaml:"paths"`
 	Ingress   IngressConfig   `yaml:"ingress"`
 	Telemetry TelemetryConfig `yaml:"telemetry"`
+	Docker    DockerConfig    `yaml:"docker"`
+}
+
+// DockerConfig points the compose-runtime driver at a docker CLI. On a Pi the
+// agent uses the native `docker` on PATH (all empty). On a Mac the agent runs
+// host-side and reaches the VM's dockerd only over the bridge socket, so the
+// app bundles a docker CLI + compose plugin and sets these.
+type DockerConfig struct {
+	// Bin is the docker CLI to invoke. Empty = "docker" on PATH.
+	Bin string `yaml:"bin"`
+	// Host sets DOCKER_HOST (e.g. unix:///tmp/obacht-docker.sock — the VM bridge).
+	Host string `yaml:"host"`
+	// ConfigDir sets DOCKER_CONFIG so the CLI finds the bundled compose plugin at
+	// <dir>/cli-plugins/docker-compose.
+	ConfigDir string `yaml:"configDir"`
 }
 
 type TelemetryConfig struct {

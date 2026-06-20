@@ -133,19 +133,64 @@ type SecretProvider interface {
 	DropTemplateSecrets(ctx context.Context, instanceID string) error
 }
 
+// DockerCLI configures how the driver invokes the docker CLI. On a Pi this is
+// the zero value (native `docker` on PATH). On a Mac the agent runs host-side
+// and reaches the VM's dockerd only via the bridge socket, so the app sets a
+// bundled binary + DOCKER_HOST + DOCKER_CONFIG (for the bundled compose plugin).
+type DockerCLI struct {
+	Bin       string // docker binary path; "" -> "docker"
+	Host      string // DOCKER_HOST; "" -> ambient
+	ConfigDir string // DOCKER_CONFIG; "" -> default
+}
+
+func (c DockerCLI) bin() string {
+	if c.Bin != "" {
+		return c.Bin
+	}
+	return "docker"
+}
+
+// env returns the process environment for a docker invocation, overlaying
+// DOCKER_HOST / DOCKER_CONFIG when configured. Returns nil to inherit the
+// ambient env unchanged (Pi).
+func (c DockerCLI) env() []string {
+	if c.Host == "" && c.ConfigDir == "" {
+		return nil
+	}
+	env := os.Environ()
+	if c.Host != "" {
+		env = append(env, "DOCKER_HOST="+c.Host)
+	}
+	if c.ConfigDir != "" {
+		env = append(env, "DOCKER_CONFIG="+c.ConfigDir)
+	}
+	return env
+}
+
 // Driver knows how to apply/remove compose-runtime instances.
 type Driver struct {
 	root    string // workspace root (e.g. /var/lib/obacht/compose)
 	log     *slog.Logger
 	secrets SecretProvider
+	docker  DockerCLI
 }
 
 // New returns a Driver with the given workspace root.
-func New(root string, secrets SecretProvider, log *slog.Logger) *Driver {
+func New(root string, secrets SecretProvider, docker DockerCLI, log *slog.Logger) *Driver {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Driver{root: root, secrets: secrets, log: log.With("component", "compose")}
+	return &Driver{root: root, secrets: secrets, docker: docker, log: log.With("component", "compose")}
+}
+
+// dockerCmd builds an exec.Cmd for the configured docker CLI + args, with the
+// DOCKER_HOST/DOCKER_CONFIG overlay (Mac) or ambient env (Pi).
+func (d *Driver) dockerCmd(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, d.docker.bin(), args...)
+	if env := d.docker.env(); env != nil {
+		cmd.Env = env
+	}
+	return cmd
 }
 
 // ProjectName returns the docker-compose project name for an instance.
@@ -216,12 +261,12 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 	// ingress bootstrap that normally creates obacht-edge never runs.
 	// `network create` is idempotent enough here — a non-zero exit when it
 	// already exists is ignored (the connect below is the real check).
-	_ = exec.CommandContext(ctx, "docker", "network", "create", PrimaryEdgeNetwork).Run()
+	_ = d.dockerCmd(ctx, "network", "create", PrimaryEdgeNetwork).Run()
 
 	// Connect the primary service container to the edge network so Caddy
 	// can resolve it. docker network connect is idempotent (returns 304).
 	primaryContainer := PrimaryContainerName(instanceID, spec.PrimaryService)
-	if err := exec.CommandContext(ctx, "docker", "network", "connect", PrimaryEdgeNetwork, primaryContainer).Run(); err != nil {
+	if err := d.dockerCmd(ctx, "network", "connect", PrimaryEdgeNetwork, primaryContainer).Run(); err != nil {
 		// "already exists in network" is fine — match on stderr below.
 		// Best-effort: if the container hasn't started yet, the next
 		// reconcile pass will succeed.
@@ -292,8 +337,8 @@ type ServiceStatus struct {
 // compose file to still exist on disk). Filters by the project label that
 // `docker compose --project-name obacht-<id>` sets on every container.
 func (d *Driver) Status(ctx context.Context, instanceID string) ([]ServiceStatus, error) {
-	cmd := exec.CommandContext(
-		ctx, "docker", "ps", "--all", "--no-trunc",
+	cmd := d.dockerCmd(
+		ctx, "ps", "--all", "--no-trunc",
 		"--filter", "label=com.docker.compose.project="+ProjectName(instanceID),
 		"--format", "{{.Names}}|{{.Label \"com.docker.compose.service\"}}|{{.State}}|{{.Status}}|{{.Image}}",
 	)
@@ -343,7 +388,7 @@ func (d *Driver) runCompose(ctx context.Context, instanceID string, args ...stri
 		full = append(full, "--env-file", envPath)
 	}
 	full = append(full, args...)
-	cmd := exec.CommandContext(ctx, "docker", full...)
+	cmd := d.dockerCmd(ctx, full...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker %s: %w (output: %s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
