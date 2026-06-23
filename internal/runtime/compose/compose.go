@@ -32,6 +32,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
 )
 
 // ErrEmptySpec is returned by ParseSpec when config_json is empty.
@@ -235,7 +237,12 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 
 	composePath := filepath.Join(ws, "docker-compose.yml")
 	prevHash := fileHash(composePath)
-	if err := os.WriteFile(composePath, []byte(body), 0o640); err != nil {
+	// Atomic write (temp + fsync + rename): a partial/failed write on a full
+	// disk must never leave a truncated 0-byte docker-compose.yml behind —
+	// that used to make the instance permanently undeletable, because
+	// `compose down` rejects an empty file ("empty compose file"). On failure
+	// the previous valid file (if any) stays intact.
+	if err := atomicWriteFile(composePath, []byte(body), 0o640); err != nil {
 		return false, fmt.Errorf("write compose: %w", err)
 	}
 
@@ -243,12 +250,35 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 	// compose can interpolate ${VAR} references in the body. Always write
 	// (even empty) so a stale .env from a previous config can't linger.
 	envPath := filepath.Join(ws, ".env")
-	if err := os.WriteFile(envPath, []byte(spec.EnvFile), 0o640); err != nil {
+	if err := atomicWriteFile(envPath, []byte(spec.EnvFile), 0o640); err != nil {
 		return false, fmt.Errorf("write env file: %w", err)
 	}
 
 	newHash := sha256Hex([]byte(body))
 	changed := prevHash != newHash
+
+	// Preflight on install/update only: refuse to let `up` pull images onto a
+	// near-full filesystem (fails mid-pull with a cryptic ENOSPC otherwise).
+	// Skipped on unchanged reconciles so a healthy instance is never blocked
+	// by a low-disk condition it isn't adding to. d.root shares the image
+	// filesystem on a Pi; fails open elsewhere.
+	if changed {
+		if err := diskcheck.EnsureFree(d.root); err != nil {
+			return changed, err
+		}
+	}
+
+	// When the body changed, snapshot the images the project currently runs
+	// *before* `up` recreates it. A digest/tag change (template image update)
+	// leaves the old images orphaned, and compose `up` never removes them — so
+	// without this they pile up on disk over a device's lifetime. We reclaim
+	// them after `up`; unchanged images are kept by the non-forced delete
+	// because the new containers still reference them. Skipped on unchanged
+	// reconciles so steady-state passes stay cheap.
+	var preUpImageIDs []string
+	if changed {
+		preUpImageIDs = d.projectImageIDs(ctx, instanceID)
+	}
 
 	// Always run `up -d` so transient failures (image pull missed) recover
 	// on the next reconcile pass.
@@ -273,6 +303,12 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 		d.log.Debug("connect to edge network (may already be connected)", "instance", instanceID, "err", err)
 	}
 
+	// Reclaim any images orphaned by the update above (no-op when nothing
+	// changed or no image was replaced).
+	for _, id := range preUpImageIDs {
+		d.removeImage(ctx, id)
+	}
+
 	return changed, nil
 }
 
@@ -283,12 +319,27 @@ func (d *Driver) Remove(ctx context.Context, instanceID string) (bool, error) {
 		return false, fmt.Errorf("remove: %w", err)
 	}
 	ws := d.Workspace(instanceID)
-	composePath := filepath.Join(ws, "docker-compose.yml")
-	if _, err := os.Stat(composePath); err == nil {
-		if err := d.runCompose(ctx, instanceID, "down", "-v", "--remove-orphans"); err != nil {
-			return false, fmt.Errorf("compose down: %w", err)
-		}
+	// Snapshot the project's images first so we can reclaim them after the
+	// containers are gone. This is label-based (projectImageIDs), so it works
+	// even when the on-disk compose file is missing/empty/corrupt. `down` alone
+	// (even with -v) never deletes images, which is why uninstalled templates
+	// used to leave their images on disk forever.
+	imageIDs := d.projectImageIDs(ctx, instanceID)
+
+	// Tear down by PROJECT NAME, not by file. `compose down` removes the
+	// project's containers, networks and volumes via the
+	// com.docker.compose.project label without parsing docker-compose.yml — so
+	// a missing/empty/corrupt file (e.g. a truncated write on a full disk) can
+	// never block removal. (The old path ran `down --file <empty>` which
+	// docker rejects with "empty compose file", leaving the instance stuck.)
+	if err := d.projectDown(ctx, instanceID); err != nil {
+		// Last resort so a user is never stuck with an undeletable instance:
+		// force-remove anything still labelled to this project.
+		d.log.Warn("compose down by project failed; forcing removal by label",
+			"instance", instanceID, "err", err)
+		d.forceRemoveByLabel(ctx, instanceID)
 	}
+
 	if err := os.RemoveAll(ws); err != nil {
 		return false, fmt.Errorf("rm workspace: %w", err)
 	}
@@ -297,7 +348,60 @@ func (d *Driver) Remove(ctx context.Context, instanceID string) (bool, error) {
 			return false, fmt.Errorf("drop secrets: %w", err)
 		}
 	}
+	// Containers are gone; reclaim their images best-effort. A non-forced
+	// delete keeps any image a co-located instance still uses (shared base).
+	for _, id := range imageIDs {
+		d.removeImage(ctx, id)
+	}
 	return true, nil
+}
+
+// projectImageIDs returns the deduped sha256 image ids of every container
+// (running or stopped) belonging to this instance's compose project. Returns
+// nil — and logs at debug — on any error, since it only feeds best-effort
+// image cleanup that must never break apply/remove.
+func (d *Driver) projectImageIDs(ctx context.Context, instanceID string) []string {
+	idsOut, err := d.dockerCmd(ctx, "ps", "-aq",
+		"--filter", "label=com.docker.compose.project="+ProjectName(instanceID)).Output()
+	if err != nil {
+		d.log.Debug("image cleanup: list project containers", "instance", instanceID, "err", err)
+		return nil
+	}
+	cids := strings.Fields(string(idsOut))
+	if len(cids) == 0 {
+		return nil
+	}
+	// Resolve each container to its image id (format-agnostic: works whether
+	// the image was pulled by tag or by digest).
+	args := append([]string{"inspect", "--format", "{{.Image}}"}, cids...)
+	out, err := d.dockerCmd(ctx, args...).Output()
+	if err != nil {
+		d.log.Debug("image cleanup: inspect project containers", "instance", instanceID, "err", err)
+		return nil
+	}
+	seen := map[string]bool{}
+	var imgs []string
+	for _, id := range strings.Fields(string(out)) {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			imgs = append(imgs, id)
+		}
+	}
+	return imgs
+}
+
+// removeImage best-effort deletes a local image by id. The non-forced
+// `image rm` refuses (and we ignore) any image still referenced by another
+// container, so shared bases and co-located instances are never disturbed.
+func (d *Driver) removeImage(ctx context.Context, imageID string) {
+	if imageID == "" {
+		return
+	}
+	if out, err := d.dockerCmd(ctx, "image", "rm", imageID).CombinedOutput(); err != nil {
+		d.log.Debug("kept image (in use or already gone)", "image", imageID, "out", strings.TrimSpace(string(out)))
+		return
+	}
+	d.log.Info("reclaimed orphaned image", "image", imageID)
 }
 
 // List returns the instance IDs currently materialised on disk. Used by
@@ -392,6 +496,75 @@ func (d *Driver) runCompose(ctx context.Context, instanceID string, args ...stri
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("docker %s: %w (output: %s)", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// projectDown tears the project down by NAME (no --file), so a
+// missing/empty/corrupt docker-compose.yml never blocks removal. `down`
+// removes the project's containers, networks and (-v) volumes via the
+// com.docker.compose.project label.
+func (d *Driver) projectDown(ctx context.Context, instanceID string) error {
+	out, err := d.dockerCmd(ctx,
+		"compose", "--project-name", ProjectName(instanceID),
+		"down", "-v", "--remove-orphans",
+	).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("compose down (project %s): %w (output: %s)",
+			ProjectName(instanceID), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// forceRemoveByLabel is the last-resort teardown when projectDown fails: it
+// force-removes every container, network and volume still tagged with this
+// instance's compose-project label. Best-effort — each step's error is logged
+// and ignored so removal always converges.
+func (d *Driver) forceRemoveByLabel(ctx context.Context, instanceID string) {
+	label := "label=com.docker.compose.project=" + ProjectName(instanceID)
+	if out, err := d.dockerCmd(ctx, "ps", "-aq", "--filter", label).Output(); err == nil {
+		for _, cid := range strings.Fields(string(out)) {
+			_ = d.dockerCmd(ctx, "rm", "-f", "-v", cid).Run()
+		}
+	}
+	if out, err := d.dockerCmd(ctx, "volume", "ls", "-q", "--filter", label).Output(); err == nil {
+		for _, v := range strings.Fields(string(out)) {
+			_ = d.dockerCmd(ctx, "volume", "rm", "-f", v).Run()
+		}
+	}
+	if out, err := d.dockerCmd(ctx, "network", "ls", "-q", "--filter", label).Output(); err == nil {
+		for _, n := range strings.Fields(string(out)) {
+			_ = d.dockerCmd(ctx, "network", "rm", n).Run()
+		}
+	}
+}
+
+// atomicWriteFile writes data to path via a temp file + fsync + rename, so a
+// partial/failed write (e.g. ENOSPC on a full disk) never leaves a truncated
+// or 0-byte file at path — the previous contents (if any) survive intact.
+func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	return nil
 }
