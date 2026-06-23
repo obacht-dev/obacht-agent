@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 )
@@ -152,3 +153,42 @@ func TestRenderBodyCustomNoEscape(t *testing.T) {
 }
 
 func max(a, b int) int { if a > b { return a }; return b }
+
+func TestAtomicWriteFile(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/docker-compose.yml"
+
+	// Writes content + mode.
+	if err := atomicWriteFile(path, []byte("services: {}\n"), 0o640); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil || string(b) != "services: {}\n" {
+		t.Fatalf("read back = %q, %v", b, err)
+	}
+
+	// Overwrites in place (rename), no leftover .tmp.
+	if err := atomicWriteFile(path, []byte("services:\n  web: {}\n"), 0o640); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "services:\n  web: {}\n" {
+		t.Fatalf("overwrite content = %q", b)
+	}
+	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("temp file lingered")
+	}
+
+	// A failed write (unwritable temp dir) leaves the previous file intact and
+	// never produces a 0-byte target — the bug that made instances undeletable.
+	ro := dir + "/ro"
+	if err := os.Mkdir(ro, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	target := ro + "/docker-compose.yml"
+	if err := atomicWriteFile(target, []byte("x"), 0o640); err == nil {
+		t.Fatalf("expected write into read-only dir to fail")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("a failed write must not leave a (0-byte) target file")
+	}
+}
