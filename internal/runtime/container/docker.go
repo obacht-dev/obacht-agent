@@ -34,7 +34,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
 )
+
+// obachtDataRoot is the agent's on-disk data root. On a Pi the Docker image
+// store lives on the same filesystem, so a statfs here reflects the space a
+// pull will consume. Used only for the pre-pull disk-space guard.
+const obachtDataRoot = "/var/lib/obacht"
 
 // DefaultSocketPath returns the canonical Docker socket path for the host OS.
 func DefaultSocketPath() string {
@@ -439,6 +446,15 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 	if err := d.start(ctx, containerName); err != nil {
 		return false, fmt.Errorf("start container: %w", err)
 	}
+	// If this was a recreate, the previous container's image may now be orphaned
+	// — that is exactly what happens on a template image *update* (new digest),
+	// where the old image would otherwise linger on disk forever. Reclaim it
+	// best-effort. The delete is not forced, so when the image is unchanged (a
+	// config-only recreate) the just-started container still references that
+	// id and dockerd keeps it.
+	if existing != nil {
+		d.removeImageByID(ctx, existing.ImageID)
+	}
 	return true, nil
 }
 
@@ -452,16 +468,60 @@ func (d *Driver) Remove(ctx context.Context, instanceID string) (bool, error) {
 	if c == nil {
 		return false, nil
 	}
-	return true, d.removeContainer(ctx, c.ID)
+	if err := d.removeContainer(ctx, c.ID); err != nil {
+		return false, err
+	}
+	// Reclaim the image now its container is gone (best-effort; a non-forced
+	// delete keeps any image still used by another instance/shared base).
+	d.removeImageByID(ctx, c.ImageID)
+	return true, nil
+}
+
+// removeImageByID best-effort deletes an image once the container that used it
+// is gone. The delete is NOT forced, so dockerd keeps any image still
+// referenced by another container (a shared base like postgres, or another
+// instance of the same template) and only reclaims a truly-orphaned one.
+// Image cleanup must never fail the operation that triggered it (uninstall or
+// image update), so every outcome other than a real reclaim is logged and
+// swallowed.
+//
+// Until this was added neither uninstall nor in-place image updates removed
+// images, so every image a device ever pulled stayed on disk and slowly filled
+// the SD card.
+func (d *Driver) removeImageByID(ctx context.Context, imageID string) {
+	if imageID == "" {
+		return
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodDelete,
+		"http://docker/v1.43/images/"+url.PathEscape(imageID), nil)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		d.log.Debug("image cleanup: delete failed", "image", imageID, "err", err)
+		return
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		d.log.Info("reclaimed orphaned image", "image", imageID)
+	case 404:
+		// already gone — nothing to do
+	case 409:
+		d.log.Debug("kept image still referenced elsewhere", "image", imageID)
+	default:
+		body, _ := io.ReadAll(resp.Body)
+		d.log.Warn("image cleanup: unexpected status", "image", imageID,
+			"status", resp.StatusCode, "body", strings.TrimSpace(string(body)))
+	}
 }
 
 // --- low-level helpers ---
 
 type containerSummary struct {
-	ID     string
-	Name   string
-	State  string
-	Labels map[string]string
+	ID      string
+	Name    string
+	State   string
+	Labels  map[string]string
+	ImageID string // sha256 image id, used to reclaim the image on remove/update
 }
 
 func (d *Driver) findByName(ctx context.Context, name string) (*containerSummary, error) {
@@ -481,10 +541,11 @@ func (d *Driver) findByName(ctx context.Context, name string) (*containerSummary
 		return nil, fmt.Errorf("find container: status %d", resp.StatusCode)
 	}
 	var raw []struct {
-		ID     string            `json:"Id"`
-		Names  []string          `json:"Names"`
-		State  string            `json:"State"`
-		Labels map[string]string `json:"Labels"`
+		ID      string            `json:"Id"`
+		Names   []string          `json:"Names"`
+		State   string            `json:"State"`
+		Labels  map[string]string `json:"Labels"`
+		ImageID string            `json:"ImageID"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
 		return nil, err
@@ -497,7 +558,7 @@ func (d *Driver) findByName(ctx context.Context, name string) (*containerSummary
 	if len(c.Names) > 0 {
 		cn = strings.TrimPrefix(c.Names[0], "/")
 	}
-	return &containerSummary{ID: c.ID, Name: cn, State: c.State, Labels: c.Labels}, nil
+	return &containerSummary{ID: c.ID, Name: cn, State: c.State, Labels: c.Labels, ImageID: c.ImageID}, nil
 }
 
 func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
@@ -510,6 +571,15 @@ func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
 	resp.Body.Close()
 	if resp.StatusCode == 200 {
 		return nil
+	}
+
+	// Preflight: refuse to start a pull onto a near-full filesystem. A pull
+	// that runs out of space fails mid-stream with a cryptic ENOSPC and can
+	// leave partial layers behind; failing fast here gives the user a clear,
+	// actionable message (recorded as the instance's observed error). Fails
+	// open where the data root isn't a local path (mac VM).
+	if err := diskcheck.EnsureFree(obachtDataRoot); err != nil {
+		return err
 	}
 
 	// Pull. Use the long-lived client because image pulls can legitimately
