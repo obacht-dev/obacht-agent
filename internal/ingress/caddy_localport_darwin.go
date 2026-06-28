@@ -104,12 +104,15 @@ func startLocalForwarder(gateway string, port int, log *slog.Logger) (io.Closer,
 	return f, nil
 }
 
-// bridgeConn pipes a VM-side connection to the host loopback service. If the
-// service isn't running, the dial fails and the connection closes — Caddy then
-// returns 502 rather than hanging.
+// bridgeConn pipes a VM-side connection to the host loopback service. Dials
+// "localhost" (not a hard 127.0.0.1) so it reaches dev servers that bind only
+// IPv6 loopback [::1] — Node/Vite/Astro default to that, and an IPv4-only dial
+// would refuse → Caddy 502. Still loopback-only (localhost never resolves off
+// the host). If the service isn't running the dial fails and the connection
+// closes — Caddy returns 502 rather than hanging.
 func bridgeConn(client net.Conn, port int) {
 	defer client.Close()
-	up, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+	up, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 5*time.Second)
 	if err != nil {
 		return
 	}
