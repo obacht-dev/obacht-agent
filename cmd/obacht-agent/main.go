@@ -147,6 +147,7 @@ func main() {
 	// Ingress (Caddy). Bootstrapped lazily in the background — pulling the
 	// Caddy image can take a while and we don't want to block IPC startup.
 	ingMgr := ingress.New(docker, st, cfg.Ingress, cfg.Paths, log.With("component", "ingress"))
+	ingMgr.SetHostGateway(*hostGateway) // VZ gateway for Mac local-port forwarding (empty on Pis)
 	if !cfg.Ingress.Disabled {
 		rec.SetIngress(ingMgr)
 		go func() {
