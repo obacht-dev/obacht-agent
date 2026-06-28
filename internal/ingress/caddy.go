@@ -71,12 +71,24 @@ type Manager struct {
 	lastHash string
 
 	ensureMu sync.Mutex
+
+	// hostGateway is the VZ gateway IP a VM container uses to reach the macOS
+	// host (set on the Mac, empty on Pis). On the Mac, a local-port binding's
+	// Caddy upstream targets this gateway (via the build-tagged
+	// localPortUpstream) and a host-side forwarder bridges it to loopback.
+	hostGateway string
+	// Active local-port forwarders (darwin only), keyed by port. Unused on Pi.
+	localProxyMu sync.Mutex
+	localProxies map[int]io.Closer
 }
 
 // New constructs a Manager. Call Bootstrap once at startup before any Apply.
 func New(docker *container.Driver, st *store.Store, cfg config.IngressConfig, paths config.PathsConfig, log *slog.Logger) *Manager {
 	return &Manager{docker: docker, store: st, cfg: cfg, paths: paths, log: log}
 }
+
+// SetHostGateway records the VZ gateway IP (macOS host). No-op-safe with "".
+func (m *Manager) SetHostGateway(ip string) { m.hostGateway = ip }
 
 // Bootstrap ensures the docker network and Caddy container exist with an
 // initial (possibly empty) Caddyfile. Safe to call multiple times.
@@ -116,6 +128,9 @@ func (m *Manager) Apply(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("render caddyfile: %w", err)
 	}
+	// Mac only: ensure a host-side forwarder (VZ-gateway → 127.0.0.1) for each
+	// bound local port, and tear down ones no longer bound. No-op on Pis.
+	m.syncLocalPortForwarders(summary.localPorts)
 	hash := sha256Hex(caddyfile)
 
 	m.mu.Lock()
@@ -254,6 +269,7 @@ type renderSummary struct {
 	totalDomains int
 	bound        int
 	observed     map[string]string // domain → observed_status to write back
+	localPorts   []int             // host ports bound this pass (drive Mac forwarders)
 }
 
 // renderCaddyfile builds the Caddyfile body from current SSOT. It returns
@@ -343,10 +359,12 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 			)
 			if bind.LocalPort > 0 {
 				// Local-port reverse proxy: target a host port (a service the
-				// user runs directly on the Pi, outside obacht's container
-				// runtime). Caddy is itself in a container, so we go via the
-				// docker host gateway alias.
-				upstream = fmt.Sprintf("host.docker.internal:%d", bind.LocalPort)
+				// user runs directly on the host, outside obacht's container
+				// runtime). Caddy is in a container; the upstream target is
+				// platform-specific (Pi: host.docker.internal; Mac: VZ gateway
+				// + host forwarder) — see localPortUpstream (build-tagged).
+				upstream = localPortUpstream(bind.LocalPort, m.hostGateway)
+				summary.localPorts = append(summary.localPorts, bind.LocalPort)
 			} else {
 				svc, ok := svcMap[svcKey(bind.InstanceID, bind.ServiceName)]
 				if !ok {
@@ -358,7 +376,11 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 					b.WriteString("}\n\n")
 					continue
 				}
-				upstream, upErr = upstreamFor(svc, bind.InstanceID)
+				var lp int
+				upstream, lp, upErr = upstreamFor(svc, bind.InstanceID, m.hostGateway)
+				if lp > 0 {
+					summary.localPorts = append(summary.localPorts, lp)
+				}
 			}
 			if upErr != nil {
 				fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(upErr.Error()))
@@ -403,28 +425,31 @@ func (m *Manager) httpsPort() int {
 	return 443
 }
 
-// upstreamFor returns the Caddy reverse_proxy target for a service.
-func upstreamFor(svc store.InstanceService, instanceID string) (string, error) {
+// upstreamFor returns the Caddy reverse_proxy target for a service, plus the
+// host port it targets (0 if none) so the caller can drive a Mac forwarder.
+func upstreamFor(svc store.InstanceService, instanceID, gateway string) (string, int, error) {
 	switch svc.TargetType {
 	case "host_port":
-		// host_port targets like "127.0.0.1:8080" must be reached through the
-		// docker host bridge.
+		// host_port targets like "127.0.0.1:8080" must be reached via the
+		// platform host path (Pi: host.docker.internal; Mac: VZ gateway).
 		hp := svc.Target
 		if strings.HasPrefix(hp, "127.0.0.1:") || strings.HasPrefix(hp, "localhost:") {
 			parts := strings.SplitN(hp, ":", 2)
 			if len(parts) == 2 {
-				return "host.docker.internal:" + parts[1], nil
+				if p, err := strconv.Atoi(parts[1]); err == nil && p > 0 {
+					return localPortUpstream(p, gateway), p, nil
+				}
 			}
 		}
-		return hp, nil
+		return hp, 0, nil
 	case "docker_dns":
 		// Caller should set Target to "containerName:port" — we resolve
 		// container DNS automatically inside the obacht-edge network.
-		return svc.Target, nil
+		return svc.Target, 0, nil
 	case "unix_socket":
-		return "", fmt.Errorf("unix_socket target not supported by ingress (instance %s)", instanceID)
+		return "", 0, fmt.Errorf("unix_socket target not supported by ingress (instance %s)", instanceID)
 	default:
-		return "", fmt.Errorf("unknown target_type %q for instance %s", svc.TargetType, instanceID)
+		return "", 0, fmt.Errorf("unknown target_type %q for instance %s", svc.TargetType, instanceID)
 	}
 }
 
