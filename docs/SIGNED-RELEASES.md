@@ -37,13 +37,33 @@ the **self-update** path.
 
 ## Staged rollout (fail-closed, no fleet breakage)
 
-- `internal/selfupdate/EmbeddedReleaseKeys` ships **empty** → `verify-release`
-  returns exit 2 → installer warns and continues on sha256. Nothing breaks.
-- Generate the offline key, embed the pubkey, ship an agent release: from
-  then on releases carry `.minisig` and updates are verified. Devices still
-  on the old agent skip (exit 2) until they update once.
-- Once the fleet reports the signing-capable version, make it mandatory
-  (drop the exit-2 fallback to a hard error in a later install.sh).
+Two independent safety layers mean no agent — old or new — is ever broken:
+
+1. **Empty-key layer:** `internal/selfupdate/EmbeddedReleaseKeys` ships
+   **empty** → `verify-release` returns exit 2 → installer warns and
+   continues on sha256. Until the offline key is embedded, nothing changes.
+2. **Capability marker (`/opt/obacht-agent/.verify-release-supported`):** the
+   installer invokes `verify-release` on the CURRENTLY installed binary. That
+   subcommand only exists from this version on. Agents ≤ v0.4.0 treat it as
+   an unknown positional, fall through to `flag.Parse`, and **start the
+   daemon** — which would hang the update and disrupt the running socket. The
+   marker is written only by a verify-capable install.sh right after it
+   installs a verify-capable binary, and the verify step runs **only when the
+   marker is present**. So a device on an old agent always skips the check
+   (marker absent) and updates fine; verification kicks in only from the
+   second update onward, once a capable binary is in place.
+
+Because of the marker, **it is safe to sign every release** including the
+first one that carries this code — an old agent has no marker and skips,
+regardless of whether a `.minisig` exists. Fresh `curl | bash` installs never
+verify (no prior trusted binary) and rest on TLS + sha256 (TOFU), unchanged.
+
+Once the fleet reports the signing-capable version, make it mandatory (drop
+the exit-2 sha256 fallback to a hard error in a later install.sh).
+
+> **Downgrade caveat:** the marker guards forward-only updates. Manually
+> downgrading below the first verify-capable version leaves a stale marker;
+> remove `/opt/obacht-agent/.verify-release-supported` if you ever do that.
 
 ## Key ceremony (release engineer, one-time)
 

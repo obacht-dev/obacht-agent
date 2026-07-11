@@ -145,8 +145,19 @@ echo "==> verifying checksum"
 # On a fresh install there is no prior binary to anchor trust in, so this
 # is a self-update-only gate; fresh installs rest on TLS + sha256 (TOFU),
 # unchanged.
+#
+# CRITICAL GUARD (VERIFY_SUPPORT_MARKER): only invoke `verify-release` when
+# the CURRENTLY installed binary actually implements that subcommand. Agents
+# released before this feature (<= v0.4.0) treat "verify-release" as an
+# unknown positional, fall through to flag.Parse and START THE DAEMON — which
+# would hang the update and disrupt the running agent's socket. The marker is
+# written (below) only by a verify-capable install.sh right after it installs
+# a verify-capable binary, so its presence ⟺ the installed binary supports
+# the check. Forward-only fleet, so downgrades (which would leave a stale
+# marker) are out of scope; a manual downgrade must remove the marker.
 installed_agent="$INSTALL_DIR/obacht-agent"
-if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ]; then
+VERIFY_SUPPORT_MARKER="$INSTALL_DIR/.verify-release-supported"
+if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ] && [ -f "$VERIFY_SUPPORT_MARKER" ]; then
   if curl -fsSL -o "$tmpdir/$asset.minisig" "$base_url/$asset.minisig" 2>/dev/null; then
     echo "==> verifying release signature"
     set +e
@@ -156,11 +167,13 @@ if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ]; then
     case "$vr" in
       0) : ;;  # verified
       1) echo "FATAL: release signature REJECTED — refusing to self-update" >&2; exit 1 ;;
-      *) echo "WARN: could not verify release signature (unsigned-migration or old agent); continuing on sha256" >&2 ;;
+      *) echo "WARN: could not verify release signature (unsigned-migration); continuing on sha256" >&2 ;;
     esac
   else
     echo "WARN: no .minisig for $asset (unsigned release); continuing on sha256" >&2
   fi
+elif [ "${SELF_UPDATE:-0}" = "1" ]; then
+  echo "==> installed agent predates signed releases; skipping signature check (sha256 only)"
 fi
 
 echo "==> installing to $INSTALL_DIR"
@@ -172,6 +185,12 @@ tar -xzf "$tmpdir/$asset" -C "$tmpdir"
 src_dir="$(find "$tmpdir" -maxdepth 1 -type d -name 'obacht-agent_*' | head -1)"
 install -m 0755 "$src_dir/obacht-agent" "$INSTALL_DIR/obacht-agent"
 install -m 0755 "$src_dir/obachtctl"    "$INSTALL_DIR/obachtctl" 2>/dev/null || true
+# Mark that the just-installed binary implements `verify-release`, so the
+# NEXT self-update knows it may safely invoke it (see VERIFY_SUPPORT_MARKER
+# above). This install.sh only ships verify-capable binaries, hence the
+# unconditional write. Presence of this marker ⟺ installed binary supports
+# signature verification.
+: > "$INSTALL_DIR/.verify-release-supported"
 # S6.5: symlink obachtctl into PATH so the ssh-gateway can invoke it
 # by name (without a hard-coded absolute path). Idempotent — ln -sf
 # overwrites any stale symlink left by a previous install.
@@ -220,8 +239,12 @@ curl -fsSL -o "$tmp" "$url"
 
 # Anchor: verify install.sh with the installed agent's embedded release key.
 # 0 verified · 1 REJECTED (abort) · 2 cannot verify (unsigned-migration).
+# Guard: only call verify-release when the installed binary supports it
+# (marker written by install.sh right after installing a capable binary).
+# Agents <= v0.4.0 lack the subcommand and would start the daemon + hang.
 installed_agent="/opt/obacht-agent/obacht-agent"
-if [ -x "$installed_agent" ] && curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/null; then
+if [ -x "$installed_agent" ] && [ -f /opt/obacht-agent/.verify-release-supported ] \
+   && curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/null; then
   set +e
   "$installed_agent" verify-release --file "$tmp" --sig "$tmpsig"
   vr=$?
@@ -229,10 +252,10 @@ if [ -x "$installed_agent" ] && curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/nu
   case "$vr" in
     0) echo "==> obacht-self-update: install.sh signature OK" ;;
     1) echo "FATAL: install.sh signature REJECTED — aborting self-update" >&2; exit 1 ;;
-    *) echo "WARN: could not verify install.sh signature (unsigned-migration or old agent); continuing" >&2 ;;
+    *) echo "WARN: could not verify install.sh signature (unsigned-migration); continuing" >&2 ;;
   esac
 else
-  echo "WARN: no install.sh.minisig or no installed agent to anchor trust; continuing" >&2
+  echo "WARN: install.sh signature not verified (old agent, unsigned release, or no anchor); continuing" >&2
 fi
 
 chmod +x "$tmp"
