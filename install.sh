@@ -83,7 +83,7 @@ if [ "${SELF_UPDATE:-0}" = "1" ]; then
   fi
   # Pull current device-id + token from the YAML so the rest of the
   # install script (which writes the config) regenerates the same
-  # values. Cheap parsing — config is owned by us.
+  # values. Cheap parsing - config is owned by us.
   DEVICE_ID="${DEVICE_ID:-$(awk '/^[[:space:]]*deviceId:/{print $2; exit}' "$CONFIG_FILE")}"
   TOKEN="${TOKEN:-$(awk '/^[[:space:]]*authToken:/{print $2; exit}' "$CONFIG_FILE")}"
 fi
@@ -138,10 +138,10 @@ echo "==> verifying checksum"
 
 # Signed-release verification (defence beyond sha256, which comes from the
 # same GitHub release). The minisig is verified by the CURRENTLY installed,
-# already-trusted agent binary against its EMBEDDED offline release key —
-# NOT by the freshly-downloaded code — so a compromised release publisher
+# already-trusted agent binary against its EMBEDDED offline release key -
+# NOT by the freshly-downloaded code - so a compromised release publisher
 # cannot bypass the check. Exit codes from `obacht-agent verify-release`:
-#   0 verified · 1 signature REJECTED (abort) · 2 cannot verify (migration).
+#   0 verified  / 1 signature REJECTED (abort)  / 2 cannot verify (migration).
 # On a fresh install there is no prior binary to anchor trust in, so this
 # is a self-update-only gate; fresh installs rest on TLS + sha256 (TOFU),
 # unchanged.
@@ -149,10 +149,10 @@ echo "==> verifying checksum"
 # CRITICAL GUARD (VERIFY_SUPPORT_MARKER): only invoke `verify-release` when
 # the CURRENTLY installed binary actually implements that subcommand. Agents
 # released before this feature (<= v0.4.0) treat "verify-release" as an
-# unknown positional, fall through to flag.Parse and START THE DAEMON — which
+# unknown positional, fall through to flag.Parse and START THE DAEMON - which
 # would hang the update and disrupt the running agent's socket. The marker is
 # written (below) only by a verify-capable install.sh right after it installs
-# a verify-capable binary, so its presence ⟺ the installed binary supports
+# a verify-capable binary, so its presence <=> the installed binary supports
 # the check. Forward-only fleet, so downgrades (which would leave a stale
 # marker) are out of scope; a manual downgrade must remove the marker.
 installed_agent="$INSTALL_DIR/obacht-agent"
@@ -166,7 +166,7 @@ if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ] && [ -f "$VERIFY_S
     set -e
     case "$vr" in
       0) : ;;  # verified
-      1) echo "FATAL: release signature REJECTED — refusing to self-update" >&2; exit 1 ;;
+      1) echo "FATAL: release signature REJECTED - refusing to self-update" >&2; exit 1 ;;
       *) echo "WARN: could not verify release signature (unsigned-migration); continuing on sha256" >&2 ;;
     esac
   else
@@ -178,7 +178,7 @@ fi
 
 echo "==> installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" /var/log/obacht
-# Ensure INSTALL_DIR is traversable — a previous failed install may have left
+# Ensure INSTALL_DIR is traversable - a previous failed install may have left
 # it at 0700 (leaked umask). Fix idempotently on every run.
 chmod 0755 "$INSTALL_DIR"
 tar -xzf "$tmpdir/$asset" -C "$tmpdir"
@@ -188,11 +188,11 @@ install -m 0755 "$src_dir/obachtctl"    "$INSTALL_DIR/obachtctl" 2>/dev/null || 
 # Mark that the just-installed binary implements `verify-release`, so the
 # NEXT self-update knows it may safely invoke it (see VERIFY_SUPPORT_MARKER
 # above). This install.sh only ships verify-capable binaries, hence the
-# unconditional write. Presence of this marker ⟺ installed binary supports
+# unconditional write. Presence of this marker <=> installed binary supports
 # signature verification.
 : > "$INSTALL_DIR/.verify-release-supported"
 # S6.5: symlink obachtctl into PATH so the ssh-gateway can invoke it
-# by name (without a hard-coded absolute path). Idempotent — ln -sf
+# by name (without a hard-coded absolute path). Idempotent - ln -sf
 # overwrites any stale symlink left by a previous install.
 ln -sf "$INSTALL_DIR/obachtctl" /usr/local/bin/obachtctl
 # S5: privileged helper. Lives outside INSTALL_DIR because the
@@ -205,12 +205,12 @@ fi
 # S5: privileged self-update wrapper. Same trust model as
 # obacht-power-toggle: a fixed-content shell script at a pinned path,
 # allowed via sudoers. Lets the obacht user (and through it, the
-# webapp via ssh-gateway → obachtctl) re-run this very installer to
+# webapp via ssh-gateway -> obachtctl) re-run this very installer to
 # upgrade the agent in place.
 echo "==> writing /usr/local/sbin/obacht-self-update"
 cat > /usr/local/sbin/obacht-self-update <<'SELF'
 #!/usr/bin/env bash
-# Managed by obacht-agent install.sh — fixed content. Only argv is the
+# Managed by obacht-agent install.sh - fixed content. Only argv is the
 # release tag (or "latest").
 #
 # The freshly-downloaded install.sh is verified against the EMBEDDED
@@ -238,7 +238,7 @@ trap 'rm -f "$tmp" "$tmpsig"' EXIT
 curl -fsSL -o "$tmp" "$url"
 
 # Anchor: verify install.sh with the installed agent's embedded release key.
-# 0 verified · 1 REJECTED (abort) · 2 cannot verify (unsigned-migration).
+# 0 verified  / 1 REJECTED (abort)  / 2 cannot verify (unsigned-migration).
 # Guard: only call verify-release when the installed binary supports it
 # (marker written by install.sh right after installing a capable binary).
 # Agents <= v0.4.0 lack the subcommand and would start the daemon + hang.
@@ -251,7 +251,7 @@ if [ -x "$installed_agent" ] && [ -f /opt/obacht-agent/.verify-release-supported
   set -e
   case "$vr" in
     0) echo "==> obacht-self-update: install.sh signature OK" ;;
-    1) echo "FATAL: install.sh signature REJECTED — aborting self-update" >&2; exit 1 ;;
+    1) echo "FATAL: install.sh signature REJECTED - aborting self-update" >&2; exit 1 ;;
     *) echo "WARN: could not verify install.sh signature (unsigned-migration); continuing" >&2 ;;
   esac
 else
@@ -266,7 +266,7 @@ chmod 0755 /usr/local/sbin/obacht-self-update
 # ---------------------------------------------------------------------------
 # S5: create the unprivileged `obacht` user that the agent runs as.
 #
-# Why: if the agent itself is compromised (the most likely surface — it
+# Why: if the agent itself is compromised (the most likely surface - it
 # talks to the network and runs untrusted manifest configs), we want
 # the blast radius to be the docker daemon and a tightly-scoped
 # sudoers entry, NOT free root on the host.
@@ -311,7 +311,7 @@ chmod 0750 /var/log/obacht
 # ---------------------------------------------------------------------------
 # S5.4: scrub the v1 NOPASSWD:ALL sudoers fragment if it's still around.
 # v1 (Python agent) installed `/etc/sudoers.d/obacht` with full passwordless
-# root — exactly the blast radius v2 is designed to remove. We drop it on
+# root - exactly the blast radius v2 is designed to remove. We drop it on
 # every v2 install so a Pi that gets re-bootstrapped is immediately back to
 # restricted-by-default, even if the operator forgets to wipe /etc.
 # ---------------------------------------------------------------------------
@@ -319,7 +319,7 @@ if [ -f /etc/sudoers.d/obacht ]; then
   echo "==> removing legacy /etc/sudoers.d/obacht (v1 NOPASSWD:ALL)"
   rm -f /etc/sudoers.d/obacht
 fi
-# Same for the older Power Mode fragment — obacht-power-toggle is the
+# Same for the older Power Mode fragment - obacht-power-toggle is the
 # canonical writer now; if it's there from a previous v2 run it gets
 # rewritten by `obachtctl system unlock-power`. Removing it here means
 # fresh installs always start LOCKED.
@@ -332,7 +332,7 @@ fi
 # S5: bootstrap sudoers fragment. The ONLY thing the obacht user is
 # allowed to run as root is /usr/local/sbin/obacht-power-toggle, with
 # its two fixed argv values. Power-level templates can only run after
-# the operator deliberately enables Power Mode — see PLAN-AGENT-V2 S5.
+# the operator deliberately enables Power Mode - see PLAN-AGENT-V2 S5.
 # ---------------------------------------------------------------------------
 if [ -x /usr/local/sbin/obacht-power-toggle ]; then
   echo "==> writing /etc/sudoers.d/obacht-bootstrap"
@@ -365,7 +365,7 @@ echo "==> writing $CONFIG_FILE"
 # instead of the intended 0644/0440).
 ( umask 077
 cat > "$CONFIG_FILE" <<YAML
-# Managed by obacht-agent install.sh — overwritten on re-install.
+# Managed by obacht-agent install.sh - overwritten on re-install.
 server:
   url: $API_URL
   deviceId: $DEVICE_ID
@@ -391,7 +391,7 @@ chown obacht:obacht "$CONFIG_FILE"
 # pubkey BEFORE the agent first starts, so the device advertises the
 # signed-mutation capability from its very first agent:register. Same
 # TOFU trust level as the authorized_keys line the platform install
-# script provisions — it is the same key.
+# script provisions - it is the same key.
 if [ -n "$USER_SIGNING_PUBKEY" ]; then
   case "$USER_SIGNING_PUBKEY" in
     ssh-ed25519\ *)
@@ -418,7 +418,7 @@ Type=simple
 # S5: drop privileges. The agent does not need root for its core job
 # (Docker via group membership, Caddy as a child process binding
 # unprivileged ports first then handed elevated caps via systemd).
-# The only privileged action — flipping Power Mode — goes through the
+# The only privileged action - flipping Power Mode - goes through the
 # obacht-power-toggle binary via the bootstrap sudoers entry.
 User=obacht
 Group=obacht
@@ -453,7 +453,7 @@ echo "==> starting $SERVICE_NAME"
 systemctl restart "$SERVICE_NAME"
 
 # Wait up to ~120s for the agent to come up + connect. Cold first boot on a
-# slow SD card can take 30–60s just to JIT-init the Go runtime + open the
+# slow SD card can take 30-60s just to JIT-init the Go runtime + open the
 # WebSocket against the api, so the previous 30s budget was too tight on
 # real hardware. Tolerate both JSON-structured (`"msg":"ws connected"`)
 # and plain (`ws connected`) log lines so a logger format change doesn't
@@ -472,7 +472,7 @@ for i in $(seq 1 60); do
 done
 
 if [ "$ok" -ne 1 ]; then
-  echo "agent did not connect within 120s — last 40 log lines:" >&2
+  echo "agent did not connect within 120s - last 40 log lines:" >&2
   journalctl -u "$SERVICE_NAME" --no-pager -n 40 >&2 || true
   echo "check 'journalctl -u $SERVICE_NAME -f' for ongoing retries" >&2
   exit 1
