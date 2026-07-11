@@ -26,13 +26,25 @@ func verifyWith(t *testing.T, pub minisign.PublicKey, content, sig []byte) error
 	return b.Verify(content, sig)
 }
 
-func TestVerifyFileNoKeysIsDistinctFromRejection(t *testing.T) {
-	// The embedded set ships empty; VerifyFile must return ErrNoKeys (a
-	// migration-phase "cannot verify"), NEVER nil and NEVER a plain
-	// rejection — the installer keys its skip-vs-abort decision on this.
-	err := VerifyFile([]byte("x"), []byte("y"))
-	if !errors.Is(err, ErrNoKeys) {
-		t.Fatalf("empty embedded keys: got %v, want ErrNoKeys", err)
+func TestVerifyNoKeysIsDistinctFromRejection(t *testing.T) {
+	// With NO trusted keys the core must return ErrNoKeys (a migration-phase
+	// "cannot verify"), NEVER nil and NEVER a plain rejection — the installer
+	// keys its skip-vs-abort decision on this.
+	if err := verifyWithKeys(nil, []byte("x"), []byte("y")); !errors.Is(err, ErrNoKeys) {
+		t.Fatalf("empty keys: got %v, want ErrNoKeys", err)
+	}
+}
+
+func TestVerifyFileUsesEmbeddedKey(t *testing.T) {
+	// A release key is embedded, so VerifyFile over garbage input must
+	// return a real rejection — NOT ErrNoKeys (which would mean the key
+	// didn't load and the installer would wrongly skip verification).
+	err := VerifyFile([]byte("not a real artifact"), []byte("not a real sig"))
+	if err == nil {
+		t.Fatal("garbage input verified")
+	}
+	if errors.Is(err, ErrNoKeys) {
+		t.Fatal("embedded release key did not load (got ErrNoKeys)")
 	}
 }
 

@@ -43,9 +43,14 @@ const ReleaseTrustDir = "/etc/obacht/release-trust.d"
 // Rotation: append the new key here, ship the agent, re-sign releases
 // with both keys for one cycle, then remove the old entry.
 var EmbeddedReleaseKeys = []trust.KeyEntry{
-	// {
-	//	Label:  "obacht-agent-release-1",
-	//	PubKey: "untrusted comment: minisign public key XXXXXXXXXXXXXXXX\n" +
-	//		"RW...\n",
-	// },
+	{
+		// Key id 2E7980BE136B606D. Generated 2026-07-11 on the release
+		// engineer's workstation; secret key at
+		// ~/.config/obacht/obacht-agent-release-1.key (passphrase in the
+		// password manager, backed up off-machine). Releases are signed
+		// locally with scripts/sign-release.sh — the secret NEVER enters CI.
+		Label: "obacht-agent-release-1",
+		PubKey: "untrusted comment: minisign public key 2E7980BE136B606D\n" +
+			"RWRtYGsTvoB5Ls75rzAz2E/agbhUA7JLnBnapCSZAhrmJOWBqKCStm+N\n",
+	},
 }

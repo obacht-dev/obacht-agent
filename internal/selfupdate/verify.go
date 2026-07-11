@@ -36,6 +36,13 @@ func VerifyFile(content, sig []byte) error {
 	if err != nil {
 		return err
 	}
+	return verifyWithKeys(keys, content, sig)
+}
+
+// verifyWithKeys is the testable core of VerifyFile: it keeps the
+// ErrNoKeys-vs-rejection contract independent of the (now populated)
+// embedded key set.
+func verifyWithKeys(keys []trust.KeyEntry, content, sig []byte) error {
 	if len(keys) == 0 {
 		return ErrNoKeys
 	}
