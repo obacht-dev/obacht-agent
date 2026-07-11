@@ -56,8 +56,12 @@ gh release download "$TAG" --repo "$REPO" --dir "$work" --clobber \
   --pattern '*.tar.gz' --pattern '*.tar.gz.sha256' --pattern 'install.sh'
 
 # Collect the artifacts to sign: all tarballs + install.sh. Skip anything
-# already carrying a .minisig (idempotent re-runs).
-mapfile -t artifacts < <(cd "$work" && ls -1 *.tar.gz install.sh 2>/dev/null || true)
+# already carrying a .minisig (idempotent re-runs). Portable to bash 3.2
+# (macOS) — no mapfile.
+artifacts=()
+while IFS= read -r f; do
+  [ -n "$f" ] && artifacts+=("$f")
+done < <(cd "$work" && ls -1 ./*.tar.gz install.sh 2>/dev/null | sed 's#^\./##' || true)
 if [ "${#artifacts[@]}" -eq 0 ]; then
   echo "no signable artifacts found in the release" >&2
   exit 1
