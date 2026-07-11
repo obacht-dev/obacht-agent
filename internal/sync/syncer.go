@@ -3,10 +3,14 @@
 //
 // Phase S2 (security hardening): the syncer is now strictly OUTBOUND for
 // state. Inbound `agent:upsert_*` / `agent:delete_*` events are denied and
-// audited — the only legitimate path for mutations is obachtctl, driven
-// from the user via ssh-gateway exec_plan (S3). This means a compromised
-// backend (or DB leak) cannot push arbitrary container/domain config to
-// devices.
+// audited. Mutations reach the agent on exactly two user-authorised paths:
+// user-signed envelopes over `agent:signed_mutation` (verified against
+// locally pinned keys — the primary path once a key is pinned, Pi and Mac
+// alike), and obachtctl driven from the user via ssh-gateway exec_plan
+// (S3 — DEPRECATED for template/hosting ops since PLAN-PI-SIGNED-MUTATIONS
+// 2026-07; stays for power-user features: service control, power mode,
+// agent update). Either way a compromised backend (or DB leak) cannot push
+// arbitrary container/domain config to devices.
 //
 // Responsibilities:
 //
@@ -24,6 +28,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/compat"
@@ -80,8 +85,11 @@ type Syncer struct {
 	// verifier holds the locally pinned user pubkeys; ingress lets verified
 	// domain ops reload Caddy. Both nil-safe; without pinned keys the
 	// capability is not advertised and the handler denies everything.
-	verifier *signedmut.Verifier
-	ingress  IngressManager
+	// verifierMu guards verifier: ReloadUserKeys (IPC pin/unpin) swaps it
+	// while the WS handler goroutine reads it.
+	verifierMu stdsync.RWMutex
+	verifier   *signedmut.Verifier
+	ingress    IngressManager
 }
 
 // SetCompose attaches the compose driver so observed-state pushes can
@@ -274,20 +282,25 @@ func (s *Syncer) sendRegister() {
 	// Advertise signed-mutation support only when at least one user key is
 	// pinned — the api/webapp route mutations by this capability, and a
 	// device that would deny everything must not attract them.
-	if s.verifier != nil && s.verifier.KeyCount() > 0 {
+	// userKeyFingerprints lets the dashboard show the pinned trust anchors
+	// so the user can compare them against their own management key.
+	var userKeyFingerprints []string
+	if v := s.getVerifier(); v != nil && v.KeyCount() > 0 {
 		capabilities = append(capabilities, "signed-mutation")
+		userKeyFingerprints = v.Fingerprints()
 	}
 	payload := map[string]any{
-		"deviceId":      s.deviceID,
-		"agentVersion":  s.agentVersion,
-		"agentV2":       true,
-		"capabilities":  capabilities,
-		"specVersion":   spec.SupportedSpecVersion,
-		"os":            runtime.GOOS,
-		"arch":          runtime.GOARCH,
-		"hostname":      hostname,
-		"compat":        ident,
-		"schemaVersion": s.readSchemaVersion(),
+		"deviceId":            s.deviceID,
+		"agentVersion":        s.agentVersion,
+		"agentV2":             true,
+		"capabilities":        capabilities,
+		"specVersion":         spec.SupportedSpecVersion,
+		"os":                  runtime.GOOS,
+		"arch":                runtime.GOARCH,
+		"hostname":            hostname,
+		"compat":              ident,
+		"schemaVersion":       s.readSchemaVersion(),
+		"userKeyFingerprints": userKeyFingerprints,
 	}
 	if err := s.client.Emit("agent:register", payload); err != nil {
 		s.log.Warn("emit agent:register", "err", err)
@@ -480,10 +493,3 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		s.log.Debug("emit observed_state", "err", err)
 	}
 }
-
-
-
-
-
-
-

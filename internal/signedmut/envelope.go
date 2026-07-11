@@ -100,6 +100,18 @@ func (v *Verifier) KeyLabels() []string {
 	return out
 }
 
+// Fingerprints returns the OpenSSH SHA256 fingerprints of all pinned keys.
+// Reported in agent:register so the dashboard can let the user compare the
+// device's trust anchors against their own key (detection of a substituted
+// pin — see PLAN-PI-SIGNED-MUTATIONS §4.3).
+func (v *Verifier) Fingerprints() []string {
+	out := make([]string, 0, len(v.keys))
+	for _, k := range v.keys {
+		out = append(out, k.Fingerprint())
+	}
+	return out
+}
+
 // Verify checks the envelope end to end and returns the parsed mutation on
 // success. Order matters and mirrors the plan: trusted key → signature →
 // device binding → time window → replay. The replay mark is written LAST so

@@ -26,8 +26,34 @@ type IngressManager interface {
 // dispatches verified ops. Without it the event is denied like any other
 // inbound mutation.
 func (s *Syncer) SetSignedMutations(v *signedmut.Verifier, ing IngressManager) {
+	s.verifierMu.Lock()
 	s.verifier = v
+	s.verifierMu.Unlock()
 	s.ingress = ing
+}
+
+// getVerifier returns the current verifier snapshot. Handlers must read the
+// verifier through this so a concurrent ReloadUserKeys swap is safe.
+func (s *Syncer) getVerifier() *signedmut.Verifier {
+	s.verifierMu.RLock()
+	defer s.verifierMu.RUnlock()
+	return s.verifier
+}
+
+// ReloadUserKeys re-reads the pinned user keys from dir, swaps the verifier
+// in place and — when connected — immediately re-registers so the backend
+// sees the capability flip without an agent restart. Called from the IPC
+// user-keys handlers after obachtctl pins or unpins a key.
+func (s *Syncer) ReloadUserKeys(dir string) (int, []error) {
+	keys, problems := signedmut.LoadUserKeys(dir)
+	s.verifierMu.Lock()
+	s.verifier = signedmut.NewVerifier(keys)
+	s.verifierMu.Unlock()
+	s.log.Info("user keys reloaded", "count", len(keys))
+	if s.client.Connected() {
+		s.sendRegister()
+	}
+	return len(keys), problems
 }
 
 // signedMutationOpTimeout bounds a single mutation dispatch (store writes +
@@ -59,13 +85,14 @@ func (s *Syncer) handleSignedMutation(args []json.RawMessage) {
 	}
 	_ = json.Unmarshal(raw, &peek)
 
-	if s.verifier == nil || s.verifier.KeyCount() == 0 {
+	verifier := s.getVerifier()
+	if verifier == nil || verifier.KeyCount() == 0 {
 		s.auditSignedMutation(ctx, signedmut.DenyUntrustedKey, peek.Mutation.Op, "", "no user keys pinned", nil)
 		s.emitSignedMutationResult(peek.Mutation.Nonce, peek.Mutation.Op, false, "device has no pinned user keys")
 		return
 	}
 
-	m, key, err := s.verifier.Verify(ctx, raw, s.deviceID, time.Now(), s.store)
+	m, key, err := verifier.Verify(ctx, raw, s.deviceID, time.Now(), s.store)
 	if err != nil {
 		reason := signedmut.DenyMalformed
 		var de *signedmut.DenyError

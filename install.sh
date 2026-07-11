@@ -34,6 +34,7 @@ TOKEN=""
 API_URL="https://api.eu.obacht.dev"
 REGISTRY_URL="https://registry.eu.obacht.dev"
 SKIP_START="${OBACHT_AGENT_SKIP_START:-0}"
+USER_SIGNING_PUBKEY="${OBACHT_USER_SIGNING_PUBKEY:-}"
 
 usage() {
   cat <<USAGE
@@ -44,6 +45,8 @@ obacht-agent installer
   --api-url        <url>    api base url (default: $API_URL)
   --registry-url   <url>    template registry url (default: $REGISTRY_URL)
   --version        <tag>    release tag (default: latest)
+  --user-pubkey    <line>   OpenSSH ed25519 public key to pin for signed
+                            mutations (optional; env OBACHT_USER_SIGNING_PUBKEY)
   --help                    show this help
 
 env:
@@ -60,6 +63,7 @@ while [ $# -gt 0 ]; do
     --api-url)   API_URL="$2";   shift 2 ;;
     --registry-url) REGISTRY_URL="$2"; shift 2 ;;
     --version)   RELEASE_TAG="$2"; shift 2 ;;
+    --user-pubkey) USER_SIGNING_PUBKEY="$2"; shift 2 ;;
     --self-update) SELF_UPDATE=1; shift 1 ;;
     --help|-h)   usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage >&2; exit 2 ;;
@@ -308,6 +312,25 @@ chmod 0600 "$CONFIG_FILE"
 # S5: bootstrap exchange rewrites this file (token -> JWT), so the
 # unprivileged agent must own it. CONFIG_DIR ownership was set above.
 chown obacht:obacht "$CONFIG_FILE"
+
+# Signed mutations (PLAN-PI-SIGNED-MUTATIONS A3): pin the user's signing
+# pubkey BEFORE the agent first starts, so the device advertises the
+# signed-mutation capability from its very first agent:register. Same
+# TOFU trust level as the authorized_keys line the platform install
+# script provisions — it is the same key.
+if [ -n "$USER_SIGNING_PUBKEY" ]; then
+  case "$USER_SIGNING_PUBKEY" in
+    ssh-ed25519\ *)
+      echo "==> pinning user signing key for signed mutations"
+      install -d -m 0700 -o obacht -g obacht "$STATE_DIR/user-keys.d"
+      ( umask 077; printf '%s\n' "$USER_SIGNING_PUBKEY" > "$STATE_DIR/user-keys.d/default.pub" )
+      chown obacht:obacht "$STATE_DIR/user-keys.d/default.pub"
+      ;;
+    *)
+      echo "WARN: --user-pubkey is not an ssh-ed25519 line, skipping pin" >&2
+      ;;
+  esac
+fi
 
 echo "==> installing systemd unit"
 cat > "$SERVICE_FILE" <<UNIT
