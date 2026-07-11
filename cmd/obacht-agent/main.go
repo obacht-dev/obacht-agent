@@ -32,6 +32,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
+	"github.com/obacht-dev/obacht-agent/internal/selfupdate"
 	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 	syncpkg "github.com/obacht-dev/obacht-agent/internal/sync"
@@ -41,6 +42,13 @@ import (
 var agentVersion = "dev"
 
 func main() {
+	// Subcommands are handled before the daemon flag set so the installer
+	// can call `obacht-agent verify-release ...` on the CURRENTLY installed
+	// (trusted) binary to check a new release before swapping it in.
+	if len(os.Args) > 1 && os.Args[1] == "verify-release" {
+		os.Exit(runVerifyRelease(os.Args[2:]))
+	}
+
 	var (
 		configPath  = flag.String("config", "", "path to agent.yml (default: /etc/obacht/agent.yml)")
 		logLevel    = flag.String("log-level", envOr("OBACHT_LOG_LEVEL", "info"), "debug|info|warn|error")
@@ -291,6 +299,52 @@ func authorizedKeysPath() string {
 		return filepath.Join(home, ".ssh", "authorized_keys")
 	}
 	return ""
+}
+
+// runVerifyRelease implements `obacht-agent verify-release --file <f>
+// --sig <f.minisig>`: it verifies a release artifact against the embedded
+// offline release-signing key(s). The installer runs this on the OLD,
+// already-trusted binary before swapping in a new one.
+//
+// Exit codes are a contract with install.sh / obacht-self-update:
+//
+//	0  verified OK        → proceed with the swap
+//	1  signature REJECTED → abort (a real tampering signal, never skip)
+//	2  cannot verify      → no embedded keys yet (signing-migration
+//	                        window) or bad usage; installer may fall back
+//	                        to sha256+TLS and warn.
+func runVerifyRelease(args []string) int {
+	fs := flag.NewFlagSet("verify-release", flag.ContinueOnError)
+	file := fs.String("file", "", "path to the artifact to verify (tarball or install.sh)")
+	sig := fs.String("sig", "", "path to the detached .minisig signature")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *file == "" || *sig == "" {
+		fmt.Fprintln(os.Stderr, "verify-release: --file and --sig are required")
+		return 2
+	}
+	content, err := os.ReadFile(*file)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verify-release: read file: %v\n", err)
+		return 2
+	}
+	sigBytes, err := os.ReadFile(*sig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "verify-release: read sig: %v\n", err)
+		return 2
+	}
+	switch err := selfupdate.VerifyFile(content, sigBytes); {
+	case err == nil:
+		fmt.Fprintf(os.Stderr, "verify-release: OK (%s)\n", filepath.Base(*file))
+		return 0
+	case errors.Is(err, selfupdate.ErrNoKeys):
+		fmt.Fprintln(os.Stderr, "verify-release: no release keys trusted (unsigned-migration window)")
+		return 2
+	default:
+		fmt.Fprintf(os.Stderr, "verify-release: SIGNATURE REJECTED: %v\n", err)
+		return 1
+	}
 }
 
 func envOr(key, fallback string) string {

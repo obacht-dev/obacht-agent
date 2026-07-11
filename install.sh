@@ -136,6 +136,33 @@ curl -fsSL -o "$tmpdir/$asset.sha256" "$base_url/$asset.sha256"
 echo "==> verifying checksum"
 ( cd "$tmpdir" && sha256sum -c "$asset.sha256" )
 
+# Signed-release verification (defence beyond sha256, which comes from the
+# same GitHub release). The minisig is verified by the CURRENTLY installed,
+# already-trusted agent binary against its EMBEDDED offline release key —
+# NOT by the freshly-downloaded code — so a compromised release publisher
+# cannot bypass the check. Exit codes from `obacht-agent verify-release`:
+#   0 verified · 1 signature REJECTED (abort) · 2 cannot verify (migration).
+# On a fresh install there is no prior binary to anchor trust in, so this
+# is a self-update-only gate; fresh installs rest on TLS + sha256 (TOFU),
+# unchanged.
+installed_agent="$INSTALL_DIR/obacht-agent"
+if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ]; then
+  if curl -fsSL -o "$tmpdir/$asset.minisig" "$base_url/$asset.minisig" 2>/dev/null; then
+    echo "==> verifying release signature"
+    set +e
+    "$installed_agent" verify-release --file "$tmpdir/$asset" --sig "$tmpdir/$asset.minisig"
+    vr=$?
+    set -e
+    case "$vr" in
+      0) : ;;  # verified
+      1) echo "FATAL: release signature REJECTED — refusing to self-update" >&2; exit 1 ;;
+      *) echo "WARN: could not verify release signature (unsigned-migration or old agent); continuing on sha256" >&2 ;;
+    esac
+  else
+    echo "WARN: no .minisig for $asset (unsigned release); continuing on sha256" >&2
+  fi
+fi
+
 echo "==> installing to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" /var/log/obacht
 # Ensure INSTALL_DIR is traversable — a previous failed install may have left
@@ -165,25 +192,49 @@ echo "==> writing /usr/local/sbin/obacht-self-update"
 cat > /usr/local/sbin/obacht-self-update <<'SELF'
 #!/usr/bin/env bash
 # Managed by obacht-agent install.sh — fixed content. Only argv is the
-# release tag (or "latest"). Pinned URL means the only attack surface
-# is whatever is published under obacht-dev/obacht-agent on GitHub
-# Releases, which is exactly what install.sh already trusts.
+# release tag (or "latest").
+#
+# The freshly-downloaded install.sh is verified against the EMBEDDED
+# offline release key by the CURRENTLY installed (trusted) agent binary
+# BEFORE it is executed. Without this, a compromised release publisher
+# could ship an install.sh that simply skips the tarball check. This
+# wrapper is the trust anchor: it is a fixed-content file on the device
+# (pinned by sudoers), not re-downloaded, and it refuses to run an
+# install.sh whose signature is rejected.
 set -euo pipefail
 ver="${1:-latest}"
 case "$ver" in
   latest|v[0-9]*.[0-9]*.[0-9]*) ;;
   *) echo "obacht-self-update: invalid version $ver" >&2; exit 2 ;;
 esac
-url="https://github.com/obacht-dev/obacht-agent/releases/${ver}/download/install.sh"
 if [ "$ver" = "latest" ]; then
-  url="https://github.com/obacht-dev/obacht-agent/releases/latest/download/install.sh"
+  base="https://github.com/obacht-dev/obacht-agent/releases/latest/download"
 else
-  url="https://github.com/obacht-dev/obacht-agent/releases/download/${ver}/install.sh"
+  base="https://github.com/obacht-dev/obacht-agent/releases/download/${ver}"
 fi
+url="$base/install.sh"
 echo "==> obacht-self-update: fetching $url"
-tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+tmp="$(mktemp)"; tmpsig="$(mktemp)"
+trap 'rm -f "$tmp" "$tmpsig"' EXIT
 curl -fsSL -o "$tmp" "$url"
+
+# Anchor: verify install.sh with the installed agent's embedded release key.
+# 0 verified · 1 REJECTED (abort) · 2 cannot verify (unsigned-migration).
+installed_agent="/opt/obacht-agent/obacht-agent"
+if [ -x "$installed_agent" ] && curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/null; then
+  set +e
+  "$installed_agent" verify-release --file "$tmp" --sig "$tmpsig"
+  vr=$?
+  set -e
+  case "$vr" in
+    0) echo "==> obacht-self-update: install.sh signature OK" ;;
+    1) echo "FATAL: install.sh signature REJECTED — aborting self-update" >&2; exit 1 ;;
+    *) echo "WARN: could not verify install.sh signature (unsigned-migration or old agent); continuing" >&2 ;;
+  esac
+else
+  echo "WARN: no install.sh.minisig or no installed agent to anchor trust; continuing" >&2
+fi
+
 chmod +x "$tmp"
 OBACHT_AGENT_VERSION="$ver" bash "$tmp" --self-update
 SELF
