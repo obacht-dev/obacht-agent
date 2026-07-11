@@ -2,15 +2,15 @@
 //
 // Two distinct caller classes share the socket:
 //
-//   1. obachtctl  — the device admin CLI. It runs as a member of group
-//      `obacht`, which gives it FS-level access to the socket. No bearer
-//      token is required for /v1/admin/* endpoints; trust is purely socket
-//      permissions.
+//  1. obachtctl  — the device admin CLI. It runs as a member of group
+//     `obacht`, which gives it FS-level access to the socket. No bearer
+//     token is required for /v1/admin/* endpoints; trust is purely socket
+//     permissions.
 //
-//   2. Templates  — containers that mount the socket read/write inside
-//      themselves. They authenticate by sending an `Authorization: Bearer
-//      <secret>` header whose value matches a row in `instance_secrets`.
-//      Only /v1/template/* endpoints accept this auth.
+//  2. Templates  — containers that mount the socket read/write inside
+//     themselves. They authenticate by sending an `Authorization: Bearer
+//     <secret>` header whose value matches a row in `instance_secrets`.
+//     Only /v1/template/* endpoints accept this auth.
 //
 // The split keeps a compromised template container from arbitrarily mutating
 // other instances or domains.
@@ -30,11 +30,13 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/redact"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
+	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
 )
 
@@ -57,6 +59,13 @@ type Server struct {
 	audit   *audit.Writer
 	version string
 	log     *slog.Logger
+
+	// user-keys trust store (signed mutations). userKeysDir is set once
+	// before Listen; onUserKeysChanged is wired after the syncer exists
+	// (only when a backend is configured), hence the mutex.
+	userKeysDir       string
+	userKeysChangedMu sync.Mutex
+	onUserKeysChanged func() (int, []error)
 
 	srv *http.Server
 }
@@ -106,6 +115,34 @@ func (s *Server) SetAudit(w *audit.Writer) { s.audit = w }
 
 // SetVersion records the agent version for /v1/system/status.
 func (s *Server) SetVersion(v string) { s.version = v }
+
+// SetUserKeysDir enables the /v1/admin/user-keys endpoints on the given
+// trust-store directory. Must be called before Listen.
+func (s *Server) SetUserKeysDir(dir string) { s.userKeysDir = dir }
+
+// SetOnUserKeysChanged wires the syncer's hot-reload: called after a pin or
+// unpin so the verifier swaps and the capability re-registers without an
+// agent restart. May be set after Listen (the syncer is constructed later);
+// until then pins still land on disk and take effect on the next start.
+func (s *Server) SetOnUserKeysChanged(fn func() (int, []error)) {
+	s.userKeysChangedMu.Lock()
+	s.onUserKeysChanged = fn
+	s.userKeysChangedMu.Unlock()
+}
+
+func (s *Server) notifyUserKeysChanged() (int, bool) {
+	s.userKeysChangedMu.Lock()
+	fn := s.onUserKeysChanged
+	s.userKeysChangedMu.Unlock()
+	if fn == nil {
+		return 0, false
+	}
+	n, problems := fn()
+	for _, p := range problems {
+		s.log.Warn("user key skipped on reload", "err", p)
+	}
+	return n, true
+}
 
 // Listen binds the unix socket and starts serving in a goroutine.
 // Returns once the listener is up; call Shutdown to stop.
@@ -209,6 +246,14 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/admin/bindings/{domain}", admin(s.adminDeleteBinding))
 	mux.HandleFunc("POST /v1/admin/services", admin(s.adminUpsertService))
 	mux.HandleFunc("POST /v1/admin/ingress/reload", admin(s.adminIngressReload))
+
+	// Signed-mutation trust store (PLAN-PI-SIGNED-MUTATIONS A1): pin/unpin
+	// the user pubkeys the agent verifies signed mutations against. Reached
+	// only via obachtctl (peer-cred gated) — i.e. via a user-authorised SSH
+	// session or local shell, never from the backend (invariant I3).
+	mux.HandleFunc("GET /v1/admin/user-keys", admin(s.adminListUserKeys))
+	mux.HandleFunc("POST /v1/admin/user-keys", admin(s.adminPinUserKey))
+	mux.HandleFunc("DELETE /v1/admin/user-keys", admin(s.adminUnpinUserKey))
 
 	// Phase S1: audit + system introspection.
 	mux.HandleFunc("GET /v1/admin/audit", admin(s.adminAuditTail))
@@ -811,10 +856,10 @@ func (s *Server) systemStatus(w http.ResponseWriter, r *http.Request) {
 		"power_mode":      settings["power_mode"] == "true",
 		"security_mode":   settings["security_mode"],
 		"counters": map[string]any{
-			"instances":  len(instances),
-			"domains":    len(domains),
-			"bindings":   len(bindings),
-			"audit_ops":  counters,
+			"instances": len(instances),
+			"domains":   len(domains),
+			"bindings":  len(bindings),
+			"audit_ops": counters,
 		},
 		"audit_log_path": "", // populated by main.go via SetAudit; for now empty
 		"now":            time.Now().Unix(),
@@ -866,6 +911,130 @@ func (s *Server) adminSetSystemSetting(w http.ResponseWriter, r *http.Request) {
 		Params:        map[string]any{"key": body.Key, "value": body.Value},
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": body.Key, "value": body.Value})
+}
+
+// --- signed-mutation user-key trust store ---
+
+func (s *Server) requireUserKeysDir(w http.ResponseWriter) bool {
+	if s.userKeysDir == "" {
+		writeErr(w, http.StatusServiceUnavailable, errors.New("user-keys store not configured"))
+		return false
+	}
+	return true
+}
+
+func (s *Server) adminListUserKeys(w http.ResponseWriter, r *http.Request) {
+	if !s.requireUserKeysDir(w) {
+		return
+	}
+	keys, problems := signedmut.LoadUserKeys(s.userKeysDir)
+	out := make([]map[string]any, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, map[string]any{"label": k.Label, "fingerprint": k.Fingerprint()})
+	}
+	resp := map[string]any{"keys": out, "count": len(keys)}
+	if len(problems) > 0 {
+		msgs := make([]string, 0, len(problems))
+		for _, p := range problems {
+			msgs = append(msgs, p.Error())
+		}
+		resp["problems"] = msgs
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// adminPinUserKey adds one OpenSSH ed25519 public key to the trust store
+// and hot-reloads the verifier so the signed-mutation capability flips
+// without a restart. Idempotent per key.
+func (s *Server) adminPinUserKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requireUserKeysDir(w) {
+		return
+	}
+	var body struct {
+		PublicKey string `json:"public_key"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	key, created, err := signedmut.PinUserKey(s.userKeysDir, body.PublicKey)
+	if err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{
+			Op:           "security.user_key.pinned",
+			Actor:        "obachtctl",
+			Result:       audit.ResultError,
+			ErrorMessage: err.Error(),
+		})
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{
+		Op:            "security.user_key.pinned",
+		Actor:         "obachtctl",
+		Target:        key.Fingerprint(),
+		Result:        audit.ResultOK,
+		ParamsSummary: "label=" + key.Label,
+		Params:        map[string]any{"label": key.Label, "fingerprint": key.Fingerprint(), "created": created},
+	})
+	count, reloaded := s.notifyUserKeysChanged()
+	if !reloaded {
+		keys, _ := signedmut.LoadUserKeys(s.userKeysDir)
+		count = len(keys)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":          true,
+		"created":     created,
+		"label":       key.Label,
+		"fingerprint": key.Fingerprint(),
+		"keyCount":    count,
+		// Without a backend connection the reload is deferred to the next
+		// agent start; the pin itself is durable either way.
+		"reloaded": reloaded,
+	})
+}
+
+// adminUnpinUserKey removes all pins matching a fingerprint and hot-reloads
+// the verifier. With zero keys left the agent stops advertising the
+// signed-mutation capability on the re-register.
+func (s *Server) adminUnpinUserKey(w http.ResponseWriter, r *http.Request) {
+	if !s.requireUserKeysDir(w) {
+		return
+	}
+	var body struct {
+		Fingerprint string `json:"fingerprint"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8<<10)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	removed, err := signedmut.UnpinUserKey(s.userKeysDir, body.Fingerprint)
+	if err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{
+			Op:           "security.user_key.unpinned",
+			Actor:        "obachtctl",
+			Target:       body.Fingerprint,
+			Result:       audit.ResultError,
+			ErrorMessage: err.Error(),
+		})
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{
+		Op:            "security.user_key.unpinned",
+		Actor:         "obachtctl",
+		Target:        body.Fingerprint,
+		Result:        audit.ResultOK,
+		ParamsSummary: fmt.Sprintf("removed=%d", removed),
+		Params:        map[string]any{"fingerprint": body.Fingerprint, "removed": removed},
+	})
+	count, reloaded := s.notifyUserKeysChanged()
+	if !reloaded {
+		keys, _ := signedmut.LoadUserKeys(s.userKeysDir)
+		count = len(keys)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "removed": removed, "keyCount": count, "reloaded": reloaded,
+	})
 }
 
 // adminListSystemdServices returns the filtered list of admin-installed

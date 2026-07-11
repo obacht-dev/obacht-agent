@@ -13,7 +13,9 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -166,10 +168,16 @@ func main() {
 		return
 	}
 
+	// One-time migration (PLAN-PI-SIGNED-MUTATIONS A3b, linux only): adopt
+	// the install-provisioned SSH key from authorized_keys as the pinned
+	// signing key. Runs before the trust store is first read below.
+	importUserKeysOnce(ctx, st, cfg.Paths.UserKeysDir, auditW, log)
+
 	ipcSrv := ipc.New(cfg.Paths.Socket, st, rec, log.With("component", "ipc"))
 	ipcSrv.SetIngress(ingMgr)
 	ipcSrv.SetAudit(auditW)
 	ipcSrv.SetVersion(agentVersion)
+	ipcSrv.SetUserKeysDir(cfg.Paths.UserKeysDir)
 	if err := ipcSrv.Listen(ctx); err != nil {
 		log.Error("ipc listen", "err", err)
 		os.Exit(1)
@@ -198,6 +206,11 @@ func main() {
 			log.Info("signed mutations enabled", "keys", strings.Join(labels, ", "))
 		}
 		syncer.SetSignedMutations(signedmut.NewVerifier(userKeys), ingMgr)
+		// obachtctl trust pin/unpin (IPC) hot-swaps the verifier and
+		// re-registers, so the capability flips without an agent restart.
+		ipcSrv.SetOnUserKeysChanged(func() (int, []error) {
+			return syncer.ReloadUserKeys(cfg.Paths.UserKeysDir)
+		})
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		logspkg.New(wsClient, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)
@@ -208,6 +221,76 @@ func main() {
 
 	<-ctx.Done()
 	log.Info("agent shutting down")
+}
+
+// userKeysImportedMetaKey marks the one-time authorized_keys import as done
+// so a later, deliberate unpin (emptying user-keys.d) is not silently undone
+// on the next start.
+const userKeysImportedMetaKey = "user_keys_imported"
+
+// importUserKeysOnce migrates the install-provisioned SSH public key into
+// the signed-mutation trust store (PLAN-PI-SIGNED-MUTATIONS §4.2). Linux
+// only — the Mac app pins explicitly at enrollment and has no sshd. Safe by
+// construction: every key in authorized_keys can already open an SSH session
+// as the obacht user and drive obachtctl, i.e. it holds strictly MORE power
+// than a mutation signer, so adopting it grants nothing new. Runs at most
+// once (agent_meta marker); skipped entirely when keys are already pinned
+// (fresh installs where install.sh provisioned user-keys.d directly).
+func importUserKeysOnce(ctx context.Context, st *store.Store, dir string, auditW *audit.Writer, log *slog.Logger) {
+	if goruntime.GOOS != "linux" {
+		return
+	}
+	if v, err := st.GetMeta(ctx, userKeysImportedMetaKey); err == nil && v != "" {
+		return
+	}
+	if keys, _ := signedmut.LoadUserKeys(dir); len(keys) > 0 {
+		_ = st.SetMeta(ctx, userKeysImportedMetaKey, "preexisting")
+		return
+	}
+	authPath := authorizedKeysPath()
+	if authPath == "" {
+		return
+	}
+	pinned, skipped, err := signedmut.ImportAuthorizedKeys(dir, authPath)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			// Unreadable file: retry on the next start rather than burning
+			// the marker on a transient error.
+			log.Warn("user-key import failed", "path", authPath, "err", err)
+		}
+		return
+	}
+	for _, k := range pinned {
+		log.Info("user key imported from authorized_keys", "fingerprint", k.Fingerprint())
+		_ = auditW.Append(ctx, audit.Entry{
+			Op:            "security.user_key.imported",
+			Actor:         "agent",
+			Target:        k.Fingerprint(),
+			Result:        audit.ResultOK,
+			ParamsSummary: "source=authorized_keys",
+			Params:        map[string]any{"fingerprint": k.Fingerprint(), "label": k.Label, "source": authPath},
+		})
+	}
+	if skipped > 0 {
+		log.Info("user-key import skipped non-ed25519/option lines", "count", skipped)
+	}
+	_ = st.SetMeta(ctx, userKeysImportedMetaKey, time.Now().UTC().Format(time.RFC3339))
+}
+
+// authorizedKeysPath resolves the obacht user's authorized_keys file. The
+// agent normally runs AS obacht, but resolve the account explicitly so a
+// root-run agent (legacy installs) still finds the right file.
+func authorizedKeysPath() string {
+	if u, err := user.Lookup("obacht"); err == nil && u.HomeDir != "" {
+		return filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return filepath.Join(u.HomeDir, ".ssh", "authorized_keys")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".ssh", "authorized_keys")
+	}
+	return ""
 }
 
 func envOr(key, fallback string) string {

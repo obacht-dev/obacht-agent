@@ -64,6 +64,8 @@ func main() {
 		rt.cmdService(ctx, args[1:])
 	case "system":
 		rt.cmdSystem(ctx, args[1:])
+	case "trust":
+		rt.cmdTrust(ctx, args[1:])
 	case "logs":
 		rt.cmdLogs(ctx, args[1:])
 	default:
@@ -186,11 +188,11 @@ func (r *runtime) instanceList(ctx context.Context) {
 		out := make([]map[string]any, 0, len(insts))
 		for _, i := range insts {
 			out = append(out, map[string]any{
-				"id":            i.ID,
-				"template_id":   i.TemplateID,
-				"runtime":       string(i.Runtime),
-				"version":       i.Version,
-				"desired_state": string(i.DesiredState),
+				"id":             i.ID,
+				"template_id":    i.TemplateID,
+				"runtime":        string(i.Runtime),
+				"version":        i.Version,
+				"desired_state":  string(i.DesiredState),
 				"observed_state": i.ObservedState,
 			})
 		}
@@ -607,6 +609,61 @@ func (r *runtime) systemSetPowerMode(ctx context.Context, args []string) {
 	emit(code, body)
 }
 
+// cmdTrust manages the signed-mutation user-key trust store
+// (PLAN-PI-SIGNED-MUTATIONS A1). Pinning is a user-authorised act by
+// construction: this CLI is only reachable via an SSH session (exec-plan,
+// authenticated with the user's own key) or a local shell — never by the
+// backend. The IPC handler hot-reloads the verifier, so a pin flips the
+// signed-mutation capability without an agent restart.
+func (r *runtime) cmdTrust(ctx context.Context, args []string) {
+	if len(args) == 0 {
+		die("usage: obachtctl trust <list-user-keys|pin-user-key|unpin-user-key>")
+	}
+	if r.directMode() {
+		die("trust commands require the daemon (not available in --db mode)")
+	}
+	switch args[0] {
+	case "list-user-keys":
+		code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/admin/user-keys", nil)
+		if err != nil {
+			die("%v", err)
+		}
+		emit(code, body)
+	case "pin-user-key":
+		fs := flag.NewFlagSet("trust pin-user-key", flag.ExitOnError)
+		pubkey := fs.String("pubkey", "", "OpenSSH ed25519 public key line (required)")
+		_ = fs.Bool("json", false, "output JSON (default)")
+		_ = fs.Parse(args[1:])
+		if *pubkey == "" {
+			die("--pubkey is required")
+		}
+		code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/user-keys", map[string]any{
+			"public_key": *pubkey,
+		})
+		if err != nil {
+			die("%v", err)
+		}
+		emit(code, body)
+	case "unpin-user-key":
+		fs := flag.NewFlagSet("trust unpin-user-key", flag.ExitOnError)
+		fingerprint := fs.String("fingerprint", "", "OpenSSH SHA256 fingerprint of the key to remove (required)")
+		_ = fs.Bool("json", false, "output JSON (default)")
+		_ = fs.Parse(args[1:])
+		if *fingerprint == "" {
+			die("--fingerprint is required")
+		}
+		code, body, err := r.doIPC(ctx, http.MethodDelete, "/v1/admin/user-keys", map[string]any{
+			"fingerprint": *fingerprint,
+		})
+		if err != nil {
+			die("%v", err)
+		}
+		emit(code, body)
+	default:
+		die("unknown trust subcommand: %s", args[0])
+	}
+}
+
 // cmdLogs returns docker logs for an instance's container/service.
 // Read-only; matches the IPC endpoint signature 1:1.
 //
@@ -646,14 +703,15 @@ func (r *runtime) cmdLogs(ctx context.Context, args []string) {
 // privileged commands via sudo (see obacht-power-toggle). Flipping it
 // on is high-impact, so we make it deliberately interactive:
 //
-//   1. Without --yes, we print what's about to change, generate a
-//      random 6-char confirm-code, ask the operator to type it back.
-//   2. On match, we shell out to `sudo obacht-power-toggle enable`
-//      AND set the agent's power_mode setting via IPC, so the
-//      reconciler / future template installs see it.
+//  1. Without --yes, we print what's about to change, generate a
+//     random 6-char confirm-code, ask the operator to type it back.
+//  2. On match, we shell out to `sudo obacht-power-toggle enable`
+//     AND set the agent's power_mode setting via IPC, so the
+//     reconciler / future template installs see it.
 //
 // Non-interactive use (CI / install-plan via ssh-gateway):
-//   obachtctl system unlock-power --yes
+//
+//	obachtctl system unlock-power --yes
 //
 // The --token / --confirm flow used by the obacht-api unlock-power
 // install-plan endpoint is upstream of this binary; the api validates
@@ -788,7 +846,6 @@ func interactiveConfirm(action string) error {
 		return fmt.Errorf("confirm code not entered within 60s")
 	}
 }
-
 
 func (r *runtime) cmdTemplate(ctx context.Context, args []string) {
 	if len(args) == 0 {
@@ -1164,6 +1221,11 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  service list                             list custom systemd services (JSON)")
 	fmt.Fprintln(w, "  service start|stop|restart|reload|enable|disable --name=UNIT.service")
 	fmt.Fprintln(w, "                                           control a systemd unit (requires Power Mode)")
+	fmt.Fprintln(w, "  trust list-user-keys                     list pinned signed-mutation user keys (JSON)")
+	fmt.Fprintln(w, "  trust pin-user-key --pubkey='ssh-ed25519 AAAA… comment'")
+	fmt.Fprintln(w, "                                           pin a user key for signed mutations (hot-reloads)")
+	fmt.Fprintln(w, "  trust unpin-user-key --fingerprint=SHA256:…")
+	fmt.Fprintln(w, "                                           remove a pinned user key")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "with --db=PATH commands write directly to the SQLite SSOT (no daemon required).")
 }
