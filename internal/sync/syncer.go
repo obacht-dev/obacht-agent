@@ -58,6 +58,14 @@ type Triggerable interface {
 	Trigger()
 }
 
+// activeWorkProvider is optionally implemented by the reconciler: exposes
+// the serial apply queue (current + waiting instance IDs) so the observed
+// push can carry a transient `active_work` field. The api relays it to the
+// progress channel only — it is never persisted.
+type activeWorkProvider interface {
+	ActiveWork() (active string, queued []string)
+}
+
 // Syncer bridges the WS client and local state.
 type Syncer struct {
 	client       *api.Client
@@ -90,7 +98,29 @@ type Syncer struct {
 	verifierMu stdsync.RWMutex
 	verifier   *signedmut.Verifier
 	ingress    IngressManager
+
+	// pushNow coalesces immediate observed-state push requests (reconciler
+	// change notifier). Buffered(1): a kick during an in-flight push simply
+	// schedules one more.
+	pushNow chan struct{}
+
+	// Install-progress throttle state (Report). RAM-only by design — the
+	// privacy invariant (see internal/progress) forbids persisting any of
+	// this, including to the audit log.
+	progMu   stdsync.Mutex
+	progSent map[string]progStamp
 }
+
+// progStamp remembers the last emitted progress event per instance for
+// throttling (max 1 event / 2s, immediate on phase change).
+type progStamp struct {
+	phase string
+	at    time.Time
+}
+
+// progressThrottle is the minimum interval between two progress events for
+// the same instance and phase.
+const progressThrottle = 2 * time.Second
 
 // SetCompose attaches the compose driver so observed-state pushes can
 // include per-service health for bundle instances.
@@ -114,6 +144,63 @@ func New(client *api.Client, st *store.Store, rec Triggerable, deviceID, agentVe
 		pushEvery:      30 * time.Second,
 		telemetryEvery: 30 * time.Second,
 		telemetry:      telemetry.NewCollector(),
+		pushNow:        make(chan struct{}, 1),
+		progSent:       map[string]progStamp{},
+	}
+}
+
+// PushNow requests an immediate observed-state push (coalescing). Wired as
+// the reconciler's change notifier so real state transitions reach the
+// backend in seconds instead of the next 30s tick. The api's hash-diff skip
+// (obacht-api F7) guarantees no extra DB writes for no-op pushes.
+func (s *Syncer) PushNow() {
+	select {
+	case s.pushNow <- struct{}{}:
+	default:
+	}
+}
+
+// Report implements progress.Reporter: relays transient install progress as
+// `agent:install_progress` over the existing WS connection, throttled to one
+// event per 2s per instance (phase changes pass immediately).
+//
+// PRIVACY INVARIANT (PLAN-DEVICE-RESPONSIVENESS-V1, Leitplanke 2): this data
+// is never written to the store, the audit log, or any backend table. The
+// api relays it RAM-only to connected browsers.
+func (s *Syncer) Report(instanceID, phase string, percent int) {
+	if instanceID == "" || !s.client.Connected() {
+		return
+	}
+	now := time.Now()
+	s.progMu.Lock()
+	last, ok := s.progSent[instanceID]
+	// Terminal 100% always passes: it often lands <2s after the previous
+	// event and dropping it would leave the bar short of full before the
+	// phase switches.
+	if ok && last.phase == phase && percent != 100 && now.Sub(last.at) < progressThrottle {
+		s.progMu.Unlock()
+		return
+	}
+	s.progSent[instanceID] = progStamp{phase: phase, at: now}
+	// Opportunistic cleanup so the map can't grow unbounded over months of
+	// installs; only sweep once it has actually accumulated entries.
+	if len(s.progSent) > 64 {
+		for id, st := range s.progSent {
+			if now.Sub(st.at) > 10*time.Minute {
+				delete(s.progSent, id)
+			}
+		}
+	}
+	s.progMu.Unlock()
+
+	if err := s.client.Emit("agent:install_progress", map[string]any{
+		"deviceId":    s.deviceID,
+		"instance_id": instanceID,
+		"phase":       phase,
+		"percent":     percent,
+		"ts":          now.Unix(),
+	}); err != nil {
+		s.log.Debug("emit install_progress", "err", err)
 	}
 }
 
@@ -190,6 +277,8 @@ func (s *Syncer) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+			s.pushObserved(ctx)
+		case <-s.pushNow:
 			s.pushObserved(ctx)
 		case <-telem.C:
 			s.pushTelemetry(ctx)
@@ -278,7 +367,7 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 func (s *Syncer) sendRegister() {
 	ident := compat.Detect("/var/lib/obacht")
 	hostname, _ := os.Hostname()
-	capabilities := []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix"}
+	capabilities := []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix", "progress.v1"}
 	// Advertise signed-mutation support only when at least one user key is
 	// pinned — the api/webapp route mutations by this capability, and a
 	// device that would deny everything must not attract them.
@@ -450,6 +539,19 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		"instances": instances,
 		"bindings":  bindings,
 		"domains":   doms,
+	}
+
+	// Transient view of the serial apply queue (C2). The api must NOT
+	// persist this — it exists so the UI can render "waiting" badges. Only
+	// attached while there is actual work, so steady-state snapshots hash
+	// identically and the api's diff-skip keeps eliding writes.
+	if aw, ok := s.rec.(activeWorkProvider); ok {
+		if active, queued := aw.ActiveWork(); active != "" || len(queued) > 0 {
+			payload["active_work"] = map[string]any{
+				"instance_id": active,
+				"queued":      queued,
+			}
+		}
 	}
 
 	// Surface the agent's system toggles to the backend so the UI can

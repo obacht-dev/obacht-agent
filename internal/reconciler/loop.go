@@ -1,6 +1,19 @@
 // Package reconciler diffs desired state (from the SQLite SSOT) against
 // observed state (from the runtime drivers) and converges by calling Apply
 // or Remove on the appropriate driver.
+//
+// Concurrency model (PLAN-DEVICE-RESPONSIVENESS-V1 phase C):
+//
+//   - The reconcile PASS is the only diff computer. It stays fast: quick
+//     operations (stop/remove, orphan GC, system units) run inline; long
+//     Applies (container + compose, i.e. image-pull-heavy) are enqueued to
+//     a single serial apply WORKER (queue size 1 by design — SD-card IO
+//     gains nothing from parallelism, and "a queue" is the simpler mental
+//     model for users).
+//   - INGRESS runs in its own loop with its own trigger + ticker, so domain
+//     claims/binds no longer queue invisibly behind a long install.
+//   - RunOnce (obachtctl reconcile run, --once) keeps the old fully
+//     synchronous semantics: applies and ingress run inline.
 package reconciler
 
 import (
@@ -12,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/progress"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
@@ -60,9 +74,36 @@ type Reconciler struct {
 	// ${host.gateway} placeholder. Empty on Pis — no host-services there.
 	hostGatewayIP string
 
-	trigger chan struct{}
-	mu      sync.Mutex
-	last    time.Time
+	trigger        chan struct{}
+	ingressTrigger chan struct{}
+	mu             sync.Mutex
+	last           time.Time
+
+	// notify is invoked (coalesced by the syncer) whenever a pass or the
+	// apply worker materially changed observed state, so the backend gets a
+	// fresh snapshot within seconds instead of waiting for the 30s tick.
+	// Wired once in main BEFORE Run starts (like prog) — no lock needed.
+	notify func()
+
+	prog progress.Reporter
+
+	// Serial apply worker state. workQueue holds jobs FIFO; workPending
+	// dedupes enqueues (including against the in-flight job, so a 5-minute
+	// pull isn't re-queued by every 30s tick behind itself); workActive is
+	// the instance currently applying.
+	workMu      sync.Mutex
+	workQueue   []applyJob
+	workPending map[string]bool
+	workActive  string
+	workKick    chan struct{}
+}
+
+// applyJob carries everything the worker needs so steady-state drains do no
+// extra docker round-trips: the pass's observed-container snapshot is shared
+// (read-only) — the same staleness the old inline pass had.
+type applyJob struct {
+	instanceID string
+	observed   map[string]container.ManagedContainer
 }
 
 // IngressApplier is the subset of the ingress manager the reconciler uses.
@@ -77,12 +118,16 @@ func New(st *store.Store, docker *container.Driver, log *slog.Logger, interval t
 		interval = 30 * time.Second
 	}
 	return &Reconciler{
-		store:    st,
-		docker:   docker,
-		system:   system.New(log),
-		interval: interval,
-		log:      log,
-		trigger:  make(chan struct{}, 1),
+		store:          st,
+		docker:         docker,
+		system:         system.New(log),
+		interval:       interval,
+		log:            log,
+		trigger:        make(chan struct{}, 1),
+		ingressTrigger: make(chan struct{}, 1),
+		workPending:    map[string]bool{},
+		workKick:       make(chan struct{}, 1),
+		prog:           progress.Nop{},
 	}
 }
 
@@ -90,8 +135,10 @@ func New(st *store.Store, docker *container.Driver, log *slog.Logger, interval t
 // instances (they are skipped with a warning).
 func (r *Reconciler) SetCompose(c *compose.Driver) { r.compose = c }
 
-// SetIngress wires an ingress manager that will be Apply()-ed at the end of
-// every reconcile pass. Optional — nil disables ingress reconciliation.
+// SetIngress wires an ingress manager. It is Apply()-ed by a dedicated
+// ingress loop (own trigger + ticker) so domain operations converge even
+// while a long install is running. Optional — nil disables ingress
+// reconciliation.
 func (r *Reconciler) SetIngress(i IngressApplier) { r.ingress = i }
 
 // SetSocketPath enables IPC injection for container instances. The agent
@@ -105,6 +152,21 @@ func (r *Reconciler) SetSocketPath(p string) { r.socketPath = p }
 // Pis. macOS only.
 func (r *Reconciler) SetHostGateway(ip string) { r.hostGatewayIP = ip }
 
+// SetChangeNotifier registers a callback fired after observed state changed
+// (pass or worker). Used by the syncer to push a snapshot immediately.
+// Must be wired before Run starts (main.go does).
+func (r *Reconciler) SetChangeNotifier(fn func()) { r.notify = fn }
+
+// SetProgress wires a progress sink (see internal/progress). Must be wired
+// before Run starts.
+func (r *Reconciler) SetProgress(p progress.Reporter) { r.prog = progress.OrNop(p) }
+
+func (r *Reconciler) notifyChanged() {
+	if r.notify != nil {
+		r.notify()
+	}
+}
+
 // Trigger requests an immediate reconcile pass. Coalesces if one is pending.
 func (r *Reconciler) Trigger() {
 	select {
@@ -113,9 +175,47 @@ func (r *Reconciler) Trigger() {
 	}
 }
 
+// TriggerIngress requests an immediate ingress Apply. Coalesces if one is
+// pending. Safe to call when no ingress manager is wired.
+func (r *Reconciler) TriggerIngress() {
+	select {
+	case r.ingressTrigger <- struct{}{}:
+	default:
+	}
+}
+
+// ActiveWork reports the instance currently applying (empty if idle) and the
+// queued instance IDs, FIFO. Transient runtime data — surfaced via the
+// observed-state push (`active_work`) and obachtctl, never persisted by the
+// backend.
+func (r *Reconciler) ActiveWork() (active string, queued []string) {
+	r.workMu.Lock()
+	defer r.workMu.Unlock()
+	for _, j := range r.workQueue {
+		queued = append(queued, j.instanceID)
+	}
+	return r.workActive, queued
+}
+
+// workerBusyWith reports whether the worker currently applies or has queued
+// the given instance. The pass uses it to defer stop/remove handling —
+// exactly the wait an inline pass used to impose — so Apply and Remove can
+// never run concurrently for one instance.
+func (r *Reconciler) workerBusyWith(instanceID string) bool {
+	r.workMu.Lock()
+	defer r.workMu.Unlock()
+	return r.workActive == instanceID || r.workPending[instanceID]
+}
+
 // Run blocks until ctx is cancelled, calling reconcile() periodically and
-// whenever Trigger() is invoked.
+// whenever Trigger() is invoked. It also owns the apply worker and the
+// ingress loop.
 func (r *Reconciler) Run(ctx context.Context) {
+	go r.runApplyWorker(ctx)
+	if r.ingress != nil {
+		go r.runIngressLoop(ctx)
+	}
+
 	t := time.NewTicker(r.interval)
 	defer t.Stop()
 
@@ -134,22 +234,175 @@ func (r *Reconciler) Run(ctx context.Context) {
 	}
 }
 
-// RunOnce performs a single reconcile pass synchronously. Useful for tests
-// and for the `obachtctl reconcile run` CLI command.
+// RunOnce performs a single reconcile pass synchronously (applies and
+// ingress inline — no worker involved). Useful for tests and for the
+// `obachtctl reconcile run` CLI command.
 func (r *Reconciler) RunOnce(ctx context.Context) error {
-	return r.reconcile(ctx)
+	return r.reconcile(ctx, true)
 }
 
 func (r *Reconciler) runOnce(ctx context.Context) {
 	r.mu.Lock()
 	r.last = time.Now()
 	r.mu.Unlock()
-	if err := r.reconcile(ctx); err != nil {
+	if err := r.reconcile(ctx, false); err != nil {
 		r.log.Error("reconcile failed", "err", err)
 	}
 }
 
-func (r *Reconciler) reconcile(ctx context.Context) error {
+// runIngressLoop applies ingress config whenever triggered, decoupled from
+// the (now fast) reconcile pass so domain claims/binds converge in seconds
+// even while an install is pulling images (finding F2). No own ticker: every
+// pass ends with a trigger, so the effective cadence equals the old
+// end-of-pass Apply — triggers in between (worker convergence, obachtctl
+// domain ops via Trigger()) just run sooner. Coalescing channel.
+func (r *Reconciler) runIngressLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.ingressTrigger:
+			if err := r.ingress.Apply(ctx); err != nil {
+				r.log.Error("ingress apply", "err", err)
+			}
+		}
+	}
+}
+
+// enqueueApply adds an instance to the serial apply queue, deduplicated
+// against both queued and in-flight work (a long pull must not queue up
+// behind itself on every tick). First installs waiting behind other work
+// are reported as "queued" so the UI can render a waiting badge; healthy
+// steady-state re-reconciles are not (that would be noise).
+func (r *Reconciler) enqueueApply(inst store.Instance, observed map[string]container.ManagedContainer) {
+	r.workMu.Lock()
+	if r.workPending[inst.ID] || r.workActive == inst.ID {
+		r.workMu.Unlock()
+		return
+	}
+	r.workPending[inst.ID] = true
+	r.workQueue = append(r.workQueue, applyJob{instanceID: inst.ID, observed: observed})
+	busy := r.workActive != ""
+	r.workMu.Unlock()
+
+	if busy && isFirstInstallState(inst.ObservedState) {
+		r.prog.Report(inst.ID, progress.PhaseQueued, -1)
+	}
+	select {
+	case r.workKick <- struct{}{}:
+	default:
+	}
+}
+
+// isFirstInstallState reports whether observed marks an instance that has
+// never completed an install (the states markInstalling may replace, plus
+// 'installing' itself after a mid-install agent restart).
+func isFirstInstallState(observed string) bool {
+	return observed == "" || observed == "pending" || observed == "installing"
+}
+
+// runApplyWorker drains the apply queue one instance at a time. Each job
+// re-reads its instance row so a desired-state change while queued (e.g.
+// uninstall) is respected. Shutdown: jobs abort with ctx (docker/compose
+// commands are CommandContext-bound) — same crash-recovery semantics as
+// before: desired state in SQLite is the SSOT, the next start converges.
+func (r *Reconciler) runApplyWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.workKick:
+		}
+		for {
+			r.workMu.Lock()
+			if len(r.workQueue) == 0 {
+				r.workMu.Unlock()
+				break
+			}
+			job := r.workQueue[0]
+			r.workQueue = r.workQueue[1:]
+			delete(r.workPending, job.instanceID)
+			r.workActive = job.instanceID
+			r.workMu.Unlock()
+
+			changed := r.applyOne(ctx, job)
+
+			r.workMu.Lock()
+			r.workActive = ""
+			r.workMu.Unlock()
+
+			if changed {
+				// A fresh install registers services the ingress may be
+				// waiting for (a bind on a still-installing instance is
+				// tolerated and retried) — nudge it now that the instance
+				// converged, and push the new observed state immediately.
+				r.TriggerIngress()
+				r.notifyChanged()
+			}
+			if ctx.Err() != nil {
+				return
+			}
+		}
+	}
+}
+
+// applyOne converges a single container/compose instance towards installed.
+// Runs in the worker. Re-reads the row (cheap local point read) so a config
+// change or an uninstall that happened while the job was queued is honored;
+// the observed-container snapshot comes from the enqueueing pass — the same
+// staleness the old inline pass had. Returns true when observable state
+// changed (drives the immediate push + ingress nudge).
+func (r *Reconciler) applyOne(ctx context.Context, job applyJob) bool {
+	inst, err := r.store.GetInstance(ctx, job.instanceID)
+	if err != nil {
+		if !errors.Is(err, store.ErrNotFound) {
+			r.log.Warn("apply worker: read instance", "instance", job.instanceID, "err", err)
+		}
+		return false // row gone (uninstalled while queued) — nothing to do
+	}
+	if inst.DesiredState != store.DesiredInstalled {
+		// Flipped to stopped/removed while queued. The pass deferred the
+		// down-handling while we held the instance — run one now so the
+		// user's uninstall doesn't wait for the next tick.
+		r.Trigger()
+		return false
+	}
+	var changed bool
+	switch inst.Runtime {
+	case store.RuntimeContainer:
+		changed = r.applyContainer(ctx, *inst, job.observed)
+	case store.RuntimeCompose:
+		changed = r.applyCompose(ctx, *inst)
+	default:
+		return false
+	}
+	// Catch a desired-state flip that happened DURING the (possibly long)
+	// apply: the pass deferred the stop/remove because we were busy — kick
+	// a pass now instead of leaving the teardown to the 30s tick.
+	if fresh, err := r.store.GetInstance(ctx, job.instanceID); err == nil && fresh.DesiredState != store.DesiredInstalled {
+		r.Trigger()
+	}
+	return changed
+}
+
+// markInstalling sets the transient 'installing' observed state before a
+// (potentially long) Apply, so the UI can show honest progress. Only set for
+// first-time installs (observed empty/pending): re-reconciles of healthy or
+// errored instances must not flap installed/error → installing every pass —
+// that would churn the DB and spam realtime subscribers with no-op cycles.
+// (Deliberate deviation from plan §A2.1, which included 'error'.)
+func (r *Reconciler) markInstalling(ctx context.Context, inst store.Instance) {
+	if inst.ObservedState != "" && inst.ObservedState != "pending" {
+		return
+	}
+	if err := r.store.SetObservedState(ctx, inst.ID, "installing", ""); err != nil {
+		r.log.Warn("record installing state", "instance", inst.ID, "err", err)
+		return
+	}
+	r.notifyChanged()
+}
+
+func (r *Reconciler) reconcile(ctx context.Context, syncApply bool) error {
 	desired, err := r.store.ListInstances(ctx)
 	if err != nil {
 		return fmt.Errorf("list desired: %w", err)
@@ -168,14 +421,35 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 	}
 
 	desiredIDs := make(map[string]struct{}, len(desired))
+	changed := false
 
 	for _, inst := range desired {
 		desiredIDs[inst.ID] = struct{}{}
 		switch inst.Runtime {
-		case store.RuntimeContainer:
-			r.reconcileContainer(ctx, inst, observedByInstance)
-		case store.RuntimeCompose:
-			r.reconcileCompose(ctx, inst)
+		case store.RuntimeContainer, store.RuntimeCompose:
+			if inst.DesiredState == store.DesiredInstalled {
+				if syncApply {
+					if inst.Runtime == store.RuntimeContainer {
+						changed = r.applyContainer(ctx, inst, observedByInstance) || changed
+					} else {
+						changed = r.applyCompose(ctx, inst) || changed
+					}
+				} else {
+					r.enqueueApply(inst, observedByInstance)
+				}
+				continue
+			}
+			// Stop/remove must never overlap a concurrent Apply of the same
+			// instance in the worker — defer to a later pass, exactly the
+			// wait the old inline (sequential) pass imposed.
+			if !syncApply && r.workerBusyWith(inst.ID) {
+				continue
+			}
+			if inst.Runtime == store.RuntimeContainer {
+				changed = r.reconcileContainerDown(ctx, inst) || changed
+			} else {
+				changed = r.reconcileComposeDown(ctx, inst) || changed
+			}
 		case store.RuntimeSystem:
 			r.reconcileSystem(ctx, inst)
 		default:
@@ -207,6 +481,7 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 		}
 		if removed {
 			r.log.Info("removed orphan container", "instance", id, "container", c.Name)
+			changed = true
 		}
 	}
 
@@ -231,100 +506,125 @@ func (r *Reconciler) reconcile(ctx context.Context) error {
 				}
 				if removed {
 					r.log.Info("removed orphan compose project", "instance", id)
+					changed = true
 				}
 			}
 		}
 	}
 
-	// Ingress runs last: it reads the SSOT we just converged towards.
-	if r.ingress != nil {
-		if err := r.ingress.Apply(ctx); err != nil {
-			r.log.Error("ingress apply", "err", err)
+	if syncApply {
+		// RunOnce keeps the old synchronous contract: ingress applied inline.
+		if r.ingress != nil {
+			if err := r.ingress.Apply(ctx); err != nil {
+				r.log.Error("ingress apply", "err", err)
+			}
 		}
+	} else {
+		r.TriggerIngress()
+	}
+	if changed {
+		r.notifyChanged()
 	}
 	return nil
 }
 
-// reconcileContainer converges a single container-runtime instance.
-func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance, observedByInstance map[string]container.ManagedContainer) {
+// applyContainer converges a single container-runtime instance towards
+// installed. Long-running (image pull) — called from the worker, or inline
+// for RunOnce. Returns true when observable state changed (drives the
+// worker's immediate push + ingress nudge; RunOnce ignores it).
+func (r *Reconciler) applyContainer(ctx context.Context, inst store.Instance, observedByInstance map[string]container.ManagedContainer) bool {
+	spec, err := container.ParseSpec(inst.ConfigJSON)
+	if err != nil {
+		if errors.Is(err, container.ErrEmptySpec) {
+			r.log.Warn("instance has empty config_json, skipping", "instance", inst.ID)
+			return false
+		}
+		r.log.Error("parse spec", "instance", inst.ID, "err", err)
+		return false
+	}
+	if err := r.injectIPC(ctx, inst.ID, &spec); err != nil {
+		r.log.Error("inject ipc", "instance", inst.ID, "err", err)
+		return false
+	}
+	if err := spec.ExpandSecrets(ctx, inst.ID, r.store); err != nil {
+		r.log.Error("expand secrets", "instance", inst.ID, "err", err)
+		return r.recordObservedError(ctx, inst, err)
+	}
+	// Resolve ${host.gateway} so a VM container (e.g. OpenWebUI) can reach a
+	// macOS host-service (e.g. Ollama on the VZ gateway). No-op on Pis (the
+	// gateway is empty there and Pi specs never use the placeholder).
+	spec.ExpandHostVars(r.hostGatewayIP)
+	r.markInstalling(ctx, inst)
+	applied, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
+	if err != nil {
+		r.log.Error("apply instance", "instance", inst.ID, "err", err)
+		if isTransientDockerErr(err) {
+			// docker momentarily unreachable (VM/bridge blip) — not an
+			// instance fault. Leave observed state untouched; next pass
+			// reports the truth once the bridge is back.
+			return false
+		}
+		return r.recordObservedError(ctx, inst, err)
+	}
+	if applied {
+		r.log.Info("applied", "instance", inst.ID, "template", inst.TemplateID)
+	}
+	// Register the manifest's named services so ingress bindings can
+	// route. We do this every reconcile (UpsertService is idempotent) so
+	// agent restarts and config drift converge cleanly.
+	for _, svc := range spec.Services {
+		if svc.Name == "" || svc.TargetPort == 0 {
+			continue
+		}
+		target := fmt.Sprintf("obacht-%s:%d", inst.ID, svc.TargetPort)
+		if err := r.store.UpsertService(ctx, store.InstanceService{
+			InstanceID:  inst.ID,
+			ServiceName: svc.Name,
+			TargetType:  "docker_dns",
+			Target:      target,
+		}); err != nil {
+			r.log.Warn("upsert service", "instance", inst.ID, "service", svc.Name, "err", err)
+		}
+	}
+	// Reflect the container's runtime state back to the api so the user
+	// sees their install transition to "installed". Templates that opt
+	// into IPC may overwrite this with finer-grained values later.
+	state := "installed"
+	if c, ok := observedByInstance[inst.ID]; ok && c.State != "" && c.State != "running" {
+		state = c.State
+	}
+	if err := r.store.SetObservedState(ctx, inst.ID, state, ""); err != nil {
+		r.log.Warn("record observed state", "instance", inst.ID, "err", err)
+	}
+	return applied || state != inst.ObservedState
+}
+
+// recordObservedError writes an 'error' observed state and reports whether
+// that was a transition (drives the immediate push — a repeatedly failing
+// instance must not re-push an identical snapshot every retry).
+func (r *Reconciler) recordObservedError(ctx context.Context, inst store.Instance, cause error) bool {
+	if err := r.store.SetObservedState(ctx, inst.ID, "error", cause.Error()); err != nil {
+		r.log.Warn("record observed error", "instance", inst.ID, "err", err)
+		return false
+	}
+	return inst.ObservedState != "error"
+}
+
+// reconcileContainerDown handles the fast, synchronous desired states of a
+// container instance (stopped/removed). Returns true when something changed.
+func (r *Reconciler) reconcileContainerDown(ctx context.Context, inst store.Instance) bool {
 	switch inst.DesiredState {
-	case store.DesiredInstalled:
-		spec, err := container.ParseSpec(inst.ConfigJSON)
-		if err != nil {
-			if errors.Is(err, container.ErrEmptySpec) {
-				r.log.Warn("instance has empty config_json, skipping", "instance", inst.ID)
-				return
-			}
-			r.log.Error("parse spec", "instance", inst.ID, "err", err)
-			return
-		}
-		if err := r.injectIPC(ctx, inst.ID, &spec); err != nil {
-			r.log.Error("inject ipc", "instance", inst.ID, "err", err)
-			return
-		}
-		if err := spec.ExpandSecrets(ctx, inst.ID, r.store); err != nil {
-			r.log.Error("expand secrets", "instance", inst.ID, "err", err)
-			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
-				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
-			}
-			return
-		}
-		// Resolve ${host.gateway} so a VM container (e.g. OpenWebUI) can reach a
-		// macOS host-service (e.g. Ollama on the VZ gateway). No-op on Pis (the
-		// gateway is empty there and Pi specs never use the placeholder).
-		spec.ExpandHostVars(r.hostGatewayIP)
-		changed, err := r.docker.Apply(ctx, inst.ID, inst.TemplateID, spec)
-		if err != nil {
-			r.log.Error("apply instance", "instance", inst.ID, "err", err)
-			if isTransientDockerErr(err) {
-				// docker momentarily unreachable (VM/bridge blip) — not an
-				// instance fault. Leave observed state untouched; next pass
-				// reports the truth once the bridge is back.
-				return
-			}
-			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
-				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
-			}
-			return
-		}
-		if changed {
-			r.log.Info("applied", "instance", inst.ID, "template", inst.TemplateID)
-		}
-		// Register the manifest's named services so ingress bindings can
-		// route. We do this every reconcile (UpsertService is idempotent) so
-		// agent restarts and config drift converge cleanly.
-		for _, svc := range spec.Services {
-			if svc.Name == "" || svc.TargetPort == 0 {
-				continue
-			}
-			target := fmt.Sprintf("obacht-%s:%d", inst.ID, svc.TargetPort)
-			if err := r.store.UpsertService(ctx, store.InstanceService{
-				InstanceID:  inst.ID,
-				ServiceName: svc.Name,
-				TargetType:  "docker_dns",
-				Target:      target,
-			}); err != nil {
-				r.log.Warn("upsert service", "instance", inst.ID, "service", svc.Name, "err", err)
-			}
-		}
-		// Reflect the container's runtime state back to the api so the user
-		// sees their install transition to "installed". Templates that opt
-		// into IPC may overwrite this with finer-grained values later.
-		state := "installed"
-		if c, ok := observedByInstance[inst.ID]; ok && c.State != "" && c.State != "running" {
-			state = c.State
-		}
-		if err := r.store.SetObservedState(ctx, inst.ID, state, ""); err != nil {
-			r.log.Warn("record observed state", "instance", inst.ID, "err", err)
-		}
 	case store.DesiredStopped:
-		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
+		removed, err := r.docker.Remove(ctx, inst.ID)
+		if err != nil {
 			r.log.Error("stop (remove) instance", "instance", inst.ID, "err", err)
+			return false
 		}
+		return removed
 	case store.DesiredRemoved:
 		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove instance", "instance", inst.ID, "err", err)
-			return
+			return false
 		}
 		if err := r.store.DropTemplateSecrets(ctx, inst.ID); err != nil {
 			r.log.Warn("drop template secrets", "instance", inst.ID, "err", err)
@@ -335,7 +635,9 @@ func (r *Reconciler) reconcileContainer(ctx context.Context, inst store.Instance
 		if err := r.store.DeleteInstance(ctx, inst.ID); err != nil {
 			r.log.Error("delete instance row", "instance", inst.ID, "err", err)
 		}
+		return true
 	}
+	return false
 }
 
 // reconcileSystem converges a single system-runtime instance. Exclusivity
@@ -435,71 +737,79 @@ func (r *Reconciler) injectIPC(ctx context.Context, instanceID string, spec *con
 	return nil
 }
 
-// reconcileCompose converges a single compose-runtime (bundle) instance.
-// Mirrors reconcileContainer but dispatches to the compose driver.
-func (r *Reconciler) reconcileCompose(ctx context.Context, inst store.Instance) {
+// applyCompose converges a single compose-runtime (bundle) instance towards
+// installed. Long-running (image pulls) — called from the worker, or inline
+// for RunOnce. Returns true when observable state changed.
+func (r *Reconciler) applyCompose(ctx context.Context, inst store.Instance) bool {
 	if r.compose == nil {
 		r.log.Warn("compose-runtime instance but no compose driver wired", "instance", inst.ID)
-		return
+		return false
+	}
+	spec, err := compose.ParseSpec(inst.ConfigJSON)
+	if err != nil {
+		if errors.Is(err, compose.ErrEmptySpec) {
+			r.log.Warn("compose instance has empty config_json, skipping", "instance", inst.ID)
+			return false
+		}
+		r.log.Error("parse compose spec", "instance", inst.ID, "err", err)
+		return r.recordObservedError(ctx, inst, err)
+	}
+	r.markInstalling(ctx, inst)
+	applied, err := r.compose.Apply(ctx, inst.ID, inst.TemplateID, spec)
+	if err != nil {
+		r.log.Error("apply compose instance", "instance", inst.ID, "err", err)
+		if isTransientDockerErr(err) {
+			return false // transient docker blip — see applyContainer
+		}
+		return r.recordObservedError(ctx, inst, err)
+	}
+	if applied {
+		r.log.Info("compose applied", "instance", inst.ID, "template", inst.TemplateID)
+	}
+	// Register the manifest's named services so ingress bindings can
+	// route. For compose runtimes the upstream is the docker-compose
+	// container DNS name, which is `obacht-<id>-<targetService>-1`.
+	for _, svc := range spec.Services {
+		if svc.Name == "" || svc.TargetPort == 0 || svc.TargetService == "" {
+			continue
+		}
+		target := fmt.Sprintf("%s:%d", compose.PrimaryContainerName(inst.ID, svc.TargetService), svc.TargetPort)
+		if err := r.store.UpsertService(ctx, store.InstanceService{
+			InstanceID:  inst.ID,
+			ServiceName: svc.Name,
+			TargetType:  "docker_dns",
+			Target:      target,
+		}); err != nil {
+			r.log.Warn("upsert compose service", "instance", inst.ID, "service", svc.Name, "err", err)
+		}
+	}
+	if err := r.store.SetObservedState(ctx, inst.ID, "installed", ""); err != nil {
+		r.log.Warn("record observed state", "instance", inst.ID, "err", err)
+	}
+	return applied || inst.ObservedState != "installed"
+}
+
+// reconcileComposeDown handles the fast, synchronous desired states of a
+// compose instance (stopped/removed). Returns true when something changed.
+func (r *Reconciler) reconcileComposeDown(ctx context.Context, inst store.Instance) bool {
+	if r.compose == nil {
+		r.log.Warn("compose-runtime instance but no compose driver wired", "instance", inst.ID)
+		return false
 	}
 	switch inst.DesiredState {
-	case store.DesiredInstalled:
-		spec, err := compose.ParseSpec(inst.ConfigJSON)
-		if err != nil {
-			if errors.Is(err, compose.ErrEmptySpec) {
-				r.log.Warn("compose instance has empty config_json, skipping", "instance", inst.ID)
-				return
-			}
-			r.log.Error("parse compose spec", "instance", inst.ID, "err", err)
-			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
-				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
-			}
-			return
-		}
-		changed, err := r.compose.Apply(ctx, inst.ID, inst.TemplateID, spec)
-		if err != nil {
-			r.log.Error("apply compose instance", "instance", inst.ID, "err", err)
-			if isTransientDockerErr(err) {
-				return // transient docker blip — see reconcileContainer
-			}
-			if obsErr := r.store.SetObservedState(ctx, inst.ID, "error", err.Error()); obsErr != nil {
-				r.log.Warn("record observed error", "instance", inst.ID, "err", obsErr)
-			}
-			return
-		}
-		if changed {
-			r.log.Info("compose applied", "instance", inst.ID, "template", inst.TemplateID)
-		}
-		// Register the manifest's named services so ingress bindings can
-		// route. For compose runtimes the upstream is the docker-compose
-		// container DNS name, which is `obacht-<id>-<targetService>-1`.
-		for _, svc := range spec.Services {
-			if svc.Name == "" || svc.TargetPort == 0 || svc.TargetService == "" {
-				continue
-			}
-			target := fmt.Sprintf("%s:%d", compose.PrimaryContainerName(inst.ID, svc.TargetService), svc.TargetPort)
-			if err := r.store.UpsertService(ctx, store.InstanceService{
-				InstanceID:  inst.ID,
-				ServiceName: svc.Name,
-				TargetType:  "docker_dns",
-				Target:      target,
-			}); err != nil {
-				r.log.Warn("upsert compose service", "instance", inst.ID, "service", svc.Name, "err", err)
-			}
-		}
-		if err := r.store.SetObservedState(ctx, inst.ID, "installed", ""); err != nil {
-			r.log.Warn("record observed state", "instance", inst.ID, "err", err)
-		}
 	case store.DesiredStopped:
 		// "Stopped" for compose is treated like Remove without GC of secrets
 		// or workspace; we still tear down containers.
-		if _, err := r.compose.Remove(ctx, inst.ID); err != nil {
+		removed, err := r.compose.Remove(ctx, inst.ID)
+		if err != nil {
 			r.log.Error("stop compose instance", "instance", inst.ID, "err", err)
+			return false
 		}
+		return removed
 	case store.DesiredRemoved:
 		if _, err := r.compose.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove compose instance", "instance", inst.ID, "err", err)
-			return
+			return false
 		}
 		if err := r.store.ReleaseLocksForInstance(ctx, inst.ID); err != nil {
 			r.log.Warn("release locks", "instance", inst.ID, "err", err)
@@ -507,5 +817,7 @@ func (r *Reconciler) reconcileCompose(ctx context.Context, inst store.Instance) 
 		if err := r.store.DeleteInstance(ctx, inst.ID); err != nil {
 			r.log.Error("delete instance row", "instance", inst.ID, "err", err)
 		}
+		return true
 	}
+	return false
 }
