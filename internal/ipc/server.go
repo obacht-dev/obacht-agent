@@ -110,6 +110,19 @@ func (s *Server) adminGuard(h http.HandlerFunc) http.HandlerFunc {
 // binding mutations and force reloads.
 func (s *Server) SetIngress(m IngressManager) { s.ingress = m }
 
+// ingressTriggerable is optionally implemented by the reconciler (C1): the
+// ingress loop runs decoupled from the reconcile pass, so domain/binding
+// mutations nudge it directly to converge in seconds even mid-install.
+type ingressTriggerable interface {
+	TriggerIngress()
+}
+
+func (s *Server) nudgeIngressLoop() {
+	if it, ok := s.rec.(ingressTriggerable); ok {
+		it.TriggerIngress()
+	}
+}
+
 // SetAudit wires the audit writer used by mutating handlers.
 func (s *Server) SetAudit(w *audit.Writer) { s.audit = w }
 
@@ -541,6 +554,7 @@ func (s *Server) adminUpsertDomain(w http.ResponseWriter, r *http.Request) {
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
+	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": body.Domain})
 }
 
@@ -555,6 +569,7 @@ func (s *Server) adminDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
+	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": d})
 }
 
@@ -589,6 +604,7 @@ func (s *Server) adminUpsertBinding(w http.ResponseWriter, r *http.Request) {
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
+	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": body.Domain})
 }
 
@@ -603,6 +619,7 @@ func (s *Server) adminDeleteBinding(w http.ResponseWriter, r *http.Request) {
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
+	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "unbound": d})
 }
 
@@ -633,6 +650,7 @@ func (s *Server) adminUpsertService(w http.ResponseWriter, r *http.Request) {
 	if s.rec != nil {
 		s.rec.Trigger()
 	}
+	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 

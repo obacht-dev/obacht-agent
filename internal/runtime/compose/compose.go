@@ -34,6 +34,7 @@ import (
 	"strings"
 
 	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
+	"github.com/obacht-dev/obacht-agent/internal/progress"
 )
 
 // ErrEmptySpec is returned by ParseSpec when config_json is empty.
@@ -175,6 +176,15 @@ type Driver struct {
 	log     *slog.Logger
 	secrets SecretProvider
 	docker  DockerCLI
+
+	// pullImage, when set, pre-pulls each image of a changed bundle via the
+	// docker REST API before `up -d`, so pulls flow through the same
+	// progress pipeline as single-container installs. Best-effort: pre-pull
+	// failures are logged and `up` retries the pull itself.
+	pullImage func(ctx context.Context, instanceID, image string) error
+
+	// prog receives transient phase reports (see internal/progress).
+	prog progress.Reporter
 }
 
 // New returns a Driver with the given workspace root.
@@ -182,8 +192,17 @@ func New(root string, secrets SecretProvider, docker DockerCLI, log *slog.Logger
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Driver{root: root, secrets: secrets, docker: docker, log: log.With("component", "compose")}
+	return &Driver{root: root, secrets: secrets, docker: docker, log: log.With("component", "compose"), prog: progress.Nop{}}
 }
+
+// SetImagePuller wires the REST-API image pre-pull (container driver).
+func (d *Driver) SetImagePuller(fn func(ctx context.Context, instanceID, image string) error) {
+	d.pullImage = fn
+}
+
+// SetProgress wires a progress sink. Must be wired before concurrent use of
+// the driver starts (main.go wires it before the reconciler runs).
+func (d *Driver) SetProgress(p progress.Reporter) { d.prog = progress.OrNop(p) }
 
 // dockerCmd builds an exec.Cmd for the configured docker CLI + args, with the
 // DOCKER_HOST/DOCKER_CONFIG overlay (Mac) or ambient env (Pi).
@@ -280,8 +299,31 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 		preUpImageIDs = d.projectImageIDs(ctx, instanceID)
 	}
 
+	// Pre-pull the bundle's images over the docker REST API so pulls report
+	// progress (PLAN-DEVICE-RESPONSIVENESS D1.2) and `up -d` itself starts
+	// in seconds. Only on changed bodies — steady-state reconciles skip it
+	// (the images are present; the puller's existence check would be cheap,
+	// but skipping keeps unchanged passes zero-docker-API). Best-effort by
+	// design: any pre-pull error falls through to `up`, which pulls with
+	// its own (progress-less) path exactly as before this feature.
+	if changed && d.pullImage != nil {
+		for _, ref := range imageRefs(body) {
+			if err := d.pullImage(ctx, instanceID, ref); err != nil {
+				d.log.Warn("pre-pull image (continuing, `up` will retry)",
+					"instance", instanceID, "image", ref, "err", err)
+				break
+			}
+		}
+		// A cancelled pre-pull (agent shutdown) must not fall through into
+		// a doomed `up -d` + misleading "starting" progress report.
+		if err := ctx.Err(); err != nil {
+			return changed, err
+		}
+	}
+
 	// Always run `up -d` so transient failures (image pull missed) recover
 	// on the next reconcile pass.
+	d.prog.Report(instanceID, progress.PhaseStarting, -1)
 	if err := d.runCompose(ctx, instanceID, "up", "-d", "--remove-orphans"); err != nil {
 		return changed, fmt.Errorf("compose up: %w", err)
 	}
@@ -677,6 +719,23 @@ func yamlEscapeInner(v string) string {
 func findUnsubstituted(body string) string {
 	m := anyPlaceholderRe.FindString(body)
 	return m
+}
+
+// imageRefs extracts the (already digest-pinned) image references from a
+// rendered compose body, deduplicated in order of appearance. Used for the
+// progress pre-pull; missing/odd lines are simply not pre-pulled.
+func imageRefs(body string) []string {
+	seen := map[string]bool{}
+	var refs []string
+	for _, m := range imageLineRe.FindAllStringSubmatch(body, -1) {
+		ref := m[3] + m[4] // bare ref + optional @sha256:… pin
+		if ref == "" || seen[ref] {
+			continue
+		}
+		seen[ref] = true
+		refs = append(refs, ref)
+	}
+	return refs
 }
 
 // pinImages rewrites `image: <ref>` lines to `image: <ref>@sha256:...` using

@@ -191,14 +191,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	go rec.Run(ctx)
+	// Compose pre-pull runs through the container driver's REST pull path so
+	// bundle installs share the pull-progress pipeline (D1.2). Wired
+	// unconditionally: without a WS/progress sink it is just a plain pull.
+	composeDrv.SetImagePuller(docker.PullImageFor)
 
 	// Backend channel (Socket.IO v4). Skipped if no server configured.
+	// NOTE: rec.Run starts *after* this block so the change notifier and
+	// progress sink are wired before the first reconcile pass (no races).
 	if cfg.Server.URL != "" && authToken != "" {
 		wsClient := api.New(cfg.Server.URL, authToken, log.With("component", "ws"))
 		syncer := syncpkg.New(wsClient, st, rec, cfg.Server.DeviceID, agentVersion, log.With("component", "sync"), auditW)
 		syncer.SetCompose(composeDrv)
 		syncer.SetWireguardIPOverride(cfg.Telemetry.WireguardIP)
+
+		// Device-responsiveness wiring (PLAN-DEVICE-RESPONSIVENESS-V1):
+		// real state transitions push observed snapshots immediately (A2),
+		// and pull/create/start phases stream as transient, never-persisted
+		// progress events (D1).
+		rec.SetChangeNotifier(syncer.PushNow)
+		rec.SetProgress(syncer)
+		docker.SetProgress(syncer)
+		composeDrv.SetProgress(syncer)
 
 		// Signed mutations: load the user pubkeys pinned at enrollment.
 		// No keys -> capability not advertised, handler denies everything.
@@ -226,6 +240,8 @@ func main() {
 	} else {
 		log.Info("backend channel disabled (no server.url or auth token)")
 	}
+
+	go rec.Run(ctx)
 
 	<-ctx.Done()
 	log.Info("agent shutting down")

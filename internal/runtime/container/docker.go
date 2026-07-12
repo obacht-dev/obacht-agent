@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
+	"github.com/obacht-dev/obacht-agent/internal/progress"
 )
 
 // obachtDataRoot is the agent's on-disk data root. On a Pi the Docker image
@@ -58,6 +59,10 @@ type Driver struct {
 	http    *http.Client
 	pullCli *http.Client // long-running, no overall timeout (image pulls)
 	log     *slog.Logger
+
+	// prog receives transient pull/create/start progress for UX feedback.
+	// Never persisted (see internal/progress). Defaults to a no-op.
+	prog progress.Reporter
 }
 
 // New returns a Driver pointing at the given unix socket path.
@@ -76,6 +81,7 @@ func New(socketPath string) *Driver {
 		http:    &http.Client{Transport: tr, Timeout: 30 * time.Second},
 		pullCli: &http.Client{Transport: tr}, // image pulls can legitimately take minutes on arm/v7
 		log:     slog.Default().With("component", "docker"),
+		prog:    progress.Nop{},
 	}
 }
 
@@ -112,8 +118,18 @@ func isTransientNetErr(err error) bool {
 
 // PullImage pulls an image if it is not already present locally.
 func (d *Driver) PullImage(ctx context.Context, image string) error {
-	return d.pullIfMissing(ctx, image)
+	return d.pullIfMissing(ctx, "", image)
 }
+
+// PullImageFor is PullImage with progress attribution to an instance, used
+// by the compose driver's pre-pull so bundle installs report pull percent.
+func (d *Driver) PullImageFor(ctx context.Context, instanceID, image string) error {
+	return d.pullIfMissing(ctx, instanceID, image)
+}
+
+// SetProgress wires a progress sink. Must be wired before concurrent use of
+// the driver starts (main.go wires it before the reconciler runs).
+func (d *Driver) SetProgress(p progress.Reporter) { d.prog = progress.OrNop(p) }
 
 // Ping verifies that the Docker daemon is reachable.
 func (d *Driver) Ping(ctx context.Context) error {
@@ -436,13 +452,15 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 		}
 	}
 
-	if err := d.pullIfMissing(ctx, spec.Image); err != nil {
+	if err := d.pullIfMissing(ctx, instanceID, spec.Image); err != nil {
 		return false, fmt.Errorf("pull image %s: %w", spec.Image, err)
 	}
 
+	d.prog.Report(instanceID, progress.PhaseCreating, -1)
 	if err := d.create(ctx, containerName, instanceID, templateID, hash, spec); err != nil {
 		return false, fmt.Errorf("create container: %w", err)
 	}
+	d.prog.Report(instanceID, progress.PhaseStarting, -1)
 	if err := d.start(ctx, containerName); err != nil {
 		return false, fmt.Errorf("start container: %w", err)
 	}
@@ -561,7 +579,7 @@ func (d *Driver) findByName(ctx context.Context, name string) (*containerSummary
 	return &containerSummary{ID: c.ID, Name: cn, State: c.State, Labels: c.Labels, ImageID: c.ImageID}, nil
 }
 
-func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
+func (d *Driver) pullIfMissing(ctx context.Context, instanceID, image string) error {
 	// Cheap existence check via /images/{image}/json.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/v1.43/images/"+url.PathEscape(image)+"/json", nil)
 	resp, err := d.http.Do(req)
@@ -599,8 +617,12 @@ func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
 		body, _ := io.ReadAll(pullResp.Body)
 		return fmt.Errorf("pull failed: %d %s", pullResp.StatusCode, string(body))
 	}
-	// Drain the JSON-stream so the pull completes before we return.
-	_, _ = io.Copy(io.Discard, pullResp.Body)
+	// Consume the JSON-stream until the pull completes. Docker emits one
+	// JSON object per layer event ({status, id, progressDetail:{current,
+	// total}}); we aggregate them into a coarse overall percent for the
+	// progress sink (finding F3 — this data used to be io.Discard-ed).
+	// Decode failures degrade to draining: the pull itself is unaffected.
+	d.consumePullStream(instanceID, image, pullResp.Body)
 	// SEC-25: if the ref is digest-pinned, confirm the daemon actually
 	// materialised that digest before we run it. Docker normally refuses to
 	// pull a mismatched digest, but verifying RepoDigests here fails closed
@@ -609,6 +631,84 @@ func (d *Driver) pullIfMissing(ctx context.Context, image string) error {
 		return err
 	}
 	return nil
+}
+
+// consumePullStream reads docker's /images/create JSON event stream to
+// completion, reporting an aggregated pull percent to the progress sink.
+// Percent = sum(current)/sum(total) over layers that advertise a total;
+// while no layer has a known total yet we report -1 (indeterminate).
+// Event-throttling (max ~1/2s) is the sink's job, not ours. Never fails:
+// on a malformed stream we silently drain the rest so the pull finishes.
+func (d *Driver) consumePullStream(instanceID, image string, body io.Reader) {
+	if instanceID == "" {
+		_, _ = io.Copy(io.Discard, body)
+		return
+	}
+	type layerState struct{ current, total int64 }
+	layers := map[string]*layerState{}
+	// High-water mark: the aggregate denominator grows as layers announce
+	// their totals, which would make the naive percent jump backwards. A
+	// progress bar must be monotonic, so we only ever report increases.
+	maxPct := -1
+	dec := json.NewDecoder(body)
+	for {
+		var ev struct {
+			Status         string `json:"status"`
+			ID             string `json:"id"`
+			ProgressDetail struct {
+				Current int64 `json:"current"`
+				Total   int64 `json:"total"`
+			} `json:"progressDetail"`
+		}
+		if err := dec.Decode(&ev); err != nil {
+			if err != io.EOF {
+				d.log.Debug("pull stream decode", "image", image, "err", err)
+				_, _ = io.Copy(io.Discard, body)
+			}
+			return
+		}
+		if ev.ID == "" {
+			continue
+		}
+		ls, ok := layers[ev.ID]
+		if !ok {
+			ls = &layerState{}
+			layers[ev.ID] = ls
+		}
+		// Percent tracks the DOWNLOAD phase only. "Extracting" events reuse
+		// progressDetail with the (different) uncompressed size — letting
+		// them overwrite the download totals corrupts the aggregate and,
+		// with the monotonic clamp, freezes the bar. Extraction shows as
+		// the bar holding at its final download percent, which is honest
+		// enough for a coarse install indicator.
+		switch ev.Status {
+		case "Downloading":
+			if ev.ProgressDetail.Total > 0 {
+				ls.total = ev.ProgressDetail.Total
+				ls.current = ev.ProgressDetail.Current
+			}
+		case "Download complete", "Already exists":
+			if ls.total > 0 {
+				ls.current = ls.total
+			}
+		default:
+			continue
+		}
+		var cur, tot int64
+		for _, l := range layers {
+			cur += l.current
+			tot += l.total
+		}
+		pct := -1
+		if tot > 0 {
+			pct = int(cur * 100 / tot)
+			if pct < maxPct {
+				pct = maxPct
+			}
+			maxPct = pct
+		}
+		d.prog.Report(instanceID, progress.PhasePulling, pct)
+	}
 }
 
 // verifyPulledDigest checks that, when image is pinned as repo@sha256:<hex>,
