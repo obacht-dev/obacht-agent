@@ -26,7 +26,31 @@ var allowedServiceKeys = map[string]bool{
 	"labels": true, "networks": true, "tmpfs": true, "read_only": true,
 	"user": true, "working_dir": true, "cap_drop": true, "security_opt": true,
 	"stop_grace_period": true, "stop_signal": true, "sysctls": true,
-	"shm_size": true, "mem_limit": true, "cpus": true, "init": true, "env_file": true,
+	"shm_size": true, "mem_limit": true, "cpus": true, "init": true,
+}
+
+// Keys forbidden on a top-level volume definition. `driver`/`driver_opts` allow
+// a local bind of the host filesystem (driver_opts: {type: none, o: bind,
+// device: /}) — a full sandbox escape — and `external`/`name` let a bundle
+// mount another instance's data volume. Only an empty/default named volume
+// (optionally flagged x-obacht-data) is permitted.
+var forbiddenVolumeKeys = map[string]string{
+	"driver":      "custom volume drivers can bind-mount the host filesystem",
+	"driver_opts": "driver_opts can bind-mount the host filesystem",
+	"external":    "external volumes can mount another instance's data",
+	"name":        "explicit volume names can target another instance's volume",
+}
+
+// Keys forbidden on a top-level network definition. `external`/`name` let a
+// bundle join obacht-edge (direct L3 access to every other bundle) and
+// `driver`/`driver_opts` (e.g. macvlan) give the container a raw LAN presence,
+// both defeating bundle isolation. The agent creates and wires the network
+// itself, so user bodies only ever need a plain named network.
+var forbiddenNetworkKeys = map[string]string{
+	"external":    "external networks can join obacht-edge / other bundles",
+	"name":        "explicit network names can target obacht-managed networks",
+	"driver":      "custom network drivers (e.g. macvlan) bypass bundle isolation",
+	"driver_opts": "network driver_opts bypass bundle isolation",
 }
 
 var forbiddenServiceKeys = map[string]string{
@@ -49,6 +73,7 @@ var forbiddenServiceKeys = map[string]string{
 	"userns_mode":    "namespace bypass not allowed",
 	"cgroup_parent":  "not allowed",
 	"pids_limit":     "not allowed",
+	"env_file":       "reads an arbitrary agent-readable host file — use environment: with ${cfg.x}/${secret.x}",
 }
 
 // ValidateComposeBody parses the rendered compose YAML and rejects the first
@@ -82,8 +107,16 @@ func ValidateComposeBody(body string) error {
 
 	declaredVolumes := map[string]bool{}
 	if vols, ok := doc["volumes"].(map[string]any); ok {
+		if err := validateTopLevelDefs("volume", vols, forbiddenVolumeKeys); err != nil {
+			return err
+		}
 		for v := range vols {
 			declaredVolumes[v] = true
+		}
+	}
+	if nets, ok := doc["networks"].(map[string]any); ok {
+		if err := validateTopLevelDefs("network", nets, forbiddenNetworkKeys); err != nil {
+			return err
 		}
 	}
 
@@ -118,6 +151,49 @@ func ValidateComposeBody(body string) error {
 				if err := validateServiceVolumes(svcName, svc[k], declaredVolumes); err != nil {
 					return err
 				}
+			}
+		}
+	}
+	return nil
+}
+
+// validateTopLevelDefs rejects dangerous keys on each top-level volume/network
+// definition. A definition may be null (empty map / default) or a mapping that
+// only carries safe keys (labels, and the x-obacht-data marker on volumes); any
+// key in `forbidden` fails closed. This is the guard that stops a user body
+// from bind-mounting the host (volumes) or joining obacht-edge (networks).
+func validateTopLevelDefs(kind string, defs map[string]any, forbidden map[string]string) error {
+	names := make([]string, 0, len(defs))
+	for name := range defs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		def := defs[name]
+		if def == nil {
+			continue // `myvol:` with no body — the safe, default case.
+		}
+		m, ok := def.(map[string]any)
+		if !ok {
+			return fmt.Errorf("compose body: %s %q definition must be a mapping", kind, name)
+		}
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			if strings.HasPrefix(k, "x-") {
+				if k != "x-obacht-data" {
+					return fmt.Errorf("compose body: %s %q forbidden extension %q (only x-obacht-data allowed)", kind, name, k)
+				}
+				continue
+			}
+			if reason, bad := forbidden[k]; bad {
+				return fmt.Errorf("compose body: %s %q.%s forbidden — %s", kind, name, k, reason)
+			}
+			if k != "labels" {
+				return fmt.Errorf("compose body: %s %q unknown key %q", kind, name, k)
 			}
 		}
 	}
