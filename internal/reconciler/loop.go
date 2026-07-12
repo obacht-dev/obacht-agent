@@ -91,19 +91,24 @@ type Reconciler struct {
 	// dedupes enqueues (including against the in-flight job, so a 5-minute
 	// pull isn't re-queued by every 30s tick behind itself); workActive is
 	// the instance currently applying.
-	workMu      sync.Mutex
-	workQueue   []applyJob
-	workPending map[string]bool
-	workActive  string
-	workKick    chan struct{}
+	workMu          sync.Mutex
+	workQueue       []applyJob
+	workPending     map[string]bool
+	workActive      string
+	workActiveFirst bool
+	workKick        chan struct{}
 }
 
 // applyJob carries everything the worker needs so steady-state drains do no
 // extra docker round-trips: the pass's observed-container snapshot is shared
-// (read-only) — the same staleness the old inline pass had.
+// (read-only) — the same staleness the old inline pass had. firstInstall
+// (observed was empty/pending/installing at enqueue) marks jobs that are
+// real user-visible installs, as opposed to the cheap no-op re-checks every
+// pass pushes through the same queue.
 type applyJob struct {
-	instanceID string
-	observed   map[string]container.ManagedContainer
+	instanceID   string
+	observed     map[string]container.ManagedContainer
+	firstInstall bool
 }
 
 // IngressApplier is the subset of the ingress manager the reconciler uses.
@@ -187,14 +192,22 @@ func (r *Reconciler) TriggerIngress() {
 // ActiveWork reports the instance currently applying (empty if idle) and the
 // queued instance IDs, FIFO. Transient runtime data — surfaced via the
 // observed-state push (`active_work`) and obachtctl, never persisted by the
-// backend.
+// backend. Only FIRST installs are reported: the steady-state pass drains
+// every healthy instance through the same queue as cheap no-op checks, and
+// exposing those made the UI claim "N waiting in queue" after any trigger
+// (e.g. an unrelated uninstall).
 func (r *Reconciler) ActiveWork() (active string, queued []string) {
 	r.workMu.Lock()
 	defer r.workMu.Unlock()
 	for _, j := range r.workQueue {
-		queued = append(queued, j.instanceID)
+		if j.firstInstall {
+			queued = append(queued, j.instanceID)
+		}
 	}
-	return r.workActive, queued
+	if r.workActiveFirst {
+		active = r.workActive
+	}
+	return active, queued
 }
 
 // workerBusyWith reports whether the worker currently applies or has queued
@@ -280,12 +293,13 @@ func (r *Reconciler) enqueueApply(inst store.Instance, observed map[string]conta
 		r.workMu.Unlock()
 		return
 	}
+	first := isFirstInstallState(inst.ObservedState)
 	r.workPending[inst.ID] = true
-	r.workQueue = append(r.workQueue, applyJob{instanceID: inst.ID, observed: observed})
+	r.workQueue = append(r.workQueue, applyJob{instanceID: inst.ID, observed: observed, firstInstall: first})
 	busy := r.workActive != ""
 	r.workMu.Unlock()
 
-	if busy && isFirstInstallState(inst.ObservedState) {
+	if busy && first {
 		r.prog.Report(inst.ID, progress.PhaseQueued, -1)
 	}
 	select {
@@ -323,12 +337,14 @@ func (r *Reconciler) runApplyWorker(ctx context.Context) {
 			r.workQueue = r.workQueue[1:]
 			delete(r.workPending, job.instanceID)
 			r.workActive = job.instanceID
+			r.workActiveFirst = job.firstInstall
 			r.workMu.Unlock()
 
 			changed := r.applyOne(ctx, job)
 
 			r.workMu.Lock()
 			r.workActive = ""
+			r.workActiveFirst = false
 			r.workMu.Unlock()
 
 			if changed {

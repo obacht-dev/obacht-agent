@@ -304,9 +304,28 @@ func (s *Server) adminListInstances(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
+	// C2.5: surface the serial apply queue so power users can see WHY an
+	// install is waiting ("work_state": applying|queued). Optional
+	// interface — reported for real first installs only (see
+	// reconciler.ActiveWork), transient, never persisted.
+	active, queuedSet := "", map[string]bool{}
+	if aw, ok := s.rec.(interface{ ActiveWork() (string, []string) }); ok {
+		var queued []string
+		active, queued = aw.ActiveWork()
+		for _, id := range queued {
+			queuedSet[id] = true
+		}
+	}
 	out := make([]map[string]any, 0, len(insts))
 	for _, i := range insts {
-		out = append(out, instanceToMap(&i))
+		m := instanceToMap(&i)
+		switch {
+		case active != "" && i.ID == active:
+			m["work_state"] = "applying"
+		case queuedSet[i.ID]:
+			m["work_state"] = "queued"
+		}
+		out = append(out, m)
 	}
 	writeJSON(w, http.StatusOK, out)
 }
