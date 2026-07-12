@@ -309,6 +309,21 @@ chown -R "obacht:$log_group" /var/log/obacht
 chmod 0750 /var/log/obacht
 
 # ---------------------------------------------------------------------------
+# C3 (PLAN-DEVICE-RESPONSIVENESS): cap parallel image-layer downloads so a
+# large template pull does not starve sshd/the agent on SD-card devices.
+# FRESH INSTALLS ONLY and only when the host has no daemon.json at all -
+# existing devices are never reconfigured remotely (self-update skips this
+# block entirely), and a hand-crafted daemon.json is never overwritten.
+# ---------------------------------------------------------------------------
+if [ "${SELF_UPDATE:-0}" != "1" ] && [ ! -f /etc/docker/daemon.json ]; then
+  echo "==> writing /etc/docker/daemon.json (max-concurrent-downloads: 2)"
+  mkdir -p /etc/docker
+  printf '{\n  "max-concurrent-downloads": 2\n}\n' > /etc/docker/daemon.json
+  # Fresh device: restarting dockerd is safe (no user containers yet).
+  systemctl restart docker || echo "WARN: docker restart failed; setting applies on next docker restart"
+fi
+
+# ---------------------------------------------------------------------------
 # S5.4: scrub the v1 NOPASSWD:ALL sudoers fragment if it's still around.
 # v1 (Python agent) installed `/etc/sudoers.d/obacht` with full passwordless
 # root - exactly the blast radius v2 is designed to remove. We drop it on
