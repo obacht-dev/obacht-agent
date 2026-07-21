@@ -80,3 +80,51 @@ spec:
 		t.Fatalf("expected unsupported-runtime error, got %v", err)
 	}
 }
+
+const kioskManifest = `
+apiVersion: obacht.dev/v2
+kind: Template
+metadata: { name: kiosk-mode, version: "1.0.0" }
+spec:
+  exclusivityGroup: display-output
+  runtime:
+    type: system
+    system:
+      kiosk: {}
+      files:
+        - path: /etc/obacht/kiosk/config.env
+          content: "KIOSK_URL=${cfg.url}\n"
+  configSchema:
+    - { key: url, label: URL, type: text }
+`
+
+func TestMaterialize_Kiosk(t *testing.T) {
+	res, err := Materialize([]byte(kioskManifest), map[string]any{"url": "https://ok.example"}, "i", "kiosk-mode")
+	if err != nil {
+		t.Fatalf("materialize kiosk: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(res.Config, &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["kiosk"]; !ok {
+		t.Errorf("kiosk marker missing: %s", res.Config)
+	}
+	if got["exclusivity_group"] != "display-output" {
+		t.Errorf("exclusivity group missing: %s", res.Config)
+	}
+	files, _ := got["files"].([]any)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file, got %s", res.Config)
+	}
+}
+
+// A control character in a user config value must be rejected for a system
+// template — it would inject a structural line into the rendered file.
+func TestMaterialize_SystemRejectsControlCharInConfig(t *testing.T) {
+	_, err := Materialize([]byte(kioskManifest),
+		map[string]any{"url": "https://ok\nLD_PRELOAD=/tmp/evil.so"}, "i", "kiosk-mode")
+	if err == nil || !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("expected control-character rejection, got %v", err)
+	}
+}

@@ -219,14 +219,33 @@ CONF=/etc/obacht/kiosk/config.env
 KIOSK_URL="https://obacht.dev"
 KIOSK_ZOOM=""
 KIOSK_HIDE_CURSOR="true"
-# shellcheck disable=SC1090
-[ -r "$CONF" ] && . "$CONF"
 
-# Only http(s) URLs (defence in depth; the agent already validates).
+# Parse config.env as strict KEY=value DATA — never `source` it. `read` reads
+# one physical line, so a value cannot inject a newline+statement, and the
+# values are only ever used as quoted data below. This is the security
+# boundary against a hostile config.env (the template author / install caller
+# controls its content).
+if [ -r "$CONF" ]; then
+  while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+    case "$_k" in
+      KIOSK_URL)         KIOSK_URL="$_v" ;;
+      KIOSK_ZOOM)        KIOSK_ZOOM="$_v" ;;
+      KIOSK_HIDE_CURSOR) KIOSK_HIDE_CURSOR="$_v" ;;
+    esac
+  done < "$CONF"
+fi
+
+# Validate each value before use (defence in depth; the values are already
+# quoted data, but keep them well-formed).
 case "$KIOSK_URL" in
   http://*|https://*) : ;;
   *) KIOSK_URL="https://obacht.dev" ;;
 esac
+# Zoom must be a bare decimal or it is ignored.
+case "$KIOSK_ZOOM" in
+  ''|*[!0-9.]*) KIOSK_ZOOM="" ;;
+esac
+[ "$KIOSK_HIDE_CURSOR" = "false" ] || KIOSK_HIDE_CURSOR="true"
 
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export HOME="${HOME:-/var/lib/obacht-kiosk}"

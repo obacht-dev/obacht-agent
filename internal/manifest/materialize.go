@@ -327,6 +327,18 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 	if _, has := sysBlock["unitTemplate"]; has {
 		return nil, fmt.Errorf("the free-form unitName/unitTemplate system flavor was withdrawn (spec v2.8) — use managed_service")
 	}
+	// Security: user config values are substituted verbatim into system-template
+	// file bodies (mediamtx.yml, kiosk config.env). A control character in a
+	// value is structural — a newline can inject a second key=value line into
+	// config.env or a new directive into a rendered config. System templates
+	// have no multi-line (textarea) fields, so reject any control char in a
+	// value up front. This closes the injection class for every system flavor
+	// regardless of how the on-device file is later parsed.
+	for k, v := range userConfig {
+		if s, ok := v.(string); ok && strings.ContainsAny(s, "\x00\n\r") {
+			return nil, fmt.Errorf("config value for %q contains a control character (not allowed in a system template)", k)
+		}
+	}
 	subst := newSubstituter(userConfig, instanceID, templateID)
 
 	hs, _ := sysBlock["host_service"].(map[string]any)

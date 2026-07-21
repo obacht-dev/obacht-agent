@@ -268,13 +268,31 @@ const (
 	kioskUnitPath    = "/etc/systemd/system/obacht-kiosk.service"
 	kioskUser        = "obacht-kiosk"
 	kioskSessionExec = "/opt/obacht-agent/libexec/obacht-kiosk-session"
-	kioskRestorePath = "/var/lib/obacht/system/restore/kiosk-dm"
+	// kioskRestoreDir is ROOT-owned (0700) and has no obacht-writable
+	// ancestor — critical, because its content (the display-manager name) is
+	// replayed to `systemctl`. If the agent could write it, it would gain a
+	// root primitive to enable/start/stop/disable any unit. The helper (root)
+	// creates it; /var/lib is root-owned so no ancestor is agent-writable.
+	kioskRestoreDir  = "/var/lib/obacht-power"
+	kioskRestorePath = "/var/lib/obacht-power/kiosk-dm"
 	// Display managers we know how to stand down + restore. Ordered; the
 	// first one that is enabled is the one we snapshot.
 	// (Pi OS ships lightdm.)
 )
 
 var knownDisplayManagers = []string{"lightdm", "gdm3", "gdm", "sddm", "greetd"}
+
+// isKnownDM guards every systemctl call that takes a snapshot-derived name, so
+// a tampered snapshot can never escape the display-manager set into an
+// arbitrary-unit enable/start/stop/disable.
+func isKnownDM(dm string) bool {
+	for _, k := range knownDisplayManagers {
+		if dm == k {
+			return true
+		}
+	}
+	return false
+}
 
 // kioskUnitContent is the FIXED kiosk unit. Runs the agent-shipped session
 // script as the unprivileged obacht-kiosk user on tty1 with a real login
@@ -406,13 +424,14 @@ func snapshotAndStopDM() error {
 	if _, err := os.Stat(kioskRestorePath); err == nil {
 		// Already snapshotted — just make sure the recorded DM is down.
 		data, _ := os.ReadFile(kioskRestorePath)
-		if dm := strings.TrimSpace(string(data)); dm != "" && dm != "none" {
+		if dm := strings.TrimSpace(string(data)); isKnownDM(dm) {
 			_ = runSystemctl("stop", dm)
 			_ = runSystemctl("disable", dm)
 		}
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(kioskRestorePath), 0o755); err != nil {
+	// Root-owned, 0700, no obacht-writable ancestor (see kioskRestoreDir).
+	if err := os.MkdirAll(kioskRestoreDir, 0o700); err != nil {
 		return err
 	}
 	active := "none"
@@ -442,7 +461,7 @@ func restoreDM() error {
 		return err
 	}
 	dm := strings.TrimSpace(string(data))
-	if dm != "" && dm != "none" {
+	if isKnownDM(dm) {
 		_ = runSystemctl("enable", dm)
 		_ = runSystemctl("start", dm)
 	}

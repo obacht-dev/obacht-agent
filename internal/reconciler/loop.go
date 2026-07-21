@@ -693,6 +693,12 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 		spec, err := system.ParseSpec(inst.ConfigJSON)
 		if err != nil {
 			r.log.Warn("parse system spec on remove (continuing)", "instance", inst.ID, "err", err)
+			// Validation failed but we must still tear down the right flavor —
+			// a mis-teardown of a kiosk would leave the display manager off.
+			// Recover the flavor leniently so Remove routes correctly.
+			if system.DetectFlavor(inst.ConfigJSON) == "kiosk" {
+				spec = system.Spec{Kiosk: &system.KioskSpec{}}
+			}
 		}
 		if err := r.system.Remove(ctx, inst.ID, spec); err != nil {
 			r.log.Error("remove system instance", "instance", inst.ID, "err", err)

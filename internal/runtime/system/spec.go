@@ -330,6 +330,36 @@ type File struct {
 	Content string `json:"content"`
 }
 
+// DetectFlavor leniently extracts which flavor a config_json declares, WITHOUT
+// running full validation. Used on the remove path so a kiosk instance whose
+// config_json fails Validate() (e.g. a since-tightened file rule) is still
+// torn down as a kiosk — restoring the display manager — rather than
+// misrouted to managed-service teardown. Returns "kiosk", "managed",
+// "host_service", or "".
+func DetectFlavor(configJSON string) string {
+	if configJSON == "" {
+		return ""
+	}
+	var probe struct {
+		HostService    *json.RawMessage `json:"host_service"`
+		ManagedService *json.RawMessage `json:"managed_service"`
+		Kiosk          *json.RawMessage `json:"kiosk"`
+	}
+	if err := json.Unmarshal([]byte(configJSON), &probe); err != nil {
+		return ""
+	}
+	switch {
+	case probe.Kiosk != nil:
+		return "kiosk"
+	case probe.ManagedService != nil:
+		return "managed"
+	case probe.HostService != nil:
+		return "host_service"
+	default:
+		return ""
+	}
+}
+
 // ParseSpec parses an instance.config_json blob into a system Spec.
 func ParseSpec(configJSON string) (Spec, error) {
 	if configJSON == "" {

@@ -22,14 +22,21 @@ const maxManagedDownloadBytes = 512 << 20
 
 // EnsureManagedBinary makes sure the digest-pinned binary for a managed
 // service exists at its content-addressed path and returns that path.
-// Mirrors the darwin host-service contract: https from an allowlisted host,
-// full sha256 verification BEFORE any extract/exec, tgz-only archives.
-// Runs entirely unprivileged (the bin root is agent-owned); the root helper
-// never downloads anything.
+// Mirrors the darwin host-service contract: https from an allowlisted host
+// (re-checked on every redirect hop), full sha256 verification BEFORE any
+// extract/exec, tgz-only archives. Runs entirely unprivileged (the bin root
+// is agent-owned); the root helper never downloads anything.
 //
 // The layout is content-addressed (<BinRoot>/<digest>/<binary>), so a
 // version bump lands in a fresh directory and the running unit keeps its
 // binary until the regenerated unit is installed — updates are atomic.
+//
+// Trust note: a cache hit (the content-addressed file already exists) is
+// returned without re-hashing. The bin root is agent-writable, so this does
+// NOT defend against a compromised agent — which can already run arbitrary
+// code via the docker socket, a strictly greater capability than a confined
+// DynamicUser workload. The sha256 check is an integrity control against a
+// corrupted/substituted DOWNLOAD, not against the agent process itself.
 func EnsureManagedBinary(ms ManagedServiceSpec) (string, error) {
 	if err := ms.validate(); err != nil {
 		return "", err
@@ -51,7 +58,20 @@ func EnsureManagedBinary(ms ManagedServiceSpec) (string, error) {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName)
 
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{
+		Timeout: 10 * time.Minute,
+		// Re-validate scheme+host on every redirect hop so an allowlisted host
+		// that 302s to a LAN/metadata address (169.254.169.254, …) is refused.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("too many redirects")
+			}
+			if req.URL.Scheme != "https" || !allowedDownloadHosts[req.URL.Host] {
+				return fmt.Errorf("redirect to disallowed target %q", req.URL.Redacted())
+			}
+			return nil
+		},
+	}
 	resp, err := client.Get(ms.BinaryURL)
 	if err != nil {
 		tmp.Close()
