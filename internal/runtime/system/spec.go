@@ -117,7 +117,20 @@ type Spec struct {
 	// helper obacht-power-toggle independently re-validates it against
 	// internal/unitpolicy before installing. Requires Power Mode.
 	ManagedService *ManagedServiceSpec `json:"managed_service,omitempty"`
+
+	// Kiosk (spec v2.8), when set, makes this the agent-shipped kiosk session
+	// (Chromium fullscreen on the device's preinstalled desktop). ALL
+	// privileged behaviour — disabling the display manager, creating the
+	// obacht-kiosk user, installing the fixed kiosk unit — lives in the root
+	// helper `obacht-power-toggle kiosk enable`; the driver only writes the
+	// instance's config.env (via Files) and toggles the helper. The struct is
+	// an empty marker; the URL etc. flow through Files. Requires Power Mode.
+	Kiosk *KioskSpec `json:"kiosk,omitempty"`
 }
+
+// KioskSpec is the empty marker for the kiosk flavor. All behaviour is
+// agent-/helper-shipped; the template contributes only files (config.env).
+type KioskSpec struct{}
 
 // HostServiceSpec describes a service obacht runs directly on the macOS host
 // (outside the VM) as a user LaunchAgent — e.g. Ollama, which needs full
@@ -349,8 +362,11 @@ func (s Spec) Validate() error {
 	if s.ManagedService != nil {
 		flavors++
 	}
+	if s.Kiosk != nil {
+		flavors++
+	}
 	if flavors != 1 {
-		return errors.New("system spec: exactly one of host_service or managed_service is required")
+		return errors.New("system spec: exactly one of host_service, managed_service or kiosk is required")
 	}
 	for _, f := range s.Files {
 		if f.Path == "" {
@@ -363,5 +379,19 @@ func (s Spec) Validate() error {
 	if s.HostService != nil {
 		return s.HostService.validate()
 	}
-	return s.ManagedService.validate()
+	if s.ManagedService != nil {
+		return s.ManagedService.validate()
+	}
+	// Kiosk: the marker itself has nothing to validate; its files are checked
+	// above. The kiosk config.env must live under /etc/obacht/kiosk/ — enforce
+	// that here so a kiosk spec cannot drop files elsewhere in the allowlist.
+	for _, f := range s.Files {
+		if f.Path == "" {
+			continue
+		}
+		if !strings.HasPrefix(f.Path, "/etc/obacht/kiosk/") {
+			return fmt.Errorf("kiosk spec: file path %q must live under /etc/obacht/kiosk/", f.Path)
+		}
+	}
+	return nil
 }

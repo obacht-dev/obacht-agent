@@ -327,18 +327,40 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 	if _, has := sysBlock["unitTemplate"]; has {
 		return nil, fmt.Errorf("the free-form unitName/unitTemplate system flavor was withdrawn (spec v2.8) — use managed_service")
 	}
-	if _, has := sysBlock["kiosk"]; has {
-		return nil, fmt.Errorf("the kiosk system flavor is not supported by this agent version")
-	}
 	subst := newSubstituter(userConfig, instanceID, templateID)
 
 	hs, _ := sysBlock["host_service"].(map[string]any)
 	ms, _ := sysBlock["managed_service"].(map[string]any)
-	if hs == nil && ms == nil {
+	_, hasKiosk := sysBlock["kiosk"]
+
+	flavorCount := 0
+	for _, present := range []bool{hs != nil, ms != nil, hasKiosk} {
+		if present {
+			flavorCount++
+		}
+	}
+	if flavorCount == 0 {
 		return nil, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", "system")
 	}
-	if hs != nil && ms != nil {
-		return nil, fmt.Errorf("spec.runtime.system: host_service and managed_service are mutually exclusive")
+	if flavorCount > 1 {
+		return nil, fmt.Errorf("spec.runtime.system: host_service, managed_service and kiosk are mutually exclusive")
+	}
+
+	// Kiosk flavor: an empty marker plus the rendered files (config.env) and
+	// exclusivity group. No binary, no substitution beyond the files.
+	if hasKiosk {
+		wrapper := map[string]any{"kiosk": map[string]any{}}
+		if files := materializeSystemFiles(sysBlock, subst); files != nil {
+			wrapper["files"] = files
+		}
+		if eg := toString(spec["exclusivityGroup"]); eg != "" {
+			wrapper["exclusivity_group"] = eg
+		}
+		cfg, err := json.Marshal(wrapper)
+		if err != nil {
+			return nil, fmt.Errorf("encode kiosk spec: %w", err)
+		}
+		return cfg, nil
 	}
 
 	out := map[string]any{}
@@ -403,22 +425,7 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 
 		// Supporting files (instance-scoped on the device) and the
 		// exclusivity group ride along at the spec level.
-		if filesAny, ok := sysBlock["files"].([]any); ok {
-			files := make([]map[string]any, 0, len(filesAny))
-			for _, f := range filesAny {
-				fm, ok := f.(map[string]any)
-				if !ok {
-					continue
-				}
-				entry := map[string]any{
-					"path":    subst.string(toString(fm["path"])),
-					"content": subst.string(toString(fm["content"])),
-				}
-				if m := toString(fm["mode"]); m != "" {
-					entry["mode"] = m
-				}
-				files = append(files, entry)
-			}
+		if files := materializeSystemFiles(sysBlock, subst); files != nil {
 			wrapper["files"] = files
 		}
 		if eg := toString(spec["exclusivityGroup"]); eg != "" {
@@ -431,6 +438,32 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 		return nil, fmt.Errorf("encode system spec: %w", err)
 	}
 	return cfg, nil
+}
+
+// materializeSystemFiles renders spec.runtime.system.files[] with ${cfg.X} /
+// ${instance.id} / ${template.id} substitution applied to path and content.
+// Returns nil when there are no files.
+func materializeSystemFiles(sysBlock map[string]any, subst *substituter) []map[string]any {
+	filesAny, ok := sysBlock["files"].([]any)
+	if !ok || len(filesAny) == 0 {
+		return nil
+	}
+	files := make([]map[string]any, 0, len(filesAny))
+	for _, f := range filesAny {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		entry := map[string]any{
+			"path":    subst.string(toString(fm["path"])),
+			"content": subst.string(toString(fm["content"])),
+		}
+		if m := toString(fm["mode"]); m != "" {
+			entry["mode"] = m
+		}
+		files = append(files, entry)
+	}
+	return files
 }
 
 // materializeCompose builds a compose.Spec the agent's compose driver

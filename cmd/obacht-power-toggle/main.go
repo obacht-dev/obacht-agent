@@ -36,6 +36,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"syscall"
 
 	"github.com/obacht-dev/obacht-agent/internal/unitpolicy"
@@ -65,6 +66,8 @@ const (
 # To disable, run: sudo obacht-power-toggle disable
 obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle svc *
 obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle unit *
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle kiosk enable
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle kiosk disable
 `
 )
 
@@ -110,6 +113,9 @@ func main() {
 	case "unit":
 		mustRoot()
 		os.Exit(unitCmd(os.Args[2:]))
+	case "kiosk":
+		mustRoot()
+		os.Exit(kioskCmd(os.Args[2:]))
 	case "status":
 		if status() {
 			fmt.Println("enabled")
@@ -243,6 +249,205 @@ func runSystemctl(args ...string) int {
 		return 1
 	}
 	return 0
+}
+
+// ---------------------------------------------------------------------------
+// kiosk: Chromium-on-the-desktop (spec v2.8 kiosk flavor).
+//
+// This is the one privileged operation whose content is FIXED and embedded
+// here — the agent contributes only /etc/obacht/kiosk/config.env (the URL),
+// which the session script reads at runtime; it never influences the unit,
+// the user, or the display-manager handling. `enable` snapshots the display
+// manager state so `disable` (and Power-Mode lock) can restore the device to
+// a normal desktop. Both verbs take NO parameters — the sudoers grant pins
+// the exact argv.
+// ---------------------------------------------------------------------------
+
+const (
+	kioskUnitName    = "obacht-kiosk.service"
+	kioskUnitPath    = "/etc/systemd/system/obacht-kiosk.service"
+	kioskUser        = "obacht-kiosk"
+	kioskSessionExec = "/opt/obacht-agent/libexec/obacht-kiosk-session"
+	kioskRestorePath = "/var/lib/obacht/system/restore/kiosk-dm"
+	// Display managers we know how to stand down + restore. Ordered; the
+	// first one that is enabled is the one we snapshot.
+	// (Pi OS ships lightdm.)
+)
+
+var knownDisplayManagers = []string{"lightdm", "gdm3", "gdm", "sddm", "greetd"}
+
+// kioskUnitContent is the FIXED kiosk unit. Runs the agent-shipped session
+// script as the unprivileged obacht-kiosk user on tty1 with a real login
+// session (PAMName=login) so logind grants a seat for DRM/input access.
+const kioskUnitContent = `[Unit]
+Description=obacht kiosk session
+After=systemd-user-sessions.service getty@tty1.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=simple
+User=` + kioskUser + `
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+ExecStart=` + kioskSessionExec + `
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target
+`
+
+func kioskCmd(args []string) int {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle kiosk {enable|disable}")
+		return 2
+	}
+	switch args[0] {
+	case "enable":
+		if err := kioskEnable(); err != nil {
+			fmt.Fprintln(os.Stderr, "kiosk enable:", err)
+			return 2
+		}
+		fmt.Println("kiosk enabled")
+		return 0
+	case "disable":
+		if err := kioskDisable(); err != nil {
+			fmt.Fprintln(os.Stderr, "kiosk disable:", err)
+			return 2
+		}
+		fmt.Println("kiosk disabled")
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "kiosk: verb %q not allowed\n", args[0])
+		return 2
+	}
+}
+
+func kioskEnable() error {
+	// Require the agent-shipped session script — never take over the display
+	// without something to run.
+	if st, err := os.Stat(kioskSessionExec); err != nil || st.IsDir() {
+		return fmt.Errorf("session script %s not installed", kioskSessionExec)
+	}
+	// 1) create the unprivileged kiosk user (system user, hardware groups only,
+	//    NOT docker) with a home for the browser profile.
+	if err := ensureKioskUser(); err != nil {
+		return err
+	}
+	// 2) snapshot + stand down the active display manager (idempotent: if we
+	//    already recorded one, keep the original snapshot).
+	if err := snapshotAndStopDM(); err != nil {
+		return err
+	}
+	// 3) install the fixed unit + enable it.
+	if err := atomicWriteRoot(kioskUnitPath, []byte(kioskUnitContent), 0o644); err != nil {
+		return err
+	}
+	if rc := runSystemctl("daemon-reload"); rc != 0 {
+		return fmt.Errorf("daemon-reload failed")
+	}
+	if rc := runSystemctl("enable", kioskUnitName); rc != 0 {
+		return fmt.Errorf("enable failed")
+	}
+	if rc := runSystemctl("restart", kioskUnitName); rc != 0 {
+		return fmt.Errorf("start failed")
+	}
+	return nil
+}
+
+func kioskDisable() error {
+	_ = runSystemctl("disable", "--now", kioskUnitName)
+	if err := os.Remove(kioskUnitPath); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	_ = runSystemctl("daemon-reload")
+	// Restore the display manager we stood down.
+	if err := restoreDM(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func ensureKioskUser() error {
+	if _, err := exec.LookPath("useradd"); err != nil {
+		return fmt.Errorf("useradd not found: %w", err)
+	}
+	// Already exists? nothing to do.
+	if exec.Command("id", "-u", kioskUser).Run() == nil {
+		return nil
+	}
+	cmd := exec.Command("useradd",
+		"--system",
+		"--create-home",
+		"--home-dir", "/var/lib/"+kioskUser,
+		"--shell", "/usr/sbin/nologin",
+		"--groups", "video,render,input",
+		kioskUser,
+	)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("useradd %s: %w", kioskUser, err)
+	}
+	return nil
+}
+
+// snapshotAndStopDM records the currently-enabled display manager (once) and
+// stops+disables it so the kiosk unit can own tty1/the display. Recording only
+// happens on the first enable, so a re-enable never overwrites the true prior
+// state.
+func snapshotAndStopDM() error {
+	if _, err := os.Stat(kioskRestorePath); err == nil {
+		// Already snapshotted — just make sure the recorded DM is down.
+		data, _ := os.ReadFile(kioskRestorePath)
+		if dm := strings.TrimSpace(string(data)); dm != "" && dm != "none" {
+			_ = runSystemctl("stop", dm)
+			_ = runSystemctl("disable", dm)
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(kioskRestorePath), 0o755); err != nil {
+		return err
+	}
+	active := "none"
+	for _, dm := range knownDisplayManagers {
+		// is-enabled returns 0 for "enabled"; treat that as the active DM.
+		if exec.Command(systemctlPath, "is-enabled", dm+".service").Run() == nil {
+			active = dm
+			break
+		}
+	}
+	if err := atomicWriteRoot(kioskRestorePath, []byte(active+"\n"), 0o644); err != nil {
+		return err
+	}
+	if active != "none" {
+		_ = runSystemctl("stop", active)
+		_ = runSystemctl("disable", active)
+	}
+	return nil
+}
+
+func restoreDM() error {
+	data, err := os.ReadFile(kioskRestorePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // nothing to restore
+		}
+		return err
+	}
+	dm := strings.TrimSpace(string(data))
+	if dm != "" && dm != "none" {
+		_ = runSystemctl("enable", dm)
+		_ = runSystemctl("start", dm)
+	}
+	_ = os.Remove(kioskRestorePath)
+	return nil
 }
 
 // svc validates a (verb, unit) pair and, only if both pass the closed

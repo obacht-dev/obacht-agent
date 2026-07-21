@@ -202,6 +202,79 @@ if [ -f "$src_dir/obacht-power-toggle" ]; then
   install -m 0755 "$src_dir/obacht-power-toggle" /usr/local/sbin/obacht-power-toggle
 fi
 
+# Kiosk session script (spec v2.8 kiosk flavor). Fixed-content, agent-shipped
+# at a pinned path referenced by the kiosk unit's ExecStart. Runs as the
+# unprivileged obacht-kiosk user; reads only /etc/obacht/kiosk/config.env for
+# the URL and display options. Prefers cage (single-app kiosk compositor);
+# falls back to labwc with an autostart. Never a shell out of the config.
+echo "==> writing $INSTALL_DIR/libexec/obacht-kiosk-session"
+mkdir -p "$INSTALL_DIR/libexec"
+cat > "$INSTALL_DIR/libexec/obacht-kiosk-session" <<'KIOSK'
+#!/usr/bin/env bash
+# Managed by obacht-agent install.sh - fixed content. Launches a fullscreen
+# Chromium kiosk on the device's preinstalled desktop compositor.
+set -eu
+
+CONF=/etc/obacht/kiosk/config.env
+KIOSK_URL="https://obacht.dev"
+KIOSK_ZOOM=""
+KIOSK_HIDE_CURSOR="true"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+# Only http(s) URLs (defence in depth; the agent already validates).
+case "$KIOSK_URL" in
+  http://*|https://*) : ;;
+  *) KIOSK_URL="https://obacht.dev" ;;
+esac
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export HOME="${HOME:-/var/lib/obacht-kiosk}"
+PROFILE="$HOME/.config/obacht-kiosk-profile"
+mkdir -p "$PROFILE"
+
+# Locate the Chromium binary (Bookworm: chromium-browser; Trixie: chromium).
+CHROME=""
+for c in /usr/bin/chromium /usr/bin/chromium-browser; do
+  [ -x "$c" ] && CHROME="$c" && break
+done
+[ -n "$CHROME" ] || { echo "no chromium binary found" >&2; exit 1; }
+
+CHROME_ARGS=(
+  --kiosk
+  --noerrdialogs
+  --disable-infobars
+  --no-first-run
+  --disable-session-crashed-bubble
+  --disable-features=Translate
+  --ozone-platform=wayland
+  --user-data-dir="$PROFILE"
+)
+[ -n "$KIOSK_ZOOM" ] && CHROME_ARGS+=("--force-device-scale-factor=$KIOSK_ZOOM")
+CHROME_ARGS+=("$KIOSK_URL")
+
+# Prefer cage (a single-application kiosk compositor); fall back to labwc.
+if command -v cage >/dev/null 2>&1; then
+  HIDE=()
+  [ "$KIOSK_HIDE_CURSOR" = "true" ] && HIDE=(-d)
+  exec cage "${HIDE[@]}" -- "$CHROME" "${CHROME_ARGS[@]}"
+elif command -v labwc >/dev/null 2>&1; then
+  AUTO="$HOME/.config/labwc"
+  mkdir -p "$AUTO"
+  {
+    printf '%s' "$CHROME"
+    for a in "${CHROME_ARGS[@]}"; do printf ' %q' "$a"; done
+    printf ' &\n'
+  } > "$AUTO/autostart"
+  chmod 0755 "$AUTO/autostart"
+  exec labwc
+else
+  echo "no supported wayland compositor (cage/labwc) found" >&2
+  exit 1
+fi
+KIOSK
+chmod 0755 "$INSTALL_DIR/libexec/obacht-kiosk-session"
+
 # S5: privileged self-update wrapper. Same trust model as
 # obacht-power-toggle: a fixed-content shell script at a pinned path,
 # allowed via sudoers. Lets the obacht user (and through it, the

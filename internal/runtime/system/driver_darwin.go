@@ -117,8 +117,8 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 
 // Remove boots the LaunchAgent out and deletes its plist. Data (e.g. models) is
 // left in place — mirrors the Pi convention of preserving instance data. The
-// unitName argument is unused on macOS (the label is derived from the id).
-func (d *Driver) Remove(ctx context.Context, instanceID, _ string) error {
+// spec argument is unused on macOS (the label is derived from the id).
+func (d *Driver) Remove(ctx context.Context, instanceID string, _ Spec) error {
 	if instanceID == "" {
 		return nil
 	}

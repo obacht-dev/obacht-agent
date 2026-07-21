@@ -20,7 +20,7 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 	return nil
 }
 
-func (d *Driver) Remove(ctx context.Context, instanceID, unitName string) error {
+func (d *Driver) Remove(ctx context.Context, instanceID string, spec Spec) error {
 	d.log.Warn("system runtime not supported on this OS; skipping remove", "instance", instanceID)
 	return nil
 }

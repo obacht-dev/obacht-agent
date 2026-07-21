@@ -137,6 +137,31 @@ func TestValidate_AcceptsGoodFilePaths(t *testing.T) {
 	}
 }
 
+func TestValidate_Kiosk(t *testing.T) {
+	// A kiosk with a config.env under /etc/obacht/kiosk/ is valid.
+	ok := Spec{
+		Kiosk: &KioskSpec{},
+		Files: []File{{Path: "/etc/obacht/kiosk/config.env", Content: "KIOSK_URL=https://x"}},
+	}
+	if err := ok.Validate(); err != nil {
+		t.Errorf("valid kiosk spec rejected: %v", err)
+	}
+	// A kiosk file outside /etc/obacht/kiosk/ is rejected even though it is
+	// inside the global allowlist.
+	bad := Spec{
+		Kiosk: &KioskSpec{},
+		Files: []File{{Path: "/etc/obacht/svc/x/evil", Content: "x"}},
+	}
+	if err := bad.Validate(); err == nil {
+		t.Error("kiosk file outside /etc/obacht/kiosk accepted")
+	}
+	// Kiosk is mutually exclusive with the other flavors.
+	both := Spec{Kiosk: &KioskSpec{}, ManagedService: validManaged()}
+	if err := both.Validate(); err == nil {
+		t.Error("kiosk + managed_service accepted")
+	}
+}
+
 func TestParseSpec_ValidatesThroughParse(t *testing.T) {
 	cfg := mustJSON(t, Spec{
 		ManagedService: validManaged(),

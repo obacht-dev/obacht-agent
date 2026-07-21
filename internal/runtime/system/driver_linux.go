@@ -99,6 +99,9 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 	if err := spec.Validate(); err != nil {
 		return fmt.Errorf("apply system: %w", err)
 	}
+	if spec.Kiosk != nil {
+		return d.applyKiosk(ctx, spec)
+	}
 	if spec.ManagedService == nil {
 		return fmt.Errorf("apply system: instance %s has no managed_service flavor (host_service is macOS-only)", instanceID)
 	}
@@ -148,20 +151,80 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 	return nil
 }
 
-// Remove stops/disables/deletes the unit via the root helper and cleans the
-// instance's staged unit + supporting-file dirs. Idempotent; the deterministic
-// unit name means removal works even when config_json is gone.
+// applyKiosk converges the kiosk flavor. The driver writes only the instance's
+// config.env (the URL etc., under /etc/obacht/kiosk/); every privileged action
+// — disabling the display manager, creating the obacht-kiosk user, installing
+// the FIXED kiosk unit — lives in the root helper `kiosk enable`, which the
+// agent process cannot influence beyond invoking it. Re-running enable is
+// idempotent and re-reads config.env, so a URL change (config → recreate →
+// apply) restarts the session on the new page.
+func (d *Driver) applyKiosk(ctx context.Context, spec Spec) error {
+	if err := d.writeKioskFiles(spec.Files); err != nil {
+		return err
+	}
+	if err := d.runHelper(ctx, "kiosk", "enable"); err != nil {
+		return err
+	}
+	// A config.env change must restart the session; enable is idempotent for
+	// the unit itself, so restart explicitly.
+	if err := d.runHelper(ctx, "svc", "restart", "obacht-kiosk.service"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// writeKioskFiles writes the kiosk config files. Confined to /etc/obacht/kiosk/
+// (Spec.Validate already enforces this; re-checked here as defence in depth).
+func (d *Driver) writeKioskFiles(files []File) error {
+	for _, f := range files {
+		if f.Path == "" {
+			continue
+		}
+		if err := validateFilePath(f.Path); err != nil {
+			return err
+		}
+		if !strings.HasPrefix(f.Path, "/etc/obacht/kiosk/") {
+			return fmt.Errorf("kiosk file %q must live under /etc/obacht/kiosk/", f.Path)
+		}
+		mode := os.FileMode(0o644)
+		if f.Mode != "" {
+			n, err := strconv.ParseUint(f.Mode, 8, 32)
+			if err != nil {
+				return fmt.Errorf("parse mode %q: %w", f.Mode, err)
+			}
+			mode = os.FileMode(n)
+		}
+		if err := os.MkdirAll(filepath.Dir(f.Path), 0o755); err != nil {
+			return fmt.Errorf("mkdir %s: %w", filepath.Dir(f.Path), err)
+		}
+		if _, err := writeIfDifferent(f.Path, []byte(f.Content), mode); err != nil {
+			return fmt.Errorf("write %s: %w", f.Path, err)
+		}
+	}
+	return nil
+}
+
+// Remove tears down a system instance. For the kiosk flavor it invokes the
+// root helper `kiosk disable` (which restores the display manager). For a
+// managed service it removes the generated unit and cleans the instance dirs.
+// Idempotent; the deterministic unit name means removal works even when
+// config_json is gone.
 //
 // The content-addressed binary dir is deliberately NOT removed here: another
 // instance may share the digest and the reconciler has no cross-instance view
 // at this point. Binaries are small and pinned; GC can follow later.
-func (d *Driver) Remove(ctx context.Context, instanceID, unitName string) error {
-	if unitName == "" {
-		if instanceID == "" {
-			return nil
+func (d *Driver) Remove(ctx context.Context, instanceID string, spec Spec) error {
+	if spec.Kiosk != nil {
+		if err := d.runHelper(ctx, "kiosk", "disable"); err != nil {
+			return err
 		}
-		unitName = ManagedUnitName(instanceID)
+		_ = os.RemoveAll("/etc/obacht/kiosk")
+		return nil
 	}
+	if instanceID == "" {
+		return nil
+	}
+	unitName := ManagedUnitName(instanceID)
 	if err := unitpolicy.ValidateName(unitName); err != nil {
 		// A legacy/foreign unit name never managed by this driver — nothing
 		// we could have installed, so nothing to remove.

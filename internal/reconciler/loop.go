@@ -687,15 +687,14 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 		r.log.Info("applied system", "instance", inst.ID)
 	case store.DesiredStopped, store.DesiredRemoved:
 		// The managed-service unit name is deterministic from the instance ID,
-		// so removal works even when config_json is gone/corrupt; the driver
-		// derives it when unitName is empty. spec.UnitName only ever mattered
-		// for the withdrawn free-form flavor.
+		// so removal works even when config_json is gone/corrupt. The spec is
+		// passed so the driver can tell the kiosk flavor (helper `kiosk
+		// disable`, restores the display manager) from a managed service.
 		spec, err := system.ParseSpec(inst.ConfigJSON)
 		if err != nil {
 			r.log.Warn("parse system spec on remove (continuing)", "instance", inst.ID, "err", err)
 		}
-		unitName := spec.UnitName
-		if err := r.system.Remove(ctx, inst.ID, unitName); err != nil {
+		if err := r.system.Remove(ctx, inst.ID, spec); err != nil {
 			r.log.Error("remove system instance", "instance", inst.ID, "err", err)
 			return
 		}
