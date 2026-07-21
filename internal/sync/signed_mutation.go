@@ -299,36 +299,48 @@ func (s *Syncer) dispatchInstanceUpsert(ctx context.Context, m *signedmut.Mutati
 		return fmt.Errorf("manifest signature rejected: %w", err)
 	}
 	if rt := manifest.RuntimeType(manifestBytes); rt == "system" {
-		// The macOS host-service flavor (launchd on the host, e.g. Ollama) is
-		// the one system runtime allowed via the signed path, and only on
-		// darwin where the host-service driver exists. Everything else stays
-		// rejected: there is no systemd in the Mac VM, and Pis install systemd
-		// templates over obachtctl/SSH, never this path. On linux this branch
-		// is byte-identical to before (the condition is always false there).
-		if !(runtime.GOOS == "darwin" && manifest.HasHostService(manifestBytes)) {
+		// Which system flavor is allowed on THIS device via the signed path:
+		//   - darwin: the macOS host-service (launchd, e.g. Ollama).
+		//   - linux (Pi): the v2.8 managed-service + kiosk flavors, which the
+		//     reconciler/driver run through the hardened-unit + root-helper
+		//     path. Requires Power Mode (re-checked below).
+		// The withdrawn free-form systemd flavor and any other shape stay
+		// rejected.
+		darwinHostSvc := runtime.GOOS == "darwin" && manifest.HasHostService(manifestBytes)
+		linuxSystem := runtime.GOOS == "linux" &&
+			(manifest.HasManagedService(manifestBytes) || manifest.HasKiosk(manifestBytes))
+		if !darwinHostSvc && !linuxSystem {
 			return errors.New("system-runtime templates are not supported on this device")
 		}
-		// Host-services are singletons per template: the launchd unit binds a
-		// fixed host resource (e.g. Ollama's TCP port), so a second instance of
-		// the same template can never run — it just fails to bind. Reject a
-		// duplicate install (a different instance id for an already-installed
-		// template). Re-upserting the SAME instance id (config/version update) is
-		// fine and falls through.
-		if desired := store.DesiredState(p.DesiredState); desired != store.DesiredRemoved {
-			existing, err := s.store.ListInstances(ctx)
-			if err != nil {
-				return fmt.Errorf("check existing host-services: %w", err)
-			}
-			for _, e := range existing {
-				if e.Runtime == store.RuntimeSystem && e.TemplateID == p.TemplateID &&
-					e.ID != p.InstanceID && e.DesiredState != store.DesiredRemoved {
-					return fmt.Errorf("host-service %q is already installed on this device (instance %s); remove it before installing another", p.TemplateID, e.ID)
+		// Singleton enforcement: host-services bind a fixed host resource, so a
+		// second instance of the same template can never run. Reject a duplicate
+		// install (different instance id, same template). Re-upserting the SAME
+		// instance id (config/version update) is fine. Linux managed_service/
+		// kiosk singletons are enforced by the reconciler's exclusivityGroup
+		// lock, so this guard is scoped to the host-service flavor.
+		if darwinHostSvc {
+			if desired := store.DesiredState(p.DesiredState); desired != store.DesiredRemoved {
+				existing, err := s.store.ListInstances(ctx)
+				if err != nil {
+					return fmt.Errorf("check existing host-services: %w", err)
+				}
+				for _, e := range existing {
+					if e.Runtime == store.RuntimeSystem && e.TemplateID == p.TemplateID &&
+						e.ID != p.InstanceID && e.DesiredState != store.DesiredRemoved {
+						return fmt.Errorf("host-service %q is already installed on this device (instance %s); remove it before installing another", p.TemplateID, e.ID)
+					}
 				}
 			}
 		}
 	}
 	if manifest.ExtractMinSudoLevel(manifestBytes) == "power" {
-		return errors.New("templates requiring power mode are not yet supported on this device")
+		// Power-mode templates (Pi system runtime) are allowed on the signed
+		// path only when Power Mode is actually unlocked on this device — the
+		// same on-device gate obachtctl enforces. The reconciler/driver/helper
+		// enforce all the confinement beyond this point.
+		if runtime.GOOS != "linux" || !s.powerModeEnabled() {
+			return errors.New("this template requires Power Mode — unlock it in the device settings first")
+		}
 	}
 
 	built, err := manifest.BuildInstanceConfig(manifestBytes, p.UserConfig, p.InstanceID, p.TemplateID, p.Version)

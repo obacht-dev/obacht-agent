@@ -98,6 +98,42 @@ func HasHostService(manifestBytes []byte) bool {
 	return len(probe.Spec.Runtime.System.HostService) > 0
 }
 
+// HasManagedService reports whether a system manifest declares the Linux
+// managed-service flavor (spec v2.8). Used to allow it on the signed path.
+func HasManagedService(manifestBytes []byte) bool {
+	var probe struct {
+		Spec struct {
+			Runtime struct {
+				System struct {
+					ManagedService map[string]any `json:"managed_service" yaml:"managed_service"`
+				} `json:"system" yaml:"system"`
+			} `json:"runtime" yaml:"runtime"`
+		} `json:"spec" yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(manifestBytes, &probe); err != nil {
+		return false
+	}
+	return len(probe.Spec.Runtime.System.ManagedService) > 0
+}
+
+// HasKiosk reports whether a system manifest declares the kiosk flavor
+// (spec v2.8). The kiosk marker is an empty object, so this checks presence
+// of the key rather than a non-empty map.
+func HasKiosk(manifestBytes []byte) bool {
+	var probe struct {
+		Spec struct {
+			Runtime struct {
+				System map[string]any `json:"system" yaml:"system"`
+			} `json:"runtime" yaml:"runtime"`
+		} `json:"spec" yaml:"spec"`
+	}
+	if err := yaml.Unmarshal(manifestBytes, &probe); err != nil {
+		return false
+	}
+	_, ok := probe.Spec.Runtime.System["kiosk"]
+	return ok
+}
+
 // RuntimeType returns spec.runtime.type ("container" | "compose" |
 // "system" | …) without a full manifest parse. Used to reject
 // system-runtime templates on platforms with no systemd target (Mac VM)
