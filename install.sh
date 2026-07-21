@@ -220,7 +220,7 @@ KIOSK_URL="https://obacht.dev"
 KIOSK_ZOOM=""
 KIOSK_HIDE_CURSOR="true"
 
-# Parse config.env as strict KEY=value DATA — never `source` it. `read` reads
+# Parse config.env as strict KEY=value DATA -- never `source` it. `read` reads
 # one physical line, so a value cannot inject a newline+statement, and the
 # values are only ever used as quoted data below. This is the security
 # boundary against a hostile config.env (the template author / install caller
@@ -380,11 +380,11 @@ fi
 # v2.8 system-runtime (managed services) working dirs.
 #
 # Split by who needs to read them:
-#   staging (/var/lib/obacht/system/staging) — agent writes generated units;
+#   staging (/var/lib/obacht/system/staging) -- agent writes generated units;
 #     only the root helper reads them, so it stays in the agent-private 0750
 #     tree.
 #   bin (/opt/obacht/system/bin), svc (/opt/obacht/svc), config (/etc/obacht/svc)
-#     — the managed-service workload runs as a transient systemd DynamicUser
+#     -- the managed-service workload runs as a transient systemd DynamicUser
 #     that is NOT the obacht user nor in its group, so it must be able to
 #     TRAVERSE these paths to exec its binary and read its config. They live
 #     under world-traversable roots (/opt, /etc), NOT under the 0750
