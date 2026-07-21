@@ -670,6 +670,7 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 				return
 			}
 			r.log.Error("parse system spec", "instance", inst.ID, "err", err)
+			_ = r.store.SetObservedState(ctx, inst.ID, "error", err.Error())
 			return
 		}
 		if spec.ExclusivityGroup != "" {
@@ -677,12 +678,21 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 				holder, _ := r.store.GetLockHolder(ctx, spec.ExclusivityGroup)
 				r.log.Error("exclusivity lock denied",
 					"instance", inst.ID, "group", spec.ExclusivityGroup, "holder", holder)
+				_ = r.store.SetObservedState(ctx, inst.ID, "error",
+					fmt.Sprintf("resource %q already in use by %s", spec.ExclusivityGroup, holder))
 				return
 			}
 		}
 		if err := r.system.Apply(ctx, inst.ID, spec); err != nil {
 			r.log.Error("apply system instance", "instance", inst.ID, "err", err)
+			_ = r.store.SetObservedState(ctx, inst.ID, "error", err.Error())
 			return
+		}
+		// Report observed state so the webapp leaves the transient "installing"
+		// state (system instances reconcile inline, not through the container
+		// worker that would otherwise write this).
+		if err := r.store.SetObservedState(ctx, inst.ID, "installed", ""); err != nil {
+			r.log.Warn("set system observed state", "instance", inst.ID, "err", err)
 		}
 		r.log.Info("applied system", "instance", inst.ID)
 	case store.DesiredStopped, store.DesiredRemoved:
@@ -711,6 +721,9 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 			if err := r.store.DeleteInstance(ctx, inst.ID); err != nil {
 				r.log.Error("delete instance row", "instance", inst.ID, "err", err)
 			}
+		} else {
+			// Stopped (not removed): report it so the webapp reflects the state.
+			_ = r.store.SetObservedState(ctx, inst.ID, "stopped", "")
 		}
 	}
 }
