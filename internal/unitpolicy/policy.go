@@ -30,7 +30,9 @@ const (
 
 	// StagingDir is the FIXED directory the helper reads staged units from.
 	// The helper never accepts a path argument — only a unit name — so the
-	// unprivileged side cannot point it at arbitrary files.
+	// unprivileged side cannot point it at arbitrary files. It lives in the
+	// agent-private tree (only root/agent read it), which is fine: the helper
+	// runs as root.
 	StagingDir = "/var/lib/obacht/system/staging"
 
 	// UnitDir is where validated units are installed.
@@ -38,12 +40,21 @@ const (
 
 	// BinRoot is the content-addressed root for downloaded, digest-verified
 	// managed-service binaries: <BinRoot>/<sha256-hex>/<binary>.
-	BinRoot = "/var/lib/obacht/system/bin"
+	//
+	// It lives under /opt/obacht (world-traversable, 0755) — NOT the
+	// agent-private /var/lib/obacht (0750, holds secrets.db) — because the
+	// workload runs as a transient systemd DynamicUser that is neither the
+	// obacht user nor in its group, and must be able to traverse the path to
+	// exec the binary. /opt is read-only under ProtectSystem=strict, which
+	// still permits read+exec.
+	BinRoot = "/opt/obacht/system/bin"
 
 	// EtcRoot/VarRoot are the instance-scoped roots template files[] may
-	// write to (agent-owned, unprivileged writes).
+	// write to. Both must be world-traversable so the DynamicUser workload can
+	// read its config — hence VarRoot under /opt, not /var/lib/obacht. EtcRoot
+	// stays under /etc/obacht, which is conventionally 0755.
 	EtcRoot = "/etc/obacht/svc"
-	VarRoot = "/var/lib/obacht/svc"
+	VarRoot = "/opt/obacht/svc"
 
 	// MaxUnitSize bounds the staged unit file. Generated units are <2 KiB;
 	// anything bigger is hostile or broken.
@@ -91,6 +102,7 @@ var AllowedDeviceAllow = map[string]bool{
 	"char-video4linux rw": true, // /dev/video*
 	"char-media rw":       true, // /dev/media*
 	"char-drm rw":         true, // /dev/dri/*
+	"char-dma_heap rw":    true, // /dev/dma_heap/* (CMA/dma-buf alloc)
 }
 
 // AllowedGroups mirrors the manifest's closed hardware.groups enum.

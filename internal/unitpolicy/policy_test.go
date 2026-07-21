@@ -11,7 +11,7 @@ After=network-online.target
 
 [Service]
 Type=exec
-ExecStart=/var/lib/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml
+ExecStart=/opt/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml
 DynamicUser=yes
 NoNewPrivileges=yes
 ProtectSystem=strict
@@ -80,9 +80,9 @@ func TestHostileMutationsRejected(t *testing.T) {
 		"block device":         {"DeviceAllow=char-media rw", "DeviceAllow=block-* rwm"},
 		"docker group":         {"SupplementaryGroups=video", "SupplementaryGroups=docker"},
 		"sudo group":           {"SupplementaryGroups=video", "SupplementaryGroups=video sudo"},
-		"execstart outside":    {"ExecStart=/var/lib/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/usr/bin/bash -c id"},
-		"execstart traversal":  {"ExecStart=/var/lib/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/var/lib/obacht/system/bin/../../../../usr/bin/bash"},
-		"execstart shell meta": {"ExecStart=/var/lib/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/var/lib/obacht/system/bin/d/m $(id)"},
+		"execstart outside":    {"ExecStart=/opt/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/usr/bin/bash -c id"},
+		"execstart traversal":  {"ExecStart=/opt/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/opt/obacht/system/bin/../../../../usr/bin/bash"},
+		"execstart shell meta": {"ExecStart=/opt/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml", "ExecStart=/opt/obacht/system/bin/d/m $(id)"},
 		"execstartpre":         {"Type=exec", "ExecStartPre=/usr/bin/chmod u+s /usr/bin/bash"},
 		"capabilities":         {"Type=exec", "AmbientCapabilities=CAP_SYS_ADMIN"},
 		"statedir escape":      {"StateDirectory=obacht-svc/1234-abcd", "StateDirectory=../../etc"},
@@ -113,7 +113,7 @@ func TestMissingHardeningRejected(t *testing.T) {
 		"ProtectSystem=strict\n",
 		"DevicePolicy=closed\n",
 		"RestrictSUIDSGID=yes\n",
-		"ExecStart=/var/lib/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml\n",
+		"ExecStart=/opt/obacht/system/bin/deadbeef/mediamtx /etc/obacht/svc/1234-abcd/mediamtx.yml\n",
 		"Description=obacht managed service 1234-abcd (mediamtx)\n",
 		"WantedBy=multi-user.target\n",
 	} {
@@ -127,7 +127,7 @@ func TestMissingHardeningRejected(t *testing.T) {
 func TestDuplicateSingletonRejected(t *testing.T) {
 	// A second ExecStart (systemd would run both for Type=oneshot, or use
 	// reset semantics) must be rejected.
-	content := goodUnit + "\n[Service]\nExecStart=/var/lib/obacht/system/bin/x/y\n"
+	content := goodUnit + "\n[Service]\nExecStart=/opt/obacht/system/bin/x/y\n"
 	if err := Validate("obacht-svc-1234-abcd.service", []byte(content)); err == nil {
 		t.Error("duplicate ExecStart accepted")
 	}

@@ -124,7 +124,7 @@ func TestValidate_RejectsBadFilePaths(t *testing.T) {
 func TestValidate_AcceptsGoodFilePaths(t *testing.T) {
 	good := []string{
 		"/etc/obacht/svc/inst/config.yaml",
-		"/var/lib/obacht/svc/inst/data.json",
+		"/opt/obacht/svc/inst/data.json",
 	}
 	for _, p := range good {
 		s := Spec{

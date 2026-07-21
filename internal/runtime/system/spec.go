@@ -236,9 +236,10 @@ var allowedManagedGroups = map[string]bool{
 // allowedManagedDevices maps the manifest's device patterns to the systemd
 // DeviceAllow device-group specifier the generator emits.
 var allowedManagedDevices = map[string]string{
-	"/dev/video*": "char-video4linux rw",
-	"/dev/media*": "char-media rw",
-	"/dev/dri/*":  "char-drm rw",
+	"/dev/video*":     "char-video4linux rw",
+	"/dev/media*":     "char-media rw",
+	"/dev/dri/*":      "char-drm rw",
+	"/dev/dma_heap/*": "char-dma_heap rw", // CMA/dma-buf alloc — libcamera needs it
 }
 
 func (m ManagedServiceSpec) validate() error {

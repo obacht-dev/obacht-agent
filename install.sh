@@ -285,17 +285,30 @@ usermod -a -G docker obacht || true
 if getent group systemd-journal >/dev/null 2>&1; then
   usermod -a -G systemd-journal obacht || true
 fi
-# v2.8 system-runtime (managed services) working dirs. All under the
-# agent-owned trees so the UNPRIVILEGED agent can stage units + write
-# verified binaries + render instance files; the root helper only ever
-# reads the fixed staging path. Created before the recursive chown so
-# ownership propagates.
-#   staging : agent writes generated units here; helper reads by name only
-#   bin     : content-addressed, digest-verified managed-service binaries
-#   svc     : per-instance supporting files (also mirrored under /etc/obacht)
-mkdir -p "$STATE_DIR/system/staging" "$STATE_DIR/system/bin" "$STATE_DIR/svc" "$CONFIG_DIR/svc"
+# v2.8 system-runtime (managed services) working dirs.
+#
+# Split by who needs to read them:
+#   staging (/var/lib/obacht/system/staging) — agent writes generated units;
+#     only the root helper reads them, so it stays in the agent-private 0750
+#     tree.
+#   bin (/opt/obacht/system/bin), svc (/opt/obacht/svc), config (/etc/obacht/svc)
+#     — the managed-service workload runs as a transient systemd DynamicUser
+#     that is NOT the obacht user nor in its group, so it must be able to
+#     TRAVERSE these paths to exec its binary and read its config. They live
+#     under world-traversable roots (/opt, /etc), NOT under the 0750
+#     /var/lib/obacht (which holds secrets.db). The dirs are obacht-owned so
+#     the unprivileged agent can still write into them; 0755 lets the
+#     DynamicUser traverse (files themselves are the access gate).
+mkdir -p "$STATE_DIR/system/staging"
+mkdir -p /opt/obacht/system/bin /opt/obacht/svc "$CONFIG_DIR/svc"
 chown -R obacht:obacht "$STATE_DIR" "$RUNTIME_DIR"
 chown obacht:obacht "$CONFIG_DIR"
+# /opt/obacht and its subtree world-traversable + obacht-owned.
+chmod 0755 /opt/obacht /opt/obacht/system /opt/obacht/system/bin /opt/obacht/svc
+chown -R obacht:obacht /opt/obacht
+# /etc/obacht must stay world-traversable so the DynamicUser can reach its
+# instance config under /etc/obacht/svc/<id>/.
+chmod 0755 "$CONFIG_DIR" "$CONFIG_DIR/svc"
 chown obacht:obacht "$CONFIG_DIR/svc"
 # S6.5: the unix-domain socket /run/obacht/agent-v2.sock is mode 0660
 # (obacht:obacht), which is correct for the daemon but means obachtctl

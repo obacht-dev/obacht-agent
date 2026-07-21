@@ -212,7 +212,7 @@ func (d *Driver) GarbageCollect(ctx context.Context, keep map[string]bool) {}
 // content changed. Paths are confined twice: the global allowlist
 // (validateFilePath, run in Validate and re-run here) plus the v2.8
 // instance-scoping rule — a managed instance may only write inside its own
-// /etc/obacht/svc/<id>/ and /var/lib/obacht/svc/<id>/ subtrees.
+// /etc/obacht/svc/<id>/ and /opt/obacht/svc/<id>/ subtrees.
 func (d *Driver) writeFiles(instanceID string, files []File) (bool, error) {
 	changed := false
 	for _, f := range files {
