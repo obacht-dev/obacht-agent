@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/compat"
+	"github.com/obacht-dev/obacht-agent/internal/inventory"
 	"github.com/obacht-dev/obacht-agent/internal/spec"
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
@@ -378,6 +379,17 @@ func (s *Syncer) sendRegister() {
 		capabilities = append(capabilities, "signed-mutation")
 		userKeyFingerprints = v.Fingerprints()
 	}
+	// Advertise the system runtime (spec v2.8 managed services) only while
+	// Power Mode is unlocked on a Linux host: the whole install path runs
+	// through the Power-Mode sudoers grant, so a locked device must not
+	// attract system installs. Power-Mode toggles re-register (obachtctl
+	// does so via IPC), keeping the advertisement current.
+	if runtime.GOOS == "linux" && s.powerModeEnabled() {
+		capabilities = append(capabilities, "runtime.system")
+	}
+	// Device inventory + derived features (spec v2.8): drives
+	// compatibility.requiresFeatures gating and optionsSource selects.
+	inv := inventory.Collect()
 	payload := map[string]any{
 		"deviceId":            s.deviceID,
 		"agentVersion":        s.agentVersion,
@@ -390,10 +402,22 @@ func (s *Syncer) sendRegister() {
 		"compat":              ident,
 		"schemaVersion":       s.readSchemaVersion(),
 		"userKeyFingerprints": userKeyFingerprints,
+		"features":            inventory.Features(inv),
+		"inventory":           inv,
 	}
 	if err := s.client.Emit("agent:register", payload); err != nil {
 		s.log.Warn("emit agent:register", "err", err)
 	}
+}
+
+// powerModeEnabled reads the power_mode flag from system_settings — the same
+// source obachtctl's install-time assertion and the telemetry push use.
+func (s *Syncer) powerModeEnabled() bool {
+	settings, err := s.store.AllSystemSettings(context.Background())
+	if err != nil {
+		return false
+	}
+	return settings["power_mode"] == "true"
 }
 
 func (s *Syncer) readSchemaVersion() string {

@@ -684,8 +684,12 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 			r.log.Error("apply system instance", "instance", inst.ID, "err", err)
 			return
 		}
-		r.log.Info("applied system", "instance", inst.ID, "unit", spec.UnitName)
+		r.log.Info("applied system", "instance", inst.ID)
 	case store.DesiredStopped, store.DesiredRemoved:
+		// The managed-service unit name is deterministic from the instance ID,
+		// so removal works even when config_json is gone/corrupt; the driver
+		// derives it when unitName is empty. spec.UnitName only ever mattered
+		// for the withdrawn free-form flavor.
 		spec, err := system.ParseSpec(inst.ConfigJSON)
 		if err != nil {
 			r.log.Warn("parse system spec on remove (continuing)", "instance", inst.ID, "err", err)

@@ -30,9 +30,9 @@ type ServiceInfo struct {
 //
 //   - excluded:  obacht-agent itself (would be a footgun to expose)
 //   - excluded:  unit files served from /lib, /usr/lib, /run (distro defaults
-//                + transient generators)
+//   - transient generators)
 //   - excluded:  unit files inside /etc/obacht/system (these are obacht
-//                template-instances; managed in the Templates tab)
+//     template-instances; managed in the Templates tab)
 //   - included:  everything else with a FragmentPath under /etc/systemd/system
 func shouldHideService(name, fragmentPath string) bool {
 	if name == "obacht-agent.service" || name == "obacht-power-toggle.service" {

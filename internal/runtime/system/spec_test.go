@@ -15,30 +15,86 @@ func mustJSON(t *testing.T, s Spec) string {
 	return string(b)
 }
 
-func TestValidate_RejectsUnitNameTraversal(t *testing.T) {
-	bad := []string{
-		"../../etc/cron.d/evil.service",
-		"evil",                 // no .service suffix
-		"evil.timer",           // wrong suffix
-		"/etc/evil.service",    // leading slash / path
-		"sub/dir/evil.service", // path separator
-		"evil.service\n",       // control char
-		"",
+func validManaged() *ManagedServiceSpec {
+	return &ManagedServiceSpec{
+		Kind:         "mediamtx",
+		Binary:       "mediamtx",
+		BinaryURL:    "https://github.com/bluenviron/mediamtx/releases/download/v1/m.tar.gz",
+		BinaryDigest: "sha256:" + strings.Repeat("a", 64),
+		Archive:      "tgz",
 	}
-	for _, name := range bad {
-		s := Spec{UnitName: name, UnitTemplate: "[Service]\nExecStart=/bin/true\n"}
-		if err := s.Validate(); err == nil {
-			t.Errorf("expected unit name %q to be rejected", name)
+}
+
+func TestValidate_WithdrawnFlavorRejected(t *testing.T) {
+	// The pre-v2.8 free-form systemd flavor must be rejected explicitly, in
+	// every combination.
+	specs := []Spec{
+		{UnitName: "obacht-foo.service", UnitTemplate: "[Service]\nExecStart=/bin/true\n"},
+		{UnitName: "obacht-foo.service"},
+		{UnitTemplate: "[Service]\nExecStart=/bin/true\n"},
+		{UnitName: "x.service", ManagedService: validManaged()},
+	}
+	for i, s := range specs {
+		err := s.Validate()
+		if err == nil {
+			t.Errorf("spec %d: withdrawn flavor accepted", i)
+			continue
+		}
+		if !strings.Contains(err.Error(), "withdrawn") {
+			t.Errorf("spec %d: expected withdrawn error, got %v", i, err)
 		}
 	}
 }
 
-func TestValidate_AcceptsGoodUnitName(t *testing.T) {
-	for _, name := range []string{"obacht-foo.service", "foo@bar.service", "a_b.c-d.service"} {
-		s := Spec{UnitName: name, UnitTemplate: "[Service]\nExecStart=/bin/true\n"}
-		if err := s.Validate(); err != nil {
-			t.Errorf("expected unit name %q to be accepted, got %v", name, err)
+func TestValidate_ExactlyOneFlavor(t *testing.T) {
+	if err := (Spec{}).Validate(); err == nil {
+		t.Error("empty spec accepted")
+	}
+	both := Spec{
+		HostService:    &HostServiceSpec{Kind: "ollama", Binary: "ollama", BinaryURL: "https://ollama.com/x", BinaryDigest: "sha256:" + strings.Repeat("a", 64)},
+		ManagedService: validManaged(),
+	}
+	if err := both.Validate(); err == nil {
+		t.Error("spec with two flavors accepted")
+	}
+	if err := (Spec{ManagedService: validManaged()}).Validate(); err != nil {
+		t.Errorf("valid managed spec rejected: %v", err)
+	}
+}
+
+func TestValidate_ManagedServiceRules(t *testing.T) {
+	mutate := func(fn func(*ManagedServiceSpec)) Spec {
+		ms := validManaged()
+		fn(ms)
+		return Spec{ManagedService: ms}
+	}
+	cases := map[string]Spec{
+		"binary not allowlisted": mutate(func(m *ManagedServiceSpec) { m.Binary = "bash" }),
+		"binary traversal":       mutate(func(m *ManagedServiceSpec) { m.Binary = "../bash" }),
+		"http url":               mutate(func(m *ManagedServiceSpec) { m.BinaryURL = "http://github.com/x" }),
+		"foreign host":           mutate(func(m *ManagedServiceSpec) { m.BinaryURL = "https://evil.example/x" }),
+		"bad digest":             mutate(func(m *ManagedServiceSpec) { m.BinaryDigest = "sha256:short" }),
+		"uppercase digest":       mutate(func(m *ManagedServiceSpec) { m.BinaryDigest = "sha256:" + strings.Repeat("A", 64) }),
+		"zip archive":            mutate(func(m *ManagedServiceSpec) { m.Archive = "zip" }),
+		"arg control char":       mutate(func(m *ManagedServiceSpec) { m.Args = []string{"a\nb"} }),
+		"env eq in key":          mutate(func(m *ManagedServiceSpec) { m.Env = map[string]string{"A=B": "c"} }),
+		"foreign group":          mutate(func(m *ManagedServiceSpec) { m.Hardware = &ManagedHardware{Groups: []string{"docker"}} }),
+		"foreign device":         mutate(func(m *ManagedServiceSpec) { m.Hardware = &ManagedHardware{Devices: []string{"/dev/sda"}} }),
+		"port out of range":      mutate(func(m *ManagedServiceSpec) { m.ListenPorts = []int{70000} }),
+	}
+	for label, s := range cases {
+		if err := s.Validate(); err == nil {
+			t.Errorf("%s: accepted", label)
 		}
+	}
+	ok := mutate(func(m *ManagedServiceSpec) {
+		m.Args = []string{"/etc/obacht/svc/i/mediamtx.yml"}
+		m.Env = map[string]string{"MTX_LOGLEVEL": "info"}
+		m.Hardware = &ManagedHardware{Groups: []string{"video"}, Devices: []string{"/dev/video*", "/dev/media*"}}
+		m.ListenPorts = []int{8888}
+	})
+	if err := ok.Validate(); err != nil {
+		t.Errorf("full valid managed spec rejected: %v", err)
 	}
 }
 
@@ -48,17 +104,16 @@ func TestValidate_RejectsBadFilePaths(t *testing.T) {
 		"/etc/cron.d/x",
 		"/root/.ssh/authorized_keys",
 		"relative/path",
-		"/etc/obacht/../../root/x",   // traversal (non-canonical)
-		"/etc/obacht//x",             // non-canonical
-		"/etc/obacht-evil/x",         // prefix on non-segment boundary
-		"/var/lib/obacht/x\x00y",     // NUL
-		"/opt/obacht/x\n",            // newline
+		"/etc/obacht/../../root/x", // traversal (non-canonical)
+		"/etc/obacht//x",           // non-canonical
+		"/etc/obacht-evil/x",       // prefix on non-segment boundary
+		"/var/lib/obacht/x\x00y",   // NUL
+		"/opt/obacht/x\n",          // newline
 	}
 	for _, p := range bad {
 		s := Spec{
-			UnitName:     "ok.service",
-			UnitTemplate: "[Service]\nExecStart=/bin/true\n",
-			Files:        []File{{Path: p, Content: "x"}},
+			ManagedService: validManaged(),
+			Files:          []File{{Path: p, Content: "x"}},
 		}
 		if err := s.Validate(); err == nil {
 			t.Errorf("expected file path %q to be rejected", p)
@@ -68,15 +123,13 @@ func TestValidate_RejectsBadFilePaths(t *testing.T) {
 
 func TestValidate_AcceptsGoodFilePaths(t *testing.T) {
 	good := []string{
-		"/etc/obacht/system/inst/config.yaml",
-		"/var/lib/obacht/inst/data.json",
-		"/opt/obacht/bin/helper",
+		"/etc/obacht/svc/inst/config.yaml",
+		"/var/lib/obacht/svc/inst/data.json",
 	}
 	for _, p := range good {
 		s := Spec{
-			UnitName:     "ok.service",
-			UnitTemplate: "[Service]\nExecStart=/bin/true\n",
-			Files:        []File{{Path: p, Content: "x"}},
+			ManagedService: validManaged(),
+			Files:          []File{{Path: p, Content: "x"}},
 		}
 		if err := s.Validate(); err != nil {
 			t.Errorf("expected file path %q to be accepted, got %v", p, err)
@@ -86,9 +139,8 @@ func TestValidate_AcceptsGoodFilePaths(t *testing.T) {
 
 func TestParseSpec_ValidatesThroughParse(t *testing.T) {
 	cfg := mustJSON(t, Spec{
-		UnitName:     "ok.service",
-		UnitTemplate: "[Service]\nExecStart=/bin/true\n",
-		Files:        []File{{Path: "/etc/passwd", Content: "pwned"}},
+		ManagedService: validManaged(),
+		Files:          []File{{Path: "/etc/passwd", Content: "pwned"}},
 	})
 	if _, err := ParseSpec(cfg); err == nil {
 		t.Fatal("expected ParseSpec to reject /etc/passwd file path")

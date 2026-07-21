@@ -285,8 +285,18 @@ usermod -a -G docker obacht || true
 if getent group systemd-journal >/dev/null 2>&1; then
   usermod -a -G systemd-journal obacht || true
 fi
+# v2.8 system-runtime (managed services) working dirs. All under the
+# agent-owned trees so the UNPRIVILEGED agent can stage units + write
+# verified binaries + render instance files; the root helper only ever
+# reads the fixed staging path. Created before the recursive chown so
+# ownership propagates.
+#   staging : agent writes generated units here; helper reads by name only
+#   bin     : content-addressed, digest-verified managed-service binaries
+#   svc     : per-instance supporting files (also mirrored under /etc/obacht)
+mkdir -p "$STATE_DIR/system/staging" "$STATE_DIR/system/bin" "$STATE_DIR/svc" "$CONFIG_DIR/svc"
 chown -R obacht:obacht "$STATE_DIR" "$RUNTIME_DIR"
 chown obacht:obacht "$CONFIG_DIR"
+chown obacht:obacht "$CONFIG_DIR/svc"
 # S6.5: the unix-domain socket /run/obacht/agent-v2.sock is mode 0660
 # (obacht:obacht), which is correct for the daemon but means obachtctl
 # invocations over SSH must run as a user that is in the `obacht`

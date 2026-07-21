@@ -151,11 +151,10 @@ func Materialize(manifestBytes []byte, userConfig map[string]any, instanceID, te
 		}
 		return Result{Runtime: "compose", Config: cfg}, nil
 	case "system":
-		// Only the macOS host-service flavor is materialised here. systemd
-		// system templates (Pi) are NOT installed via this path — they push a
-		// raw config_json over obachtctl IPC — so for any system manifest
-		// WITHOUT a host_service block we return the exact same error as before
-		// (keeps the Pi/legacy behaviour byte-identical).
+		// Two structured flavors are materialised here: the macOS host_service
+		// (v2.4) and the Linux managed_service (v2.8). The withdrawn free-form
+		// unitName/unitTemplate flavor and the kiosk marker (Phase E) are
+		// rejected below with explicit errors.
 		cfg, err := materializeSystem(spec, runtimeBlock, userConfig, instanceID, templateID)
 		if err != nil {
 			return Result{}, err
@@ -313,36 +312,53 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 	return json.Marshal(out)
 }
 
-// materializeSystem produces the config_json for a macOS host-service instance
-// from spec.runtime.system.host_service, substituting ${cfg.X}/${instance.id}/
-// ${template.id} in its string fields. The output is shaped to match
-// runtime/system.Spec (a {"host_service": {...}} object) so the darwin system
-// driver's ParseSpec consumes it directly. A system manifest WITHOUT a
-// host_service block returns the exact same "unsupported" error the default
-// switch case produces, keeping non-host-service system manifests unchanged.
+// materializeSystem produces the config_json for a system instance from
+// spec.runtime.system, substituting ${cfg.X}/${instance.id}/${template.id} in
+// its string fields. Two structured flavors exist: host_service (macOS,
+// v2.4) and managed_service (Linux, v2.8). The output is shaped to match
+// runtime/system.Spec so the OS driver's ParseSpec consumes it directly.
+// The withdrawn free-form unitName/unitTemplate flavor and the kiosk marker
+// (implemented in a later phase) are rejected with explicit errors.
 func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, instanceID, templateID string) ([]byte, error) {
-	_ = spec
 	sysBlock, _ := runtime["system"].(map[string]any)
-	hs, _ := sysBlock["host_service"].(map[string]any)
-	if hs == nil {
-		return nil, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", "system")
+	if sysBlock == nil {
+		return nil, fmt.Errorf("manifest missing spec.runtime.system")
+	}
+	if _, has := sysBlock["unitTemplate"]; has {
+		return nil, fmt.Errorf("the free-form unitName/unitTemplate system flavor was withdrawn (spec v2.8) — use managed_service")
+	}
+	if _, has := sysBlock["kiosk"]; has {
+		return nil, fmt.Errorf("the kiosk system flavor is not supported by this agent version")
 	}
 	subst := newSubstituter(userConfig, instanceID, templateID)
 
+	hs, _ := sysBlock["host_service"].(map[string]any)
+	ms, _ := sysBlock["managed_service"].(map[string]any)
+	if hs == nil && ms == nil {
+		return nil, fmt.Errorf("unsupported runtime.type %q (agent supports container, compose)", "system")
+	}
+	if hs != nil && ms != nil {
+		return nil, fmt.Errorf("spec.runtime.system: host_service and managed_service are mutually exclusive")
+	}
+
 	out := map[string]any{}
+	src := hs
+	if ms != nil {
+		src = ms
+	}
 	for _, k := range []string{"kind", "binary", "binary_url", "binary_digest", "archive", "data_dir"} {
-		if v, ok := hs[k].(string); ok && v != "" {
+		if v, ok := src[k].(string); ok && v != "" {
 			out[k] = subst.string(v)
 		}
 	}
-	if argsAny, ok := hs["args"].([]any); ok {
+	if argsAny, ok := src["args"].([]any); ok {
 		args := make([]string, 0, len(argsAny))
 		for _, a := range argsAny {
 			args = append(args, subst.string(toString(a)))
 		}
 		out["args"] = args
 	}
-	if envAny, ok := hs["env"].(map[string]any); ok {
+	if envAny, ok := src["env"].(map[string]any); ok {
 		env := make(map[string]string, len(envAny))
 		for k, v := range envAny {
 			env[k] = subst.string(toString(v))
@@ -350,9 +366,69 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 		out["env"] = env
 	}
 
-	cfg, err := json.Marshal(map[string]any{"host_service": out})
+	wrapper := map[string]any{}
+	if hs != nil {
+		wrapper["host_service"] = out
+	} else {
+		// managed_service-only fields: the closed hardware grants and the
+		// documented listen ports flow through verbatim (they are enums /
+		// integers validated by runtime/system.Spec.Validate on the device;
+		// no substitution applies).
+		if hwAny, ok := src["hardware"].(map[string]any); ok {
+			hw := map[string]any{}
+			if gs, ok := hwAny["groups"].([]any); ok {
+				groups := make([]string, 0, len(gs))
+				for _, g := range gs {
+					groups = append(groups, toString(g))
+				}
+				hw["groups"] = groups
+			}
+			if ds, ok := hwAny["devices"].([]any); ok {
+				devices := make([]string, 0, len(ds))
+				for _, d := range ds {
+					devices = append(devices, toString(d))
+				}
+				hw["devices"] = devices
+			}
+			out["hardware"] = hw
+		}
+		if lpAny, ok := src["listen_ports"].([]any); ok {
+			ports := make([]int, 0, len(lpAny))
+			for _, p := range lpAny {
+				ports = append(ports, toInt(p))
+			}
+			out["listen_ports"] = ports
+		}
+		wrapper["managed_service"] = out
+
+		// Supporting files (instance-scoped on the device) and the
+		// exclusivity group ride along at the spec level.
+		if filesAny, ok := sysBlock["files"].([]any); ok {
+			files := make([]map[string]any, 0, len(filesAny))
+			for _, f := range filesAny {
+				fm, ok := f.(map[string]any)
+				if !ok {
+					continue
+				}
+				entry := map[string]any{
+					"path":    subst.string(toString(fm["path"])),
+					"content": subst.string(toString(fm["content"])),
+				}
+				if m := toString(fm["mode"]); m != "" {
+					entry["mode"] = m
+				}
+				files = append(files, entry)
+			}
+			wrapper["files"] = files
+		}
+		if eg := toString(spec["exclusivityGroup"]); eg != "" {
+			wrapper["exclusivity_group"] = eg
+		}
+	}
+
+	cfg, err := json.Marshal(wrapper)
 	if err != nil {
-		return nil, fmt.Errorf("encode system host-service spec: %w", err)
+		return nil, fmt.Errorf("encode system spec: %w", err)
 	}
 	return cfg, nil
 }

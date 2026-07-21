@@ -56,6 +56,15 @@ func (s *Syncer) ReloadUserKeys(dir string) (int, []error) {
 	return len(keys), problems
 }
 
+// Reregister re-emits agent:register when connected. Used by the IPC layer
+// after system-setting flips (power_mode gates the runtime.system
+// capability) — mirror of the ReloadUserKeys re-register behaviour.
+func (s *Syncer) Reregister() {
+	if s.client.Connected() {
+		s.sendRegister()
+	}
+}
+
 // signedMutationOpTimeout bounds a single mutation dispatch (store writes +
 // Caddy reload are local and fast; this only guards against a wedged docker).
 const signedMutationOpTimeout = 30 * time.Second

@@ -233,6 +233,10 @@ func main() {
 		ipcSrv.SetOnUserKeysChanged(func() (int, []error) {
 			return syncer.ReloadUserKeys(cfg.Paths.UserKeysDir)
 		})
+		// power_mode gates the runtime.system capability — re-register on
+		// setting flips so the backend routes (or stops routing) system
+		// installs without an agent restart.
+		ipcSrv.SetOnSystemSettingChanged(func(string) { syncer.Reregister() })
 		files.New(wsClient, st, log.With("component", "files")).Register()
 		logspkg.New(wsClient, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)

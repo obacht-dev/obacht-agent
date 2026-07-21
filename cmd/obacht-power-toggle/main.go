@@ -31,10 +31,14 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"syscall"
+
+	"github.com/obacht-dev/obacht-agent/internal/unitpolicy"
 )
 
 const (
@@ -55,9 +59,12 @@ const (
 	// execs systemctl, so this grant cannot touch non-obacht units.
 	powerSudoersContent = `# Managed by obacht-power-toggle. Do not edit by hand.
 # Phase S5: Power Mode is ENABLED. The obacht user can run obacht-scoped
-# systemd actions, mediated by the validating 'svc' subcommand below.
+# systemd actions, mediated by the validating 'svc' subcommand below, and
+# install/remove agent-staged managed-service units, mediated by the
+# validating 'unit' subcommand (internal/unitpolicy content policy).
 # To disable, run: sudo obacht-power-toggle disable
 obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle svc *
+obacht ALL=(root) NOPASSWD: /usr/local/sbin/obacht-power-toggle unit *
 `
 )
 
@@ -100,6 +107,9 @@ func main() {
 	case "svc":
 		mustRoot()
 		os.Exit(svc(os.Args[2:]))
+	case "unit":
+		mustRoot()
+		os.Exit(unitCmd(os.Args[2:]))
 	case "status":
 		if status() {
 			fmt.Println("enabled")
@@ -115,7 +125,124 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle {enable|disable|status|svc <verb> <unit>}")
+	fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle {enable|disable|status|svc <verb> <unit>|unit {install|remove} <unit>}")
+}
+
+// unitCmd validates and installs/removes an agent-staged managed-service
+// unit. Trust model: the staged file is written by the UNPRIVILEGED obacht
+// user, so its content is fully attacker-controlled if the agent is
+// compromised — the unitpolicy content validation below is the actual
+// privilege boundary, and it runs HERE (as root), independently of whatever
+// the agent claims to have validated. The helper accepts only a unit NAME;
+// the staging path is fixed, so no caller-supplied paths are ever opened.
+func unitCmd(args []string) int {
+	if len(args) != 2 {
+		fmt.Fprintln(os.Stderr, "usage: obacht-power-toggle unit {install|remove} <unit>")
+		return 2
+	}
+	verb, name := args[0], args[1]
+	if err := unitpolicy.ValidateName(name); err != nil {
+		fmt.Fprintln(os.Stderr, "unit:", err)
+		return 2
+	}
+	installedPath := filepath.Join(unitpolicy.UnitDir, name)
+	switch verb {
+	case "install":
+		content, err := readStagedUnit(name)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "unit install:", err)
+			return 2
+		}
+		if err := unitpolicy.Validate(name, content); err != nil {
+			fmt.Fprintln(os.Stderr, "unit install: policy rejected:", err)
+			return 2
+		}
+		if err := atomicWriteRoot(installedPath, content, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "unit install:", err)
+			return 2
+		}
+		if rc := runSystemctl("daemon-reload"); rc != 0 {
+			return rc
+		}
+		if rc := runSystemctl("enable", name); rc != 0 {
+			return rc
+		}
+		fmt.Printf("unit %s installed\n", name)
+		return 0
+	case "remove":
+		// Best-effort stop/disable; the unit may already be gone.
+		_ = runSystemctl("disable", "--now", name)
+		if err := os.Remove(installedPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintln(os.Stderr, "unit remove:", err)
+			return 2
+		}
+		if rc := runSystemctl("daemon-reload"); rc != 0 {
+			return rc
+		}
+		fmt.Printf("unit %s removed\n", name)
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "unit: verb %q not allowed\n", verb)
+		return 2
+	}
+}
+
+// readStagedUnit opens the staged unit file symlink-safely (O_NOFOLLOW) and
+// enforces regular-file + size limits before any parsing happens.
+func readStagedUnit(name string) ([]byte, error) {
+	stagePath := filepath.Join(unitpolicy.StagingDir, name)
+	fh, err := os.OpenFile(stagePath, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open staged unit %s: %w", stagePath, err)
+	}
+	defer fh.Close()
+	st, err := fh.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("staged unit %s is not a regular file", stagePath)
+	}
+	if st.Size() > unitpolicy.MaxUnitSize {
+		return nil, fmt.Errorf("staged unit %s exceeds %d bytes", stagePath, unitpolicy.MaxUnitSize)
+	}
+	return io.ReadAll(io.LimitReader(fh, unitpolicy.MaxUnitSize+1))
+}
+
+// atomicWriteRoot writes a root-owned file via tmp+rename in the target dir.
+func atomicWriteRoot(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".obacht-unit-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(mode); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
+}
+
+func runSystemctl(args ...string) int {
+	cmd := exec.Command(systemctlPath, args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return ee.ExitCode()
+		}
+		fmt.Fprintln(os.Stderr, "systemctl:", err)
+		return 1
+	}
+	return 0
 }
 
 // svc validates a (verb, unit) pair and, only if both pass the closed

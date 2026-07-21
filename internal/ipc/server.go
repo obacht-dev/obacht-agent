@@ -67,6 +67,12 @@ type Server struct {
 	userKeysChangedMu sync.Mutex
 	onUserKeysChanged func() (int, []error)
 
+	// onSystemSettingChanged is invoked (when wired) after a system setting
+	// mutates — the syncer re-registers so capability flips tied to settings
+	// (runtime.system ↔ power_mode) reach the backend without a restart.
+	settingChangedMu       sync.Mutex
+	onSystemSettingChanged func(key string)
+
 	srv *http.Server
 }
 
@@ -141,6 +147,24 @@ func (s *Server) SetOnUserKeysChanged(fn func() (int, []error)) {
 	s.userKeysChangedMu.Lock()
 	s.onUserKeysChanged = fn
 	s.userKeysChangedMu.Unlock()
+}
+
+// SetOnSystemSettingChanged wires the syncer's re-register on setting flips
+// (e.g. power_mode gates the runtime.system capability). May be set after
+// Listen, same as SetOnUserKeysChanged.
+func (s *Server) SetOnSystemSettingChanged(fn func(key string)) {
+	s.settingChangedMu.Lock()
+	s.onSystemSettingChanged = fn
+	s.settingChangedMu.Unlock()
+}
+
+func (s *Server) notifySystemSettingChanged(key string) {
+	s.settingChangedMu.Lock()
+	fn := s.onSystemSettingChanged
+	s.settingChangedMu.Unlock()
+	if fn != nil {
+		fn(key)
+	}
 }
 
 func (s *Server) notifyUserKeysChanged() (int, bool) {
@@ -947,6 +971,9 @@ func (s *Server) adminSetSystemSetting(w http.ResponseWriter, r *http.Request) {
 		ParamsSummary: "value=" + body.Value,
 		Params:        map[string]any{"key": body.Key, "value": body.Value},
 	})
+	// Re-register so setting-gated capabilities (runtime.system ↔
+	// power_mode) flip on the backend without an agent restart.
+	s.notifySystemSettingChanged(body.Key)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": body.Key, "value": body.Value})
 }
 

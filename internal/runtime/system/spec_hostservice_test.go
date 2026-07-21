@@ -67,15 +67,12 @@ func TestParseSpec_HostServiceRoundTrip(t *testing.T) {
 	}
 }
 
-// A systemd spec (no HostService) must still validate via the systemd branch —
-// guards that adding the host-service branch didn't change the Pi path.
-func TestSystemdSpec_StillValidated(t *testing.T) {
-	good := Spec{UnitName: "obacht-x.service", UnitTemplate: "[Unit]\n[Service]\nExecStart=/bin/true\n"}
-	if err := good.Validate(); err != nil {
-		t.Fatalf("valid systemd spec rejected: %v", err)
-	}
-	bad := Spec{UnitName: "../escape", UnitTemplate: "x"}
-	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "unit_name") {
-		t.Fatalf("expected unit_name rejection, got %v", err)
+// The pre-v2.8 free-form systemd flavor is withdrawn: any spec carrying
+// unit_name/unit_template must be rejected explicitly (never silently
+// ignored), regardless of how well-formed it looks.
+func TestSystemdSpec_WithdrawnFlavorRejected(t *testing.T) {
+	legacy := Spec{UnitName: "obacht-x.service", UnitTemplate: "[Unit]\n[Service]\nExecStart=/bin/true\n"}
+	if err := legacy.Validate(); err == nil || !strings.Contains(err.Error(), "withdrawn") {
+		t.Fatalf("expected withdrawn rejection, got %v", err)
 	}
 }
