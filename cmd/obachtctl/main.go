@@ -366,7 +366,7 @@ func (r *runtime) instanceSetState(ctx context.Context, args []string) {
 
 func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 	if len(args) == 0 {
-		die("usage: obachtctl domain <list|claim|unclaim|bind|unbind|service>")
+		die("usage: obachtctl domain <list|claim|unclaim|bind|unbind|basic-auth|service>")
 	}
 	switch args[0] {
 	case "list":
@@ -462,6 +462,36 @@ func (r *runtime) cmdDomain(ctx context.Context, args []string) {
 		}
 		r.requireIPC()
 		code, body, err := r.doIPC(ctx, http.MethodDelete, "/v1/admin/bindings/"+*domain, nil)
+		if err != nil {
+			die("%v", err)
+		}
+		emit(code, body)
+	case "basic-auth":
+		fs := flag.NewFlagSet("domain basic-auth", flag.ExitOnError)
+		domain := fs.String("domain", "", "fqdn (required)")
+		user := fs.String("user", "", "username")
+		password := fs.String("password", "", "password (WARNING: visible in shell history/ps; prefer the webapp)")
+		clear := fs.Bool("clear", false, "remove basic auth from the domain")
+		_ = fs.Parse(args[1:])
+		if *domain == "" {
+			die("--domain is required")
+		}
+		r.requireIPC()
+		if *clear {
+			code, body, err := r.doIPC(ctx, http.MethodDelete, "/v1/admin/domains/"+*domain+"/basic-auth", nil)
+			if err != nil {
+				die("%v", err)
+			}
+			emit(code, body)
+			return
+		}
+		if *user == "" || *password == "" {
+			die("--user and --password required (or --clear)")
+		}
+		code, body, err := r.doIPC(ctx, http.MethodPost, "/v1/admin/domains/"+*domain+"/basic-auth", map[string]any{
+			"username": *user,
+			"password": *password,
+		})
 		if err != nil {
 			die("%v", err)
 		}
@@ -1214,6 +1244,7 @@ func usage(w *os.File) {
 	fmt.Fprintln(w, "  domain unclaim --domain=FQDN             remove a domain")
 	fmt.Fprintln(w, "  domain bind --domain=FQDN --instance=ID --service=NAME [--mode=root|path] [--path-prefix=/x]")
 	fmt.Fprintln(w, "  domain unbind --domain=FQDN              remove ingress binding for a domain")
+	fmt.Fprintln(w, "  domain basic-auth --domain=FQDN --user=U --password=P | --clear   set/remove HTTP basic auth")
 	fmt.Fprintln(w, "  domain service --instance=ID --service=NAME --target=TGT [--type=docker_dns|host_port]")
 	fmt.Fprintln(w, "  ingress reload                           force a Caddy reload")
 	fmt.Fprintln(w, "  audit tail [--n N]                       show recent audit entries (newest first)")

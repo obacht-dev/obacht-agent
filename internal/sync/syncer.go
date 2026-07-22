@@ -368,7 +368,7 @@ func (s *Syncer) pushTelemetry(ctx context.Context) {
 func (s *Syncer) sendRegister() {
 	ident := compat.Detect("/var/lib/obacht")
 	hostname, _ := os.Hostname()
-	capabilities := []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix", "progress.v1"}
+	capabilities := []string{"ingress.caddy", "runtime.container", "runtime.compose", "ipc.unix", "progress.v1", "ingress.basic-auth"}
 	// Advertise signed-mutation support only when at least one user key is
 	// pinned — the api/webapp route mutations by this capability, and a
 	// device that would deny everything must not attract them.
@@ -485,6 +485,8 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		CertNotAfter   int64  `json:"cert_not_after,omitempty"`
 		CertIssuer     string `json:"cert_issuer,omitempty"`
 		CertObserved   string `json:"cert_observed_state,omitempty"`
+		// Username only — the bcrypt hash never leaves the device.
+		BasicAuthUser string `json:"basic_auth_user,omitempty"`
 	}
 
 	instances := make([]instOut, 0, len(insts))
@@ -536,7 +538,7 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		o := domOut{
 			Domain: d.Domain, DesiredStatus: d.DesiredStatus,
 			ObservedStatus: d.ObservedStatus, LastError: d.LastError,
-			CertIssuer: d.CertIssuer,
+			CertIssuer: d.CertIssuer, BasicAuthUser: d.BasicAuthUser,
 		}
 		if !d.CertNotAfter.IsZero() {
 			o.CertNotAfter = d.CertNotAfter.Unix()

@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/basicauth"
 	"github.com/obacht-dev/obacht-agent/internal/redact"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/signedmut"
@@ -279,6 +280,8 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/admin/domains", admin(s.adminListDomains))
 	mux.HandleFunc("POST /v1/admin/domains", admin(s.adminUpsertDomain))
 	mux.HandleFunc("DELETE /v1/admin/domains/{domain}", admin(s.adminDeleteDomain))
+	mux.HandleFunc("POST /v1/admin/domains/{domain}/basic-auth", admin(s.adminSetDomainBasicAuth))
+	mux.HandleFunc("DELETE /v1/admin/domains/{domain}/basic-auth", admin(s.adminClearDomainBasicAuth))
 	mux.HandleFunc("POST /v1/admin/bindings", admin(s.adminUpsertBinding))
 	mux.HandleFunc("DELETE /v1/admin/bindings/{domain}", admin(s.adminDeleteBinding))
 	mux.HandleFunc("POST /v1/admin/services", admin(s.adminUpsertService))
@@ -561,6 +564,10 @@ func (s *Server) adminListDomains(w http.ResponseWriter, r *http.Request) {
 		if !d.CertNotAfter.IsZero() {
 			m["cert_not_after"] = d.CertNotAfter.Unix()
 		}
+		if d.BasicAuthUser != "" {
+			// Username only — the hash stays in the DB.
+			m["basic_auth_user"] = d.BasicAuthUser
+		}
 		if b, ok := bindByDomain[d.Domain]; ok {
 			m["binding"] = map[string]any{
 				"instance_id":  b.InstanceID,
@@ -614,6 +621,63 @@ func (s *Server) adminDeleteDomain(w http.ResponseWriter, r *http.Request) {
 	}
 	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "deleted": d})
+}
+
+// adminSetDomainBasicAuth sets HTTP Basic Auth for a domain. The password is
+// bcrypt-hashed immediately and never stored or audited in plaintext.
+func (s *Server) adminSetDomainBasicAuth(w http.ResponseWriter, r *http.Request) {
+	d := r.PathValue("domain")
+	var body struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := basicauth.ValidateCredentials(body.Username, body.Password); err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	hash, err := basicauth.Hash(body.Password)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	if err := s.store.SetDomainBasicAuth(r.Context(), d, body.Username, hash); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.set_basic_auth", Actor: "obachtctl", Target: d, Result: audit.ResultError, ErrorMessage: err.Error(), Params: map[string]any{"username": body.Username}})
+		code := http.StatusBadRequest
+		if errors.Is(err, store.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.set_basic_auth", Actor: "obachtctl", Target: d, Params: map[string]any{"username": body.Username}, ParamsSummary: "user=" + body.Username})
+	if s.ingress != nil {
+		_ = s.ingress.Reload(r.Context())
+	}
+	s.nudgeIngressLoop()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": d, "username": body.Username})
+}
+
+func (s *Server) adminClearDomainBasicAuth(w http.ResponseWriter, r *http.Request) {
+	d := r.PathValue("domain")
+	if err := s.store.SetDomainBasicAuth(r.Context(), d, "", ""); err != nil {
+		_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.clear_basic_auth", Actor: "obachtctl", Target: d, Result: audit.ResultError, ErrorMessage: err.Error()})
+		code := http.StatusBadRequest
+		if errors.Is(err, store.ErrNotFound) {
+			code = http.StatusNotFound
+		}
+		writeErr(w, code, err)
+		return
+	}
+	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.clear_basic_auth", Actor: "obachtctl", Target: d})
+	if s.ingress != nil {
+		_ = s.ingress.Reload(r.Context())
+	}
+	s.nudgeIngressLoop()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": d, "cleared": true})
 }
 
 type bindingReq struct {

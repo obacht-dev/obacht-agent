@@ -34,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/basicauth"
 	"github.com/obacht-dev/obacht-agent/internal/config"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
 	"github.com/obacht-dev/obacht-agent/internal/store"
@@ -352,6 +353,21 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 		bind, hasBinding := bindByDomain[d.Domain]
 
 		fmt.Fprintf(&b, "%s {\n", d.Domain)
+		// HTTP Basic Auth guards the whole site (all paths, including the
+		// unbound "ready" page). Username and hash are validated again at
+		// render time — like isValidDomain above, they are emitted as
+		// unquoted tokens and must never be able to inject directives
+		// (SEC-12). A present-but-invalid pair fails CLOSED: the user asked
+		// for protection, so we serve a 503 instead of the unprotected app.
+		if d.BasicAuthHash != "" {
+			if !basicauth.ValidUsername(d.BasicAuthUser) || !basicauth.ValidHash(d.BasicAuthHash) {
+				m.log.Warn("invalid basic auth credentials; serving 503", "domain", d.Domain)
+				b.WriteString("\trespond \"obacht: basic auth misconfigured for this domain\" 503\n}\n\n")
+				summary.observed[d.Domain] = store.DomainStatusError
+				continue
+			}
+			fmt.Fprintf(&b, "\tbasic_auth {\n\t\t%s %s\n\t}\n", d.BasicAuthUser, d.BasicAuthHash)
+		}
 		if hasBinding {
 			var (
 				upstream string

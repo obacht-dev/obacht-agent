@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/basicauth"
 	"github.com/obacht-dev/obacht-agent/internal/manifest"
 	"github.com/obacht-dev/obacht-agent/internal/signedmut"
 	"github.com/obacht-dev/obacht-agent/internal/store"
@@ -161,6 +162,42 @@ func (s *Syncer) dispatchSignedMutation(ctx context.Context, m *signedmut.Mutati
 		}
 		if err := s.store.DeleteDomain(ctx, p.Domain); err != nil {
 			return err
+		}
+		s.rec.Trigger()
+		return nil
+
+	case "domain.set_basic_auth":
+		// SECURITY: p.Password is the only secret-shaped param on the signed
+		// path. It is bcrypt-hashed here and discarded — never stored in
+		// plaintext, never logged (audit keeps nonce+op only, see
+		// auditSignedMutation), never echoed in results or observed state.
+		var p struct {
+			Domain   string `json:"domain"`
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Clear    bool   `json:"clear"`
+		}
+		if err := json.Unmarshal(m.Params, &p); err != nil || p.Domain == "" {
+			return errors.New("invalid params for domain.set_basic_auth")
+		}
+		if p.Clear {
+			if err := s.store.SetDomainBasicAuth(ctx, p.Domain, "", ""); err != nil {
+				return err
+			}
+		} else {
+			if err := basicauth.ValidateCredentials(p.Username, p.Password); err != nil {
+				return err
+			}
+			hash, err := basicauth.Hash(p.Password)
+			if err != nil {
+				return err
+			}
+			if err := s.store.SetDomainBasicAuth(ctx, p.Domain, p.Username, hash); err != nil {
+				return err
+			}
+		}
+		if s.ingress != nil {
+			_ = s.ingress.Reload(ctx)
 		}
 		s.rec.Trigger()
 		return nil

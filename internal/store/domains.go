@@ -26,6 +26,11 @@ type Domain struct {
 	CertNotAfter    time.Time
 	CertIssuer      string
 	LastError       string
+	// HTTP Basic Auth in front of this domain's site block. The bcrypt
+	// hash is device-local only — observed-state snapshots may echo the
+	// username, never the hash.
+	BasicAuthUser   string
+	BasicAuthHash   string
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
 }
@@ -109,6 +114,28 @@ func (s *Store) SetDomainCert(ctx context.Context, domain string, notAfter time.
 	return err
 }
 
+// SetDomainBasicAuth stores (or, with empty strings, clears) the HTTP Basic
+// Auth credentials for a domain. Callers pass a bcrypt hash, never plaintext.
+func (s *Store) SetDomainBasicAuth(ctx context.Context, domain, username, hash string) error {
+	if domain == "" {
+		return errors.New("domain is required")
+	}
+	if (username == "") != (hash == "") {
+		return errors.New("username and hash must be set together (or both empty to clear)")
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE domains
+		   SET basic_auth_user = ?, basic_auth_hash = ?, updated_at = ?
+		 WHERE domain = ?`, username, hash, time.Now().Unix(), domain)
+	if err != nil {
+		return fmt.Errorf("set basic auth for %s: %w", domain, err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // DeleteDomain removes the domain row (cascades to ingress_bindings).
 func (s *Store) DeleteDomain(ctx context.Context, domain string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM domains WHERE domain = ?`, domain)
@@ -124,6 +151,8 @@ func (s *Store) ListDomains(ctx context.Context) ([]Domain, error) {
 		       COALESCE(cert_not_after, 0),
 		       COALESCE(cert_issuer, ''),
 		       COALESCE(last_error, ''),
+		       COALESCE(basic_auth_user, ''),
+		       COALESCE(basic_auth_hash, ''),
 		       created_at, updated_at
 		FROM domains ORDER BY domain ASC`)
 	if err != nil {
@@ -137,7 +166,7 @@ func (s *Store) ListDomains(ctx context.Context) ([]Domain, error) {
 			notAfter    int64
 			created, ua int64
 		)
-		if err := rows.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &created, &ua); err != nil {
+		if err := rows.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &d.BasicAuthUser, &d.BasicAuthHash, &created, &ua); err != nil {
 			return nil, err
 		}
 		if notAfter > 0 {
@@ -159,6 +188,8 @@ func (s *Store) GetDomain(ctx context.Context, domain string) (*Domain, error) {
 		       COALESCE(cert_not_after, 0),
 		       COALESCE(cert_issuer, ''),
 		       COALESCE(last_error, ''),
+		       COALESCE(basic_auth_user, ''),
+		       COALESCE(basic_auth_hash, ''),
 		       created_at, updated_at
 		FROM domains WHERE domain = ?`, domain)
 	var (
@@ -166,7 +197,7 @@ func (s *Store) GetDomain(ctx context.Context, domain string) (*Domain, error) {
 		notAfter    int64
 		created, ua int64
 	)
-	if err := row.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &created, &ua); err != nil {
+	if err := row.Scan(&d.Domain, &d.DesiredStatus, &d.ObservedStatus, &notAfter, &d.CertIssuer, &d.LastError, &d.BasicAuthUser, &d.BasicAuthHash, &created, &ua); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}

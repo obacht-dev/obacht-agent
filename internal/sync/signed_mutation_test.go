@@ -220,6 +220,59 @@ func TestDispatchBindingUpsertDelete(t *testing.T) {
 	}
 }
 
+func TestDispatchDomainSetBasicAuth(t *testing.T) {
+	s, st, _ := newDispatchSyncer(t)
+	ctx := context.Background()
+	if err := st.UpsertDomain(ctx, "auth.example.com", store.DomainStatusReady); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.dispatchSignedMutation(ctx, mutation(t, "domain.set_basic_auth", map[string]any{
+		"domain": "auth.example.com", "username": "admin", "password": "supersecret",
+	})); err != nil {
+		t.Fatalf("domain.set_basic_auth: %v", err)
+	}
+	d, err := st.GetDomain(ctx, "auth.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.BasicAuthUser != "admin" || !strings.HasPrefix(d.BasicAuthHash, "$2") {
+		t.Fatalf("credentials not stored as bcrypt: %#v", d)
+	}
+	if strings.Contains(d.BasicAuthHash, "supersecret") {
+		t.Fatal("plaintext password stored")
+	}
+
+	// Weak/invalid inputs are rejected.
+	if err := s.dispatchSignedMutation(ctx, mutation(t, "domain.set_basic_auth", map[string]any{
+		"domain": "auth.example.com", "username": "admin", "password": "short",
+	})); err == nil {
+		t.Fatal("short password must be rejected")
+	}
+	if err := s.dispatchSignedMutation(ctx, mutation(t, "domain.set_basic_auth", map[string]any{
+		"domain": "auth.example.com", "username": "bad user", "password": "supersecret",
+	})); err == nil {
+		t.Fatal("username with whitespace must be rejected")
+	}
+	// Unknown domain errors.
+	if err := s.dispatchSignedMutation(ctx, mutation(t, "domain.set_basic_auth", map[string]any{
+		"domain": "nope.example.com", "username": "admin", "password": "supersecret",
+	})); err == nil {
+		t.Fatal("unknown domain must be rejected")
+	}
+
+	// Clear removes the credentials.
+	if err := s.dispatchSignedMutation(ctx, mutation(t, "domain.set_basic_auth", map[string]any{
+		"domain": "auth.example.com", "clear": true,
+	})); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	d, _ = st.GetDomain(ctx, "auth.example.com")
+	if d.BasicAuthUser != "" || d.BasicAuthHash != "" {
+		t.Fatalf("credentials not cleared: %#v", d)
+	}
+}
+
 const containerTestManifest = `apiVersion: obacht.dev/v2
 kind: TemplateManifest
 metadata:
