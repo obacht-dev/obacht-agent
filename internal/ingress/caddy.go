@@ -165,8 +165,10 @@ func (m *Manager) Apply(ctx context.Context) error {
 
 	// Reflect observed status into the SSOT regardless of whether the
 	// Caddyfile changed: cert state can flip without the file changing.
+	// Error statuses carry the render's reason so the UI can explain WHY
+	// instead of showing a bare red state.
 	for d, s := range summary.observed {
-		if err := m.store.SetDomainObserved(ctx, d, s, ""); err != nil {
+		if err := m.store.SetDomainObserved(ctx, d, s, summary.lastErrors[d]); err != nil {
 			m.log.Warn("set domain observed", "domain", d, "err", err)
 		}
 	}
@@ -270,6 +272,7 @@ type renderSummary struct {
 	totalDomains int
 	bound        int
 	observed     map[string]string // domain → observed_status to write back
+	lastErrors   map[string]string // domain → human-readable reason for an error status
 	localPorts   []int             // host ports bound this pass (drive Mac forwarders)
 }
 
@@ -331,7 +334,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 	}
 	b.WriteString("}\n\n")
 
-	summary := renderSummary{observed: map[string]string{}}
+	summary := renderSummary{observed: map[string]string{}, lastErrors: map[string]string{}}
 
 	// Stable order makes the hash stable.
 	sort.Slice(domains, func(i, j int) bool { return domains[i].Domain < domains[j].Domain })
@@ -347,6 +350,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 		if !isValidDomain(d.Domain) {
 			m.log.Warn("skipping domain with invalid name", "domain", d.Domain)
 			summary.observed[d.Domain] = store.DomainStatusError
+			summary.lastErrors[d.Domain] = "domain name is not a valid hostname"
 			continue
 		}
 		summary.totalDomains++
@@ -364,6 +368,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 				m.log.Warn("invalid basic auth credentials; serving 503", "domain", d.Domain)
 				b.WriteString("\trespond \"obacht: basic auth misconfigured for this domain\" 503\n}\n\n")
 				summary.observed[d.Domain] = store.DomainStatusError
+				summary.lastErrors[d.Domain] = "stored basic auth credentials are invalid; serving 503 until they are set again or removed"
 				continue
 			}
 			fmt.Fprintf(&b, "\tbasic_auth {\n\t\t%s %s\n\t}\n", d.BasicAuthUser, d.BasicAuthHash)

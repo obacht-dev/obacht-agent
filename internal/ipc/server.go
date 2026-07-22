@@ -654,9 +654,8 @@ func (s *Server) adminSetDomainBasicAuth(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.set_basic_auth", Actor: "obachtctl", Target: d, Params: map[string]any{"username": body.Username}, ParamsSummary: "user=" + body.Username})
-	if s.ingress != nil {
-		_ = s.ingress.Reload(r.Context())
-	}
+	// No ingress.Reload: it re-pushes the previously rendered Caddyfile and
+	// cannot apply this change; the nudged ingress loop renders + reloads.
 	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": d, "username": body.Username})
 }
@@ -673,9 +672,7 @@ func (s *Server) adminClearDomainBasicAuth(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	_ = s.audit.Append(r.Context(), audit.Entry{Op: "domain.clear_basic_auth", Actor: "obachtctl", Target: d})
-	if s.ingress != nil {
-		_ = s.ingress.Reload(r.Context())
-	}
+	// No ingress.Reload — see adminSetDomainBasicAuth.
 	s.nudgeIngressLoop()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "domain": d, "cleared": true})
 }

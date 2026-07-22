@@ -196,9 +196,10 @@ func (s *Syncer) dispatchSignedMutation(ctx context.Context, m *signedmut.Mutati
 				return err
 			}
 		}
-		if s.ingress != nil {
-			_ = s.ingress.Reload(ctx)
-		}
+		// No ingress.Reload here: Reload re-pushes the PREVIOUSLY rendered
+		// Caddyfile (it never renders), so it cannot apply this change. The
+		// reconcile pass ends in an ingress Apply (render + diff + reload)
+		// which converges within seconds.
 		s.rec.Trigger()
 		return nil
 
@@ -418,9 +419,10 @@ func (s *Syncer) auditSignedMutation(ctx context.Context, outcome, op, keyLabel,
 	}
 	if m != nil {
 		e.Params["nonce"] = m.Nonce
-		// Params of accepted mutations are not secret-shaped today
-		// (domain names + status), but keep this a summary, not a dump,
-		// so a future op can't accidentally leak config into the audit log.
+		// SECURITY: params ARE secret-shaped — domain.set_basic_auth carries
+		// a plaintext password. Only the nonce and the op name may ever land
+		// in the audit log; never add m.Params (or anything derived from it)
+		// here without routing through internal/redact first.
 		e.ParamsSummary = m.Op
 	}
 	switch outcome {
