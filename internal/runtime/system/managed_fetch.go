@@ -66,7 +66,7 @@ func EnsureManagedBinary(ms ManagedServiceSpec) (string, error) {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
 			}
-			if req.URL.Scheme != "https" || !allowedDownloadHosts[req.URL.Host] {
+			if req.URL.Scheme != "https" || !RedirectHostAllowed(req.URL.Host) {
 				return fmt.Errorf("redirect to disallowed target %q", req.URL.Redacted())
 			}
 			return nil

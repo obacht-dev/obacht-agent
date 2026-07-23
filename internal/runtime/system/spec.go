@@ -166,9 +166,24 @@ var hostBinaryRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
 // The sha256 digest is the real protection; this is defence in depth so a
 // (signed-but-wrong) manifest cannot point the downloader at an arbitrary host.
 var allowedDownloadHosts = map[string]bool{
-	"ollama.com":                    true,
-	"github.com":                    true,
-	"objects.githubusercontent.com": true,
+	"ollama.com":                           true,
+	"github.com":                           true,
+	"objects.githubusercontent.com":        true,
+	"release-assets.githubusercontent.com": true,
+}
+
+// RedirectHostAllowed reports whether a redirect hop may target host. The
+// INITIAL url is still validated strictly against allowedDownloadHosts; this
+// looser check applies only to redirect targets, where GitHub bounces release
+// downloads to its content CDN. That CDN host has changed before
+// (objects → release-assets .githubusercontent.com), so any
+// *.githubusercontent.com host (all GitHub-controlled) is accepted to avoid a
+// fleet-wide fresh-install breakage the next time GitHub renames it.
+func RedirectHostAllowed(host string) bool {
+	if allowedDownloadHosts[host] {
+		return true
+	}
+	return strings.HasSuffix(host, ".githubusercontent.com")
 }
 
 func (h HostServiceSpec) validate() error {
