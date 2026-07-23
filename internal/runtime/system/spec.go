@@ -105,6 +105,12 @@ type Spec struct {
 	Files            []File `json:"files,omitempty"`
 	ExclusivityGroup string `json:"exclusivity_group,omitempty"`
 
+	// Services carries spec.services so the reconciler can register each named
+	// service's ingress target (host_port) — a managed service listens on a
+	// host port, and a bound domain's Caddy reaches it via the host gateway.
+	// Without this a domain binding renders a 503 "no registered service yet".
+	Services []Service `json:"services,omitempty"`
+
 	// HostService, when set, makes this a macOS host-service instance
 	// (launchd). Only ever materialized for Mac devices; the linux driver
 	// rejects it. See driver_darwin.go.
@@ -335,6 +341,15 @@ func keysOf(m map[string]bool) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// Service is a named ingress target a system instance exposes. For a managed
+// service TargetType is "host_port" and TargetPort is the local port the
+// binary listens on.
+type Service struct {
+	Name       string `json:"name"`
+	TargetType string `json:"target_type"`
+	TargetPort int    `json:"target_port"`
 }
 
 // File is a supporting file rendered alongside the unit. Mode defaults to

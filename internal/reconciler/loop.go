@@ -688,6 +688,27 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 			_ = r.store.SetObservedState(ctx, inst.ID, "error", err.Error())
 			return
 		}
+		// Register the manifest's named services so ingress bindings can route
+		// to the host process. A managed service listens on a host port; the
+		// bound domain's Caddy reaches it via the host gateway (host_port
+		// target). Idempotent (every reconcile), mirroring the container path.
+		for _, svc := range spec.Services {
+			if svc.Name == "" || svc.TargetPort == 0 {
+				continue
+			}
+			targetType := svc.TargetType
+			if targetType == "" {
+				targetType = "host_port"
+			}
+			if err := r.store.UpsertService(ctx, store.InstanceService{
+				InstanceID:  inst.ID,
+				ServiceName: svc.Name,
+				TargetType:  targetType,
+				Target:      fmt.Sprintf("127.0.0.1:%d", svc.TargetPort),
+			}); err != nil {
+				r.log.Warn("upsert system service", "instance", inst.ID, "service", svc.Name, "err", err)
+			}
+		}
 		// Report observed state so the webapp leaves the transient "installing"
 		// state (system instances reconcile inline, not through the container
 		// worker that would otherwise write this).

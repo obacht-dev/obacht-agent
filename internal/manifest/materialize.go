@@ -443,6 +443,11 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 		if eg := toString(spec["exclusivityGroup"]); eg != "" {
 			wrapper["exclusivity_group"] = eg
 		}
+		// Named ingress services (spec.services) so the reconciler can register
+		// the host_port target a bound domain routes to.
+		if svcs := materializeSystemServices(spec); svcs != nil {
+			wrapper["services"] = svcs
+		}
 	}
 
 	cfg, err := json.Marshal(wrapper)
@@ -450,6 +455,29 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 		return nil, fmt.Errorf("encode system spec: %w", err)
 	}
 	return cfg, nil
+}
+
+// materializeSystemServices copies spec.services into the system config so the
+// reconciler can register each service's ingress target. Ports are integers /
+// closed-shape values (no ${cfg.X} substitution needed for camera/kiosk).
+func materializeSystemServices(spec map[string]any) []map[string]any {
+	svcsAny, ok := spec["services"].([]any)
+	if !ok || len(svcsAny) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(svcsAny))
+	for _, s := range svcsAny {
+		sm, ok := s.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, map[string]any{
+			"name":        toString(sm["name"]),
+			"target_type": toString(sm["targetType"]),
+			"target_port": toInt(sm["targetPort"]),
+		})
+	}
+	return out
 }
 
 // materializeSystemFiles renders spec.runtime.system.files[] with ${cfg.X} /
