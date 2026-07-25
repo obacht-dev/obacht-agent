@@ -5,7 +5,7 @@
 //     container can reach template containers by name.
 //   - Run a single Caddy 2 container with persistent data/config volumes.
 //   - Generate the Caddyfile from the SQLite SSOT (domains + ingress_bindings
-//     + instance_services) and reload Caddy in place.
+//   - instance_services) and reload Caddy in place.
 //   - Drive the per-domain state machine: pending → claiming → ready → bound
 //     (observed_status), reflecting what Caddy has actually achieved.
 //
@@ -60,13 +60,29 @@ func isValidDomain(d string) bool {
 	return len(d) <= 253 && domainRe.MatchString(d)
 }
 
+// appPathRe constrains service.appPath to a safe absolute path. It is rendered
+// UNQUOTED into a `redir / <path>` directive, so — like the domain label —
+// anything with whitespace/braces/newlines could inject Caddy directives.
+var appPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
+
+// sanitizeAppPath returns the app path only if it is a safe absolute path,
+// else "" (skip the redirect). Defence in depth: the registry validator
+// already enforces the same shape, but the agent must never render an
+// unvalidated value into the Caddyfile.
+func sanitizeAppPath(p string) string {
+	if p == "" || len(p) > 512 || !appPathRe.MatchString(p) {
+		return ""
+	}
+	return p
+}
+
 // Manager owns the Caddy lifecycle and Caddyfile generation.
 type Manager struct {
-	docker  *container.Driver
-	store   *store.Store
-	cfg     config.IngressConfig
-	paths   config.PathsConfig
-	log     *slog.Logger
+	docker *container.Driver
+	store  *store.Store
+	cfg    config.IngressConfig
+	paths  config.PathsConfig
+	log    *slog.Logger
 
 	mu       sync.Mutex
 	lastHash string
@@ -377,6 +393,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 			var (
 				upstream string
 				upErr    error
+				appPath  string
 			)
 			if bind.LocalPort > 0 {
 				// Local-port reverse proxy: target a host port (a service the
@@ -402,6 +419,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 				if lp > 0 {
 					summary.localPorts = append(summary.localPorts, lp)
 				}
+				appPath = svc.AppPath
 			}
 			if upErr != nil {
 				fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(upErr.Error()))
@@ -410,6 +428,12 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 				if bind.Mode == "path" && bind.PathPrefix != "" {
 					fmt.Fprintf(&b, "\thandle %s* {\n\t\treverse_proxy %s\n\t}\n", bind.PathPrefix, upstream)
 				} else {
+					// Spec v2.8 service.appPath: for an app whose entry page lives
+					// under a subpath (e.g. MediaMTX at /cam/), send a bare root
+					// visit there. `redir / <path>` matches ONLY the exact "/".
+					if ap := sanitizeAppPath(appPath); ap != "" {
+						fmt.Fprintf(&b, "\tredir / %s\n", ap)
+					}
 					fmt.Fprintf(&b, "\treverse_proxy %s\n", upstream)
 				}
 				summary.bound++

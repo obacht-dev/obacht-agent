@@ -95,6 +95,7 @@ type matServiceSpec struct {
 	Name       string `json:"name"`
 	TargetType string `json:"targetType,omitempty"`
 	TargetPort int    `json:"targetPort"`
+	AppPath    string `json:"appPath,omitempty"`
 }
 
 // Materialize takes the raw manifest bytes (YAML, since v2
@@ -280,6 +281,7 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 				Name:       toString(sm["name"]),
 				TargetType: toString(sm["targetType"]),
 				TargetPort: toInt(sm["targetPort"]),
+				AppPath:    toString(sm["appPath"]),
 			})
 		}
 	}
@@ -471,11 +473,15 @@ func materializeSystemServices(spec map[string]any) []map[string]any {
 		if !ok {
 			continue
 		}
-		out = append(out, map[string]any{
+		entry := map[string]any{
 			"name":        toString(sm["name"]),
 			"target_type": toString(sm["targetType"]),
 			"target_port": toInt(sm["targetPort"]),
-		})
+		}
+		if ap := toString(sm["appPath"]); ap != "" {
+			entry["app_path"] = ap
+		}
+		out = append(out, entry)
 	}
 	return out
 }

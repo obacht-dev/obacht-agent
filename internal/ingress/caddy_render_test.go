@@ -105,3 +105,78 @@ func TestRenderMacPortsGlobal(t *testing.T) {
 		t.Errorf("expected :8080 fallback listener:\n%s", out)
 	}
 }
+
+// Spec v2.8 service.appPath: a service whose app lives under a subpath gets a
+// `redir / <appPath>` (before the reverse_proxy) when bound at the domain
+// root, so a bare-root visitor lands on the app. A service without appPath
+// gets no redirect.
+func TestRenderServiceAppPathRedirect(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	// Instance with a host_port service that carries appPath.
+	if err := st.UpsertInstance(ctx, store.Instance{ID: "cam1", TemplateID: "camera-streamer", Runtime: store.RuntimeSystem, DesiredState: store.DesiredInstalled}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertService(ctx, store.InstanceService{InstanceID: "cam1", ServiceName: "web", TargetType: "host_port", Target: "127.0.0.1:8888", AppPath: "/cam/"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDomain(ctx, "cam.example.com", store.DomainStatusReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBinding(ctx, store.IngressBinding{Domain: "cam.example.com", InstanceID: "cam1", ServiceName: "web", Mode: "root"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second instance/service WITHOUT appPath, bound at root.
+	if err := st.UpsertInstance(ctx, store.Instance{ID: "web1", TemplateID: "whoami", Runtime: store.RuntimeContainer, DesiredState: store.DesiredInstalled}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertService(ctx, store.InstanceService{InstanceID: "web1", ServiceName: "web", TargetType: "docker_dns", Target: "obacht-web1:80"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertDomain(ctx, "plain.example.com", store.DomainStatusReady); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBinding(ctx, store.IngressBinding{Domain: "plain.example.com", InstanceID: "web1", ServiceName: "web", Mode: "root"}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{store: st, cfg: config.IngressConfig{HTTPPort: 80, HTTPSPort: 443}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body, _, err := m.renderCaddyfile(ctx)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+
+	// The camera domain emits the redirect, before its reverse_proxy.
+	camBlock := siteBlock(t, body, "cam.example.com")
+	if !strings.Contains(camBlock, "redir / /cam/") {
+		t.Errorf("camera site missing `redir / /cam/`:\n%s", camBlock)
+	}
+	if strings.Index(camBlock, "redir / /cam/") > strings.Index(camBlock, "reverse_proxy") {
+		t.Errorf("redir must come before reverse_proxy:\n%s", camBlock)
+	}
+	// The plain domain gets no redirect.
+	plainBlock := siteBlock(t, body, "plain.example.com")
+	if strings.Contains(plainBlock, "redir") {
+		t.Errorf("plain site must not emit a redir:\n%s", plainBlock)
+	}
+}
+
+// siteBlock returns the Caddyfile block for a domain ("<domain> { ... }").
+func siteBlock(t *testing.T, body, domain string) string {
+	t.Helper()
+	start := strings.Index(body, domain+" {")
+	if start < 0 {
+		t.Fatalf("no site block for %s in:\n%s", domain, body)
+	}
+	end := strings.Index(body[start:], "\n}\n")
+	if end < 0 {
+		return body[start:]
+	}
+	return body[start : start+end]
+}

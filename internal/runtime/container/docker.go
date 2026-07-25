@@ -253,6 +253,7 @@ type ServiceSpec struct {
 	Name       string `json:"name"`
 	TargetType string `json:"targetType,omitempty"`
 	TargetPort int    `json:"targetPort"`
+	AppPath    string `json:"appPath,omitempty"`
 }
 
 // PortMap maps a host port to a container port (TCP only for v1).

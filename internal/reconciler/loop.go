@@ -598,6 +598,7 @@ func (r *Reconciler) applyContainer(ctx context.Context, inst store.Instance, ob
 			ServiceName: svc.Name,
 			TargetType:  "docker_dns",
 			Target:      target,
+			AppPath:     svc.AppPath,
 		}); err != nil {
 			r.log.Warn("upsert service", "instance", inst.ID, "service", svc.Name, "err", err)
 		}
@@ -705,6 +706,7 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 				ServiceName: svc.Name,
 				TargetType:  targetType,
 				Target:      fmt.Sprintf("127.0.0.1:%d", svc.TargetPort),
+				AppPath:     svc.AppPath,
 			}); err != nil {
 				r.log.Warn("upsert system service", "instance", inst.ID, "service", svc.Name, "err", err)
 			}

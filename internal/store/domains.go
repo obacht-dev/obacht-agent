@@ -20,19 +20,19 @@ const (
 
 // Domain is one row in `domains`.
 type Domain struct {
-	Domain          string
-	DesiredStatus   string
-	ObservedStatus  string
-	CertNotAfter    time.Time
-	CertIssuer      string
-	LastError       string
+	Domain         string
+	DesiredStatus  string
+	ObservedStatus string
+	CertNotAfter   time.Time
+	CertIssuer     string
+	LastError      string
 	// HTTP Basic Auth in front of this domain's site block. The bcrypt
 	// hash is device-local only — observed-state snapshots may echo the
 	// username, never the hash.
-	BasicAuthUser   string
-	BasicAuthHash   string
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	BasicAuthUser string
+	BasicAuthHash string
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
 }
 
 // IngressBinding is one row in `ingress_bindings`.
@@ -55,6 +55,10 @@ type InstanceService struct {
 	ServiceName string
 	TargetType  string
 	Target      string
+	// AppPath (spec v2.8): when this service is bound at the domain root, the
+	// Caddy renderer emits `redir / <AppPath>` (apps serving under a subpath,
+	// e.g. MediaMTX at /cam/). Empty = no redirect.
+	AppPath string
 }
 
 // UpsertDomain inserts a new domain or updates the desired status. The legacy
@@ -291,19 +295,20 @@ func (s *Store) UpsertService(ctx context.Context, svc InstanceService) error {
 		return errors.New("instance_id, service_name, target_type, target required")
 	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO instance_services(instance_id, service_name, target_type, target)
-		VALUES(?, ?, ?, ?)
+		INSERT INTO instance_services(instance_id, service_name, target_type, target, app_path)
+		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT(instance_id, service_name) DO UPDATE SET
 			target_type = excluded.target_type,
-			target      = excluded.target
-	`, svc.InstanceID, svc.ServiceName, svc.TargetType, svc.Target)
+			target      = excluded.target,
+			app_path    = excluded.app_path
+	`, svc.InstanceID, svc.ServiceName, svc.TargetType, svc.Target, nullIfEmpty(svc.AppPath))
 	return err
 }
 
 // ListInstanceServices returns every service known to the agent.
 func (s *Store) ListInstanceServices(ctx context.Context) ([]InstanceService, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT instance_id, service_name, target_type, target FROM instance_services`)
+		`SELECT instance_id, service_name, target_type, target, app_path FROM instance_services`)
 	if err != nil {
 		return nil, fmt.Errorf("list services: %w", err)
 	}
@@ -311,9 +316,11 @@ func (s *Store) ListInstanceServices(ctx context.Context) ([]InstanceService, er
 	var out []InstanceService
 	for rows.Next() {
 		var s InstanceService
-		if err := rows.Scan(&s.InstanceID, &s.ServiceName, &s.TargetType, &s.Target); err != nil {
+		var appPath sql.NullString
+		if err := rows.Scan(&s.InstanceID, &s.ServiceName, &s.TargetType, &s.Target, &appPath); err != nil {
 			return nil, err
 		}
+		s.AppPath = appPath.String
 		out = append(out, s)
 	}
 	return out, rows.Err()
@@ -322,14 +329,16 @@ func (s *Store) ListInstanceServices(ctx context.Context) ([]InstanceService, er
 // GetInstanceService looks up one (instance_id, service_name) target.
 func (s *Store) GetInstanceService(ctx context.Context, instanceID, serviceName string) (*InstanceService, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT instance_id, service_name, target_type, target
+		`SELECT instance_id, service_name, target_type, target, app_path
 		   FROM instance_services WHERE instance_id = ? AND service_name = ?`, instanceID, serviceName)
 	var svc InstanceService
-	if err := row.Scan(&svc.InstanceID, &svc.ServiceName, &svc.TargetType, &svc.Target); err != nil {
+	var appPath sql.NullString
+	if err := row.Scan(&svc.InstanceID, &svc.ServiceName, &svc.TargetType, &svc.Target, &appPath); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	svc.AppPath = appPath.String
 	return &svc, nil
 }

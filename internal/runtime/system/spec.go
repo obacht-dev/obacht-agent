@@ -350,6 +350,7 @@ type Service struct {
 	Name       string `json:"name"`
 	TargetType string `json:"target_type"`
 	TargetPort int    `json:"target_port"`
+	AppPath    string `json:"app_path,omitempty"`
 }
 
 // File is a supporting file rendered alongside the unit. Mode defaults to
