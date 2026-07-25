@@ -180,3 +180,23 @@ func siteBlock(t *testing.T, body, domain string) string {
 	}
 	return body[start : start+end]
 }
+
+// sanitizeAppPath must reject open-redirect / injection shapes and accept
+// normal absolute paths.
+func TestSanitizeAppPath(t *testing.T) {
+	reject := []string{
+		"//evil.com", "//evil.com/", "///evil.com", "/\\evil.com",
+		"/a b", "/x\ny", "/x{y}", "/x\"y", "http://x", "evil.com", "",
+	}
+	for _, p := range reject {
+		if got := sanitizeAppPath(p); got != "" {
+			t.Errorf("sanitizeAppPath(%q) = %q, want \"\"", p, got)
+		}
+	}
+	accept := []string{"/", "/cam/", "/app", "/a/b/c", "/x-y_z.1~"}
+	for _, p := range accept {
+		if got := sanitizeAppPath(p); got != p {
+			t.Errorf("sanitizeAppPath(%q) = %q, want %q", p, got, p)
+		}
+	}
+}

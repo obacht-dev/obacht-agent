@@ -70,6 +70,7 @@ type matComposeServiceSpec struct {
 	Name          string `json:"name"`
 	TargetService string `json:"targetService"`
 	TargetPort    int    `json:"targetPort"`
+	AppPath       string `json:"appPath,omitempty"`
 }
 
 // Result is what materialize* funcs return: the runtime kind
@@ -612,6 +613,7 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 				Name:          toString(sm["name"]),
 				TargetService: targetService,
 				TargetPort:    targetPort,
+				AppPath:       toString(sm["appPath"]),
 			})
 		}
 	}

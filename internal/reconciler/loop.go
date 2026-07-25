@@ -840,6 +840,7 @@ func (r *Reconciler) applyCompose(ctx context.Context, inst store.Instance) bool
 			ServiceName: svc.Name,
 			TargetType:  "docker_dns",
 			Target:      target,
+			AppPath:     svc.AppPath,
 		}); err != nil {
 			r.log.Warn("upsert compose service", "instance", inst.ID, "service", svc.Name, "err", err)
 		}

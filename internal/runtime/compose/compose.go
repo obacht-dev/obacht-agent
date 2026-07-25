@@ -115,6 +115,7 @@ type ServiceSpec struct {
 	Name          string `json:"name"`
 	TargetService string `json:"targetService"`
 	TargetPort    int    `json:"targetPort"`
+	AppPath       string `json:"appPath,omitempty"`
 }
 
 // ParseSpec parses the JSON body stored in instances.config_json.

@@ -62,15 +62,20 @@ func isValidDomain(d string) bool {
 
 // appPathRe constrains service.appPath to a safe absolute path. It is rendered
 // UNQUOTED into a `redir / <path>` directive, so — like the domain label —
-// anything with whitespace/braces/newlines could inject Caddy directives.
-var appPathRe = regexp.MustCompile(`^/[A-Za-z0-9._~/-]*$`)
+// anything with whitespace/braces/newlines could inject Caddy directives. The
+// char after the leading "/" must NOT be another "/": a protocol-relative
+// "//host" is a HOST reference (Caddy would 302 to https://host), i.e. an open
+// redirect, which this field must never allow.
+var appPathRe = regexp.MustCompile(`^/(?:[A-Za-z0-9._~-][A-Za-z0-9._~/-]*)?$`)
 
 // sanitizeAppPath returns the app path only if it is a safe absolute path,
 // else "" (skip the redirect). Defence in depth: the registry validator
 // already enforces the same shape, but the agent must never render an
 // unvalidated value into the Caddyfile.
 func sanitizeAppPath(p string) string {
-	if p == "" || len(p) > 512 || !appPathRe.MatchString(p) {
+	// Explicit "//" guard in addition to the regex, so an open-redirect can
+	// never slip through even if the pattern is later loosened.
+	if p == "" || len(p) > 512 || strings.HasPrefix(p, "//") || !appPathRe.MatchString(p) {
 		return ""
 	}
 	return p
