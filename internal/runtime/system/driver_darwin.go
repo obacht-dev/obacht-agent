@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -423,9 +424,19 @@ func renderPlist(label, binary string, args []string, env map[string]string, log
 	}
 	b.WriteString("  </array>\n")
 	if len(env) > 0 {
+		// Sort the keys: Go map iteration order is random, so an unsorted
+		// render makes writeIfDifferent see a "changed" plist on ~every other
+		// reconcile tick once a service has >1 env var — which bounced the
+		// service (bootout/bootstrap/kickstart -k) in a permanent restart
+		// loop. One env var never flapped, which is why this stayed hidden.
+		keys := make([]string, 0, len(env))
+		for k := range env {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
 		b.WriteString("  <key>EnvironmentVariables</key>\n  <dict>\n")
-		for k, v := range env {
-			b.WriteString("    <key>" + xmlEscape(k) + "</key><string>" + xmlEscape(v) + "</string>\n")
+		for _, k := range keys {
+			b.WriteString("    <key>" + xmlEscape(k) + "</key><string>" + xmlEscape(env[k]) + "</string>\n")
 		}
 		b.WriteString("  </dict>\n")
 	}
