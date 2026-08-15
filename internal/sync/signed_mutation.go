@@ -381,7 +381,19 @@ func (s *Syncer) dispatchInstanceUpsert(ctx context.Context, m *signedmut.Mutati
 		}
 	}
 
-	built, err := manifest.BuildInstanceConfig(manifestBytes, p.UserConfig, p.InstanceID, p.TemplateID, p.Version)
+	// Keep-sentinel resolution: the webapp round-trips the redacted
+	// `__input` echo on reconfigure/update, so secret values arrive as
+	// SecretKeepSentinel and resolve here against the device-local stored
+	// config. Must happen BEFORE materialisation — the sentinel would
+	// otherwise be substituted into env/volumes as a literal value.
+	userConfig := p.UserConfig
+	if existing, err := s.store.GetInstance(ctx, p.InstanceID); err == nil && existing != nil {
+		userConfig = manifest.ResolveSecretSentinels(userConfig, existing.ConfigJSON)
+	} else {
+		userConfig = manifest.ResolveSecretSentinels(userConfig, "")
+	}
+
+	built, err := manifest.BuildInstanceConfig(manifestBytes, userConfig, p.InstanceID, p.TemplateID, p.Version)
 	if err != nil {
 		return err
 	}

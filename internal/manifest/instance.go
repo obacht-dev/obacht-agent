@@ -79,10 +79,15 @@ func BuildInstanceConfig(manifestBytes []byte, userConfig map[string]any, instan
 		return InstanceConfig{}, fmt.Errorf("materialise self-check: %w", err)
 	}
 	// Preserve the user-provided config (+ schema defaults) so the webapp
-	// can prefill "Configure" later.
+	// can prefill "Configure" later. The secret-typed keys are recorded
+	// alongside (always, even when empty — presence of the marker tells the
+	// observed-state echo the list is authoritative, see RedactedInputEcho);
+	// the echo replaces their values with SecretKeepSentinel so plaintext
+	// secrets never reach the backend.
 	config := asAny
 	if m, ok := asAny.(map[string]any); ok {
 		m["__input"] = userConfig
+		m[SecretKeysMarker] = SecretConfigKeys(manifestBytes)
 		config = m
 	}
 
