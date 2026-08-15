@@ -275,6 +275,13 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/admin/instances/{id}/state", admin(s.adminSetInstanceState))
 	mux.HandleFunc("POST /v1/admin/reconcile", admin(s.adminTriggerReconcile))
 	mux.HandleFunc("POST /v1/admin/instances/{id}/secret", admin(s.adminIssueSecret))
+	// Raw (unredacted) stored `__input` for the keep-sentinel resolution in
+	// `obachtctl template install`: the ssh-plan reconfigure path receives
+	// SecretKeepSentinel values from the webapp and must substitute the
+	// device-local plaintext BEFORE materialising (the sentinel would land in
+	// env otherwise). Peercred-gated like every admin route; deliberately a
+	// separate endpoint so `instance get` keeps its redaction.
+	mux.HandleFunc("GET /v1/admin/instances/{id}/config-input", admin(s.adminInstanceConfigInput))
 
 	// Phase-3 ingress endpoints.
 	mux.HandleFunc("GET /v1/admin/domains", admin(s.adminListDomains))
@@ -417,6 +424,33 @@ func (s *Server) adminUpsertInstance(w http.ResponseWriter, r *http.Request) {
 		s.rec.Trigger()
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": body.ID})
+}
+
+// adminInstanceConfigInput returns the stored raw `__input` map of an
+// instance (unredacted — the caller is peercred-gated obachtctl resolving
+// keep-sentinels; see routes()). 404 when the instance does not exist;
+// an empty object when it has no `__input`.
+func (s *Server) adminInstanceConfigInput(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	inst, err := s.store.GetInstance(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, err)
+		} else {
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	input := map[string]any{}
+	if inst.ConfigJSON != "" {
+		var cfg map[string]any
+		if err := json.Unmarshal([]byte(inst.ConfigJSON), &cfg); err == nil {
+			if in, ok := cfg["__input"].(map[string]any); ok {
+				input = in
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "input": input})
 }
 
 func (s *Server) adminDeleteInstance(w http.ResponseWriter, r *http.Request) {

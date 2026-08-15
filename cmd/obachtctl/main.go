@@ -14,6 +14,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -970,6 +971,28 @@ func (r *runtime) templateInstall(ctx context.Context, args []string) {
 			} else {
 				die("--config-json must be a JSON object when materialising from manifest")
 			}
+		}
+		// Keep-sentinel resolution (mirror of the daemon's signed-mutation
+		// dispatcher): a reconfigure round-trips the redacted `__input`
+		// echo, so secret values arrive as manifest.SecretKeepSentinel and
+		// must be replaced with the device-local stored values BEFORE
+		// materialisation. The stored input comes over the peercred-gated
+		// IPC — failing to fetch it while sentinels are present is fatal,
+		// because materialising the sentinel literal would overwrite the
+		// real secret in the instance env.
+		if manifest.HasSecretSentinel(userCfg) {
+			r.requireIPC()
+			code, body, err := r.doIPC(ctx, http.MethodGet, "/v1/admin/instances/"+url.PathEscape(*iid)+"/config-input", nil)
+			if err != nil || code != http.StatusOK {
+				die("cannot resolve stored secret values for %s (ipc status %d): %v", *iid, code, err)
+			}
+			var stored struct {
+				Input map[string]any `json:"input"`
+			}
+			if err := json.Unmarshal(body, &stored); err != nil {
+				die("cannot parse stored config input: %v", err)
+			}
+			userCfg = manifest.ResolveSecretSentinelsInput(userCfg, stored.Input)
 		}
 		// Shared with the daemon's signed-mutation dispatcher
 		// (internal/manifest.BuildInstanceConfig): materialise +

@@ -37,6 +37,8 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/audit"
+	"github.com/obacht-dev/obacht-agent/internal/enckey"
+	"github.com/obacht-dev/obacht-agent/internal/manifest"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
 	"github.com/obacht-dev/obacht-agent/internal/signedmut"
@@ -387,6 +389,18 @@ func (s *Syncer) sendRegister() {
 	if runtime.GOOS == "linux" && s.powerModeEnabled() {
 		capabilities = append(capabilities, "runtime.system")
 	}
+	// Device encryption identity (ANALYSE-E2E-PARAMS-ENCRYPTION §4 Schritt 2):
+	// publish the X25519 pubkey so clients can later encrypt secret-typed
+	// config values to this device. enc-key.v1 = "key published"; the
+	// decrypt capability (enc-params.v1) ships separately so no client
+	// encrypts against an agent that cannot decrypt.
+	var encPublicKey string
+	if pub, err := enckey.EnsurePublicKey(context.Background(), s.store); err == nil {
+		encPublicKey = pub
+		capabilities = append(capabilities, enckey.Capability)
+	} else {
+		s.log.Warn("ensure enc key", "err", err)
+	}
 	// Device inventory + derived features (spec v2.8): drives
 	// compatibility.requiresFeatures gating and optionsSource selects.
 	inv := inventory.Collect()
@@ -404,6 +418,9 @@ func (s *Syncer) sendRegister() {
 		"userKeyFingerprints": userKeyFingerprints,
 		"features":            inventory.Features(inv),
 		"inventory":           inv,
+	}
+	if encPublicKey != "" {
+		payload["encPublicKey"] = encPublicKey
 	}
 	if err := s.client.Emit("agent:register", payload); err != nil {
 		s.log.Warn("emit agent:register", "err", err)
@@ -499,13 +516,12 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 			ObservedState: i.ObservedState,
 			Runtime:       string(i.Runtime),
 		}
-		if i.ConfigJSON != "" {
-			var cfg map[string]any
-			if err := json.Unmarshal([]byte(i.ConfigJSON), &cfg); err == nil {
-				if input, ok := cfg["__input"].(map[string]any); ok && len(input) > 0 {
-					o.Config = map[string]any{"__input": input}
-				}
-			}
+		// SECURITY: the `__input` echo crosses the backend and lands in
+		// device_template_instances.config in plaintext — secret values are
+		// replaced with the keep-sentinel before the snapshot leaves the
+		// device. Real values stay in the local config_json only.
+		if input := manifest.RedactedInputEcho(i.ConfigJSON); input != nil {
+			o.Config = map[string]any{"__input": input}
 		}
 		// Surface the reconciler's last error so the api/webapp can
 		// show users WHY an install is stuck instead of forcing them
