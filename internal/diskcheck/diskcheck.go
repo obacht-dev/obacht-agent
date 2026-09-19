@@ -78,7 +78,7 @@ func EnsureFreeAtLeast(path string, minBytes uint64) error {
 	// Name the source of the requirement so the user knows whether to free a
 	// little (agent floor) or pick a smaller option / bigger disk (template).
 	if need == minBytes && minBytes > floor {
-		return fmt.Errorf("insufficient disk space: %s free, template requires %s free — free up space or choose a smaller option and retry",
+		return fmt.Errorf("insufficient disk space: %s free, template requires %s free. Free up space or choose a smaller option and retry",
 			humanize(free), humanize(need))
 	}
 	return fmt.Errorf("insufficient disk space: %s free, need at least %s — free up space and retry",
