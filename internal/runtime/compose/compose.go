@@ -101,6 +101,13 @@ type Spec struct {
 	// compose file and used by docker compose for ${VAR} interpolation.
 	// Used by custom-docker-composition's env textarea.
 	EnvFile string `json:"env_file,omitempty"`
+
+	// MinDiskMb is the free disk the install needs, resolved by the
+	// materializer from compatibility.resources.minDiskMb and the chosen
+	// select option's optionRequirements (spec v2.9). 0 = no template
+	// requirement; the agent's fixed floor still applies. Only consulted on
+	// changed bodies, never on steady-state reconciles or Status.
+	MinDiskMb int64 `json:"min_disk_mb,omitempty"`
 }
 
 // SecretField mirrors manifest spec.secretsSchema entries.
@@ -283,7 +290,7 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 	// by a low-disk condition it isn't adding to. d.root shares the image
 	// filesystem on a Pi; fails open elsewhere.
 	if changed {
-		if err := diskcheck.EnsureFree(d.root); err != nil {
+		if err := diskcheck.EnsureFreeAtLeast(d.root, diskcheck.MiB(spec.MinDiskMb)); err != nil {
 			return changed, err
 		}
 	}

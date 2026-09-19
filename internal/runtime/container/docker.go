@@ -118,13 +118,16 @@ func isTransientNetErr(err error) bool {
 
 // PullImage pulls an image if it is not already present locally.
 func (d *Driver) PullImage(ctx context.Context, image string) error {
-	return d.pullIfMissing(ctx, "", image)
+	return d.pullIfMissing(ctx, "", image, 0)
 }
 
 // PullImageFor is PullImage with progress attribution to an instance, used
 // by the compose driver's pre-pull so bundle installs report pull percent.
 func (d *Driver) PullImageFor(ctx context.Context, instanceID, image string) error {
-	return d.pullIfMissing(ctx, instanceID, image)
+	// minBytes 0: the compose driver already ran the template-aware disk
+	// preflight against its own spec before pre-pulling; here only the
+	// agent floor applies.
+	return d.pullIfMissing(ctx, instanceID, image, 0)
 }
 
 // SetProgress wires a progress sink. Must be wired before concurrent use of
@@ -162,6 +165,13 @@ type Spec struct {
 	// volumes / labels / cmd with values fetched from the agent's
 	// secret store before calling Apply. Mirrors compose.SecretsSchema.
 	SecretsSchema []SecretField `json:"secretsSchema,omitempty"`
+
+	// MinDiskMb is the free disk the install needs, resolved by the
+	// materializer from compatibility.resources.minDiskMb and the chosen
+	// select option's optionRequirements (spec v2.9). 0 = no template
+	// requirement; the agent's fixed floor still applies. Mirrors
+	// compose.Spec.MinDiskMb.
+	MinDiskMb int64 `json:"min_disk_mb,omitempty"`
 }
 
 // SecretField mirrors manifest spec.secretsSchema entries. Same shape as
@@ -453,7 +463,7 @@ func (d *Driver) Apply(ctx context.Context, instanceID, templateID string, spec 
 		}
 	}
 
-	if err := d.pullIfMissing(ctx, instanceID, spec.Image); err != nil {
+	if err := d.pullIfMissing(ctx, instanceID, spec.Image, diskcheck.MiB(spec.MinDiskMb)); err != nil {
 		return false, fmt.Errorf("pull image %s: %w", spec.Image, err)
 	}
 
@@ -580,7 +590,9 @@ func (d *Driver) findByName(ctx context.Context, name string) (*containerSummary
 	return &containerSummary{ID: c.ID, Name: cn, State: c.State, Labels: c.Labels, ImageID: c.ImageID}, nil
 }
 
-func (d *Driver) pullIfMissing(ctx context.Context, instanceID, image string) error {
+// minDiskBytes is the template-declared free-disk requirement (0 = none);
+// the agent floor applies regardless.
+func (d *Driver) pullIfMissing(ctx context.Context, instanceID, image string, minDiskBytes uint64) error {
 	// Cheap existence check via /images/{image}/json.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker/v1.43/images/"+url.PathEscape(image)+"/json", nil)
 	resp, err := d.http.Do(req)
@@ -597,7 +609,7 @@ func (d *Driver) pullIfMissing(ctx context.Context, instanceID, image string) er
 	// leave partial layers behind; failing fast here gives the user a clear,
 	// actionable message (recorded as the instance's observed error). Fails
 	// open where the data root isn't a local path (mac VM).
-	if err := diskcheck.EnsureFree(obachtDataRoot); err != nil {
+	if err := diskcheck.EnsureFreeAtLeast(obachtDataRoot, minDiskBytes); err != nil {
 		return err
 	}
 

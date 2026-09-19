@@ -40,6 +40,7 @@ type matSpec struct {
 	Labels        map[string]string `json:"labels,omitempty"`
 	Services      []matServiceSpec  `json:"services,omitempty"`
 	SecretsSchema []matSecretField  `json:"secretsSchema,omitempty"`
+	MinDiskMb     int64             `json:"min_disk_mb,omitempty"`
 }
 
 // Subset of compose.Spec we emit (mirrors
@@ -58,6 +59,7 @@ type matComposeSpec struct {
 	// Custom-docker-composition support.
 	AllowUnpinnedImages bool   `json:"allow_unpinned_images,omitempty"`
 	EnvFile             string `json:"env_file,omitempty"`
+	MinDiskMb           int64  `json:"min_disk_mb,omitempty"`
 }
 
 type matSecretField struct {
@@ -197,7 +199,7 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 	}
 
 	subst := newSubstituter(userConfig, instanceID, templateID)
-	out := matSpec{}
+	out := matSpec{MinDiskMb: requiredDiskMb(spec, userConfig)}
 
 	if v, ok := container["image"].(string); ok {
 		out.Image = subst.string(v)
@@ -638,8 +640,55 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 		SecretEnvKeys:       secretEnvKeys,
 		AllowUnpinnedImages: allowUnpinned,
 		EnvFile:             envFile,
+		MinDiskMb:           requiredDiskMb(spec, userConfig),
 	}
 	return json.Marshal(out)
+}
+
+// requiredDiskMb resolves the free disk an install needs (spec v2.9): the
+// template-wide floor spec.compatibility.resources.minDiskMb, raised by the
+// minDiskMb of whichever option the user picked on any select field carrying
+// optionRequirements. Options without an entry inherit the floor. The
+// result rides in the runtime Spec so the driver's preflight can refuse
+// before pulling e.g. a 40 GiB model pack onto a 32 GiB card.
+//
+// userConfig must already have configSchema defaults applied. Anything
+// malformed (non-map blocks, non-numeric values, unknown option) is ignored
+// — the registry validated the manifest, and a missing requirement must
+// degrade to the plain floor rather than block an install.
+func requiredDiskMb(spec map[string]any, userConfig map[string]any) int64 {
+	var required int64
+	if compat, ok := spec["compatibility"].(map[string]any); ok {
+		if res, ok := compat["resources"].(map[string]any); ok {
+			required = int64(toInt(res["minDiskMb"]))
+		}
+	}
+	schemaAny, ok := spec["configSchema"].([]any)
+	if !ok {
+		return required
+	}
+	for _, e := range schemaAny {
+		em, ok := e.(map[string]any)
+		if !ok || toString(em["type"]) != "select" {
+			continue
+		}
+		reqs, ok := em["optionRequirements"].(map[string]any)
+		if !ok {
+			continue
+		}
+		chosen, ok := userConfig[toString(em["key"])]
+		if !ok {
+			continue
+		}
+		entry, ok := reqs[toString(chosen)].(map[string]any)
+		if !ok {
+			continue
+		}
+		if n := int64(toInt(entry["minDiskMb"])); n > required {
+			required = n
+		}
+	}
+	return required
 }
 
 // substWithoutCfgSecret resolves only ${instance.id} / ${template.id} /

@@ -52,16 +52,47 @@ func FreeBytes(path string) (free uint64, ok bool) {
 // free space can't be determined, so an unrelated statfs quirk never blocks an
 // install. path must be a directory on the same filesystem images land on.
 func EnsureFree(path string) error {
+	return EnsureFreeAtLeast(path, 0)
+}
+
+// EnsureFreeAtLeast is EnsureFree with a template-declared requirement on
+// top: it demands max(floor, minBytes). The floor alone can't know that an
+// LLM template with the "eu" model pack needs 40 GiB (spec v2.9
+// compatibility.resources.minDiskMb + configSchema optionRequirements), so
+// the materializer hands the resolved figure through the runtime Spec and
+// the driver passes it here. minBytes == 0 means "no template requirement";
+// the floor still applies. Same fail-open semantics as EnsureFree.
+func EnsureFreeAtLeast(path string, minBytes uint64) error {
 	free, ok := FreeBytes(path)
 	if !ok {
 		return nil
 	}
-	min := MinFreeBytes()
-	if free >= min {
+	floor := MinFreeBytes()
+	need := floor
+	if minBytes > need {
+		need = minBytes
+	}
+	if free >= need {
 		return nil
 	}
+	// Name the source of the requirement so the user knows whether to free a
+	// little (agent floor) or pick a smaller option / bigger disk (template).
+	if need == minBytes && minBytes > floor {
+		return fmt.Errorf("insufficient disk space: %s free, template requires %s free — free up space or choose a smaller option and retry",
+			humanize(free), humanize(need))
+	}
 	return fmt.Errorf("insufficient disk space: %s free, need at least %s — free up space and retry",
-		humanize(free), humanize(min))
+		humanize(free), humanize(need))
+}
+
+// MiB converts a manifest-style MiB figure to bytes for EnsureFreeAtLeast.
+// Non-positive input (unset field) yields 0, i.e. "floor only" — never a
+// wrapped-around huge requirement.
+func MiB(mb int64) uint64 {
+	if mb <= 0 {
+		return 0
+	}
+	return uint64(mb) * 1024 * 1024
 }
 
 func humanize(b uint64) string {
