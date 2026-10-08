@@ -646,7 +646,10 @@ func (d *Driver) renderBody(ctx context.Context, instanceID string, spec Spec) (
 			if err != nil {
 				return "", fmt.Errorf("secret %s: %w", sf.Key, err)
 			}
-			body = strings.ReplaceAll(body, "${secret."+sf.Key+"}", val)
+			// Secrets may sit in unquoted scalars, so only the compose
+			// interpolation escape is applied (charset alphanumeric_symbols
+			// contains '$').
+			body = strings.ReplaceAll(body, "${secret."+sf.Key+"}", composeEscapeDollar(val))
 		}
 	}
 	if remain := findUnsubstituted(body); remain != "" {
@@ -697,12 +700,16 @@ func substituteCfg(body string, cfg map[string]string, escape bool) string {
 // "${cfg.x}"). It deliberately does not add outer quotes. Newlines, quotes,
 // backslashes and other control characters are turned into YAML escape
 // sequences so a config value can never break out of its scalar and inject
-// new YAML structure.
+// new YAML structure. '$' is doubled because docker compose interpolates the
+// whole file: without it a password like "Neu$abc9" reaches the container
+// as "Neu".
 func yamlEscapeInner(v string) string {
 	var b strings.Builder
 	b.Grow(len(v))
 	for _, r := range v {
 		switch r {
+		case '$':
+			b.WriteString(`$$`)
 		case '"':
 			b.WriteString(`\"`)
 		case '\\':
@@ -722,6 +729,12 @@ func yamlEscapeInner(v string) string {
 		}
 	}
 	return b.String()
+}
+
+// composeEscapeDollar doubles '$' so docker compose passes it through
+// literally instead of treating it as a variable reference.
+func composeEscapeDollar(v string) string {
+	return strings.ReplaceAll(v, "$", "$$")
 }
 
 func findUnsubstituted(body string) string {
