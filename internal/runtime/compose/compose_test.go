@@ -130,6 +130,38 @@ func TestRenderBodyCfgYAMLInjection(t *testing.T) {
 	}
 }
 
+type dollarSecrets struct{}
+
+func (dollarSecrets) EnsureTemplateSecret(_ context.Context, _, _, _ string, _ int) (string, error) {
+	return "ab$cd${x}$", nil
+}
+func (dollarSecrets) DropTemplateSecrets(_ context.Context, _ string) error { return nil }
+
+// TestRenderBodyDollarEscaped proves '$' in cfg values and secrets is doubled,
+// so docker compose interpolation hands the literal value to the container
+// instead of truncating "Neu$abc9" to "Neu".
+func TestRenderBodyDollarEscaped(t *testing.T) {
+	d := New("/tmp/test-compose-driver", dollarSecrets{}, DockerCLI{}, nil)
+	spec := Spec{
+		ComposeBody: "services:\n  web:\n    image: ghost:5\n    environment:\n" +
+			"      PW: \"${cfg.pw}\"\n      DB: ${secret.db}\n",
+		PrimaryService: "web", PrimaryPort: 2368,
+		ImageDigests:  map[string]string{"ghost:5": "sha256:" + strings.Repeat("a", 64)},
+		SecretsSchema: []SecretField{{Key: "db", Length: 16, Charset: "alphanumeric_symbols"}},
+		Config:        map[string]string{"pw": `Neu$abc9 $$ ${HOME} "q"`},
+	}
+	out, err := d.renderBody(context.Background(), "demo-1", spec)
+	if err != nil {
+		t.Fatalf("renderBody: %v", err)
+	}
+	if !strings.Contains(out, `PW: "Neu$$abc9 $$$$ $${HOME} \"q\""`) {
+		t.Errorf("cfg '$' not escaped:\n%s", out)
+	}
+	if !strings.Contains(out, `DB: ab$$cd$${x}$$`) {
+		t.Errorf("secret '$' not escaped:\n%s", out)
+	}
+}
+
 // TestRenderBodyCustomNoEscape proves the custom-compose path (AllowUnpinnedImages)
 // injects the user body verbatim (the whole document is the cfg value) and is
 // guarded by the allowlist instead of escaping.
