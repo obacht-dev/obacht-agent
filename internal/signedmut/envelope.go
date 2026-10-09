@@ -251,3 +251,25 @@ func normalize(v any) (any, error) {
 		return v, nil
 	}
 }
+
+// ParamsMatch reports whether the signed params (raw JSON from a verified
+// Mutation) are exactly the expected request parameters. Both sides are
+// compared in JCS-canonical form, so key order and whitespace do not
+// matter, but every key and value must agree: an extra or missing field is
+// a mismatch. want values must be JSON-compatible (string, bool, int64,
+// nil, nested map[string]any / []any).
+func ParamsMatch(signed json.RawMessage, want map[string]any) (bool, error) {
+	got, err := decodeJSON(signed)
+	if err != nil {
+		return false, fmt.Errorf("decode signed params: %w", err)
+	}
+	gotCanon, err := canonicalize(got)
+	if err != nil {
+		return false, err
+	}
+	wantCanon, err := canonicalize(want)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(gotCanon, wantCanon), nil
+}

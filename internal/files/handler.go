@@ -11,7 +11,9 @@ package files
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/obacht-dev/obacht-agent/internal/api"
 	"github.com/obacht-dev/obacht-agent/internal/store"
@@ -29,17 +32,25 @@ import (
 // 25 MiB matches the static-site upload limit on the api side.
 const maxBodyBytes = 25 * 1024 * 1024
 
+// Authorizer checks the user signature on a request (implemented by the
+// syncer, which owns the pinned user keys and the nonce store).
+type Authorizer interface {
+	AuthorizeRequest(ctx context.Context, envelope json.RawMessage, op string, params map[string]any) error
+}
+
 // Handler wires "agent:files_request" → fs op → "agent:files_response".
 type Handler struct {
 	client *api.Client
 	store  *store.Store
+	auth   Authorizer
 	log    *slog.Logger
 }
 
 // New constructs a Handler. Register() must be called once to attach to
-// the WS client.
-func New(client *api.Client, st *store.Store, log *slog.Logger) *Handler {
-	return &Handler{client: client, store: st, log: log}
+// the WS client. Every request must carry a user-signed envelope that auth
+// accepts; the backend alone can no longer read or change app files.
+func New(client *api.Client, st *store.Store, auth Authorizer, log *slog.Logger) *Handler {
+	return &Handler{client: client, store: st, auth: auth, log: log}
 }
 
 // Register subscribes to "agent:files_request" on the WS client.
@@ -51,10 +62,14 @@ func (h *Handler) Register() {
 type request struct {
 	RequestID  string `json:"request_id"`
 	InstanceID string `json:"instance_id"`
-	Op         string `json:"op"`     // list | upload | delete | download | mkdir
-	Path       string `json:"path"`   // relative to webroot
+	Op         string `json:"op"`   // list | upload | delete | download | mkdir
+	Path       string `json:"path"` // relative to webroot
 	NewPath    string `json:"new_path,omitempty"`
 	Content    string `json:"content,omitempty"` // base64-encoded for upload
+	// Signed is the user-signed envelope (same wire format as
+	// agent:signed_mutation) with op "files.<op>" and params
+	// {instance_id, path[, content_sha256]}.
+	Signed json.RawMessage `json:"signed,omitempty"`
 }
 
 // response is the wire shape of the reply event. Either Data is set (op
@@ -90,6 +105,38 @@ func (h *Handler) handle(args []json.RawMessage) {
 		return
 	}
 
+	if req.NewPath != "" {
+		h.reply(req, nil, errors.New("new_path is not supported"))
+		return
+	}
+
+	// Signature first, before any filesystem access. For uploads the
+	// signature covers the sha256 of the decoded bytes, so the backend
+	// cannot swap the content of a signed upload.
+	params := map[string]any{"instance_id": req.InstanceID, "path": req.Path}
+	var uploadData []byte
+	if req.Op == "upload" {
+		data, err := decodeUpload(req.Content)
+		if err != nil {
+			h.reply(req, nil, err)
+			return
+		}
+		sum := sha256.Sum256(data)
+		params["content_sha256"] = hex.EncodeToString(sum[:])
+		uploadData = data
+	}
+	authCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if h.auth == nil {
+		h.reply(req, nil, errors.New("signed requests are not enabled on this device"))
+		return
+	}
+	if err := h.auth.AuthorizeRequest(authCtx, req.Signed, "files."+req.Op, params); err != nil {
+		h.log.Warn("files_request rejected", "op", req.Op, "err", err)
+		h.reply(req, nil, err)
+		return
+	}
+
 	root, err := h.resolveWebroot(req.InstanceID)
 	if err != nil {
 		h.reply(req, nil, err)
@@ -110,7 +157,7 @@ func (h *Handler) handle(args []json.RawMessage) {
 		data, err := h.opDownload(abs)
 		h.reply(req, data, err)
 	case "upload":
-		data, err := h.opUpload(abs, req.Content)
+		data, err := h.opUpload(abs, uploadData)
 		h.reply(req, data, err)
 	case "delete":
 		data, err := h.opDelete(abs, root)
@@ -238,7 +285,8 @@ func (h *Handler) opDownload(abs string) (map[string]any, error) {
 	}, nil
 }
 
-func (h *Handler) opUpload(abs, b64 string) (map[string]any, error) {
+// decodeUpload decodes and size-checks base64 upload content.
+func decodeUpload(b64 string) ([]byte, error) {
 	if len(b64) > maxBodyBytes*2 { // base64 is ~4/3 of bytes; cheap upper bound
 		return nil, errors.New("payload too large")
 	}
@@ -249,6 +297,10 @@ func (h *Handler) opUpload(abs, b64 string) (map[string]any, error) {
 	if int64(len(data)) > maxBodyBytes {
 		return nil, fmt.Errorf("file too large (%d bytes)", len(data))
 	}
+	return data, nil
+}
+
+func (h *Handler) opUpload(abs string, data []byte) (map[string]any, error) {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return nil, err
 	}

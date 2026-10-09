@@ -237,8 +237,10 @@ func main() {
 		// setting flips so the backend routes (or stops routing) system
 		// installs without an agent restart.
 		ipcSrv.SetOnSystemSettingChanged(func(string) { syncer.Reregister() })
-		files.New(wsClient, st, log.With("component", "files")).Register()
-		logspkg.New(wsClient, log.With("component", "logs")).Register()
+		// Logs and file access need the user's signature (same pinned keys
+		// and nonce store as signed mutations); the syncer authorizes.
+		files.New(wsClient, st, syncer, log.With("component", "files")).Register()
+		logspkg.New(wsClient, syncer, log.With("component", "logs")).Register()
 		go wsClient.Run(ctx)
 		go syncer.Run(ctx)
 	} else {

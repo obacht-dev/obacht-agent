@@ -378,7 +378,7 @@ func (s *Syncer) sendRegister() {
 	// so the user can compare them against their own management key.
 	var userKeyFingerprints []string
 	if v := s.getVerifier(); v != nil && v.KeyCount() > 0 {
-		capabilities = append(capabilities, "signed-mutation")
+		capabilities = append(capabilities, "signed-mutation", SignedRequestsCapability)
 		userKeyFingerprints = v.Fingerprints()
 	}
 	// Advertise the system runtime (spec v2.8 managed services) only while
