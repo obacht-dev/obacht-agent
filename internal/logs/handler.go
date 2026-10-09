@@ -7,11 +7,11 @@
 //
 // Resolution mirrors the IPC endpoint in internal/ipc:
 //
-//   1. List containers labelled com.docker.compose.project=obacht-<id>
-//      and pick the one whose com.docker.compose.service label matches
-//      the requested service.
-//   2. Fall back to a single container named "obacht-<id>" (the
-//      container-runtime case) if no compose project matched.
+//  1. List containers labelled com.docker.compose.project=obacht-<id>
+//     and pick the one whose com.docker.compose.service label matches
+//     the requested service.
+//  2. Fall back to a single container named "obacht-<id>" (the
+//     container-runtime case) if no compose project matched.
 package logs
 
 import (
@@ -28,16 +28,24 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/api"
 )
 
+// Authorizer checks the user signature on a request (implemented by the
+// syncer, which owns the pinned user keys and the nonce store).
+type Authorizer interface {
+	AuthorizeRequest(ctx context.Context, envelope json.RawMessage, op string, params map[string]any) error
+}
+
 // Handler wires "agent:logs_request" → docker logs → "agent:logs_response".
 type Handler struct {
 	client *api.Client
+	auth   Authorizer
 	log    *slog.Logger
 }
 
 // New constructs a Handler. Register() must be called once to attach to
-// the WS client.
-func New(client *api.Client, log *slog.Logger) *Handler {
-	return &Handler{client: client, log: log}
+// the WS client. Every request must carry a user-signed envelope (op
+// "logs.read", params {instance_id, service, tail}) that auth accepts.
+func New(client *api.Client, auth Authorizer, log *slog.Logger) *Handler {
+	return &Handler{client: client, auth: auth, log: log}
 }
 
 // Register subscribes to "agent:logs_request" on the WS client.
@@ -50,6 +58,8 @@ type request struct {
 	InstanceID string `json:"instance_id"`
 	Service    string `json:"service,omitempty"`
 	Tail       int    `json:"tail,omitempty"`
+	// Signed is the user-signed envelope, op "logs.read".
+	Signed json.RawMessage `json:"signed,omitempty"`
 }
 
 type response struct {
@@ -80,6 +90,21 @@ func (h *Handler) handle(args []json.RawMessage) {
 		h.reply(req, nil, errors.New("invalid service name"))
 		return
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// The signature covers exactly what was asked for, before clamping.
+	if h.auth == nil {
+		h.reply(req, nil, errors.New("signed requests are not enabled on this device"))
+		return
+	}
+	params := map[string]any{"instance_id": req.InstanceID, "service": req.Service, "tail": int64(req.Tail)}
+	if err := h.auth.AuthorizeRequest(ctx, req.Signed, "logs.read", params); err != nil {
+		h.log.Warn("logs_request rejected", "err", err)
+		h.reply(req, nil, err)
+		return
+	}
+
 	tail := req.Tail
 	if tail < 1 {
 		tail = 200
@@ -87,9 +112,6 @@ func (h *Handler) handle(args []json.RawMessage) {
 	if tail > 5000 {
 		tail = 5000
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 
 	data, err := fetchLogs(ctx, req.InstanceID, req.Service, tail)
 	h.reply(req, data, err)
