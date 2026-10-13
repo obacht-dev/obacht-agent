@@ -50,6 +50,8 @@ type Driver struct {
 	logDir     string // ~/Library/Logs/obacht
 	uid        int
 	httpClient *http.Client
+	// hooks runs post_start hooks (spec v2.9) after a service is loaded.
+	hooks *hookRunner
 }
 
 func New(log *slog.Logger) *Driver {
@@ -63,7 +65,18 @@ func New(log *slog.Logger) *Driver {
 		logDir:     envOr("OBACHT_HOST_LOG_DIR", filepath.Join(home, "Library", "Logs", "obacht")),
 		uid:        os.Getuid(),
 		httpClient: &http.Client{Timeout: 10 * time.Minute},
+		hooks:      newHookRunner(log),
 	}
+}
+
+// SetReadinessSink wires where post_start hook outcomes go (the reconciler
+// persists them as the instance's service_ready state).
+func (d *Driver) SetReadinessSink(s ReadinessSink) { d.hooks.setSink(s) }
+
+// HasPostStart reports whether a spec's readiness is governed by post_start
+// hooks (then the reconciler's HTTP prober must leave the instance alone).
+func HasPostStart(spec Spec) bool {
+	return spec.HostService != nil && len(spec.HostService.PostStart) > 0
 }
 
 // hostLabel is the deterministic launchd label for an instance. Deriving it
@@ -104,15 +117,25 @@ func (d *Driver) Apply(ctx context.Context, instanceID string, spec Spec) error 
 	}
 
 	label := hostLabel(instanceID)
-	plist := renderPlist(label, binPath, hs.Args, hs.Env, d.logDir)
+	// ${host.data} → this instance's data dir; OBACHT_DATA_DIR always set.
+	args, env := expandHostData(hs, dataDir)
+	plist := renderPlist(label, binPath, args, env, d.logDir)
 	changed, err := writeIfDifferent(d.plistPath(label), []byte(plist), 0o644)
 	if err != nil {
 		return fmt.Errorf("write plist: %w", err)
 	}
-	if err := d.load(ctx, label, changed); err != nil {
+	restarted, err := d.load(ctx, label, changed)
+	if err != nil {
 		return err
 	}
 	d.log.Info("applied host-service", "instance", instanceID, "label", label, "binary", hs.Binary, "changed", changed)
+	// post_start hooks: after every (re)start, once per agent process for an
+	// already-running service, and again after a cool-down if the last run
+	// failed. Idempotent by contract, so re-running is safe; not on every
+	// 30 s tick, so a model pull is not re-requested forever.
+	if len(hs.PostStart) > 0 && d.hooks.shouldRun(instanceID, restarted) {
+		d.hooks.start(instanceID, hs.PostStart)
+	}
 	return nil
 }
 
@@ -124,6 +147,7 @@ func (d *Driver) Remove(ctx context.Context, instanceID string, _ Spec) error {
 		return nil
 	}
 	label := hostLabel(instanceID)
+	d.hooks.cancel(instanceID)
 	_ = d.runLaunchctl(ctx, "bootout", d.guiDomain()+"/"+label) // ignore: may not be loaded
 	if err := os.Remove(d.plistPath(label)); err != nil && !os.IsNotExist(err) {
 		d.log.Warn("remove plist", "label", label, "err", err)
@@ -178,25 +202,28 @@ func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {
 
 // load (re)bootstraps the LaunchAgent. On a changed plist it boots out + back
 // in and force-restarts; otherwise it only ensures the service is loaded and
-// running without a needless restart.
-func (d *Driver) load(ctx context.Context, label string, changed bool) error {
+// running without a needless restart. Reports whether the service was
+// (re)started by this call (drives the post_start hooks).
+func (d *Driver) load(ctx context.Context, label string, changed bool) (bool, error) {
 	domain := d.guiDomain()
 	svc := domain + "/" + label
 	plist := d.plistPath(label)
 	if changed {
 		_ = d.runLaunchctl(ctx, "bootout", svc) // ignore: may not be loaded yet
 		if err := d.runLaunchctl(ctx, "bootstrap", domain, plist); err != nil {
-			return fmt.Errorf("bootstrap %s: %w", label, err)
+			return false, fmt.Errorf("bootstrap %s: %w", label, err)
 		}
-		return d.runLaunchctl(ctx, "kickstart", "-k", svc)
+		return true, d.runLaunchctl(ctx, "kickstart", "-k", svc)
 	}
+	restarted := false
 	if st, _ := d.Status(ctx, label); st == "" {
 		if err := d.runLaunchctl(ctx, "bootstrap", domain, plist); err != nil {
-			return fmt.Errorf("bootstrap %s: %w", label, err)
+			return false, fmt.Errorf("bootstrap %s: %w", label, err)
 		}
+		restarted = true
 	}
 	_ = d.runLaunchctl(ctx, "kickstart", svc) // start if stopped; harmless if running
-	return nil
+	return restarted, nil
 }
 
 // ensureBinary returns the path to the verified, pinned binary, downloading

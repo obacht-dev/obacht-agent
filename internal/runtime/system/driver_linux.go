@@ -254,6 +254,16 @@ func (d *Driver) Remove(ctx context.Context, instanceID string, spec Spec) error
 // Status returns systemd's ActiveState for the unit ("active", "inactive",
 // "failed", ...) or "" if the unit is unknown. Read-only over the system
 // D-Bus — works unprivileged.
+// SetReadinessSink is a no-op here: post_start hooks exist only for macOS
+// host services.
+func (d *Driver) SetReadinessSink(ReadinessSink) {}
+
+// HasPostStart mirrors the darwin driver: no host services here, so no
+// hook-governed readiness.
+func HasPostStart(spec Spec) bool {
+	return spec.HostService != nil && len(spec.HostService.PostStart) > 0
+}
+
 func (d *Driver) Status(ctx context.Context, unitName string) (string, error) {
 	conn, err := dbus.NewSystemConnectionContext(ctx)
 	if err != nil {
