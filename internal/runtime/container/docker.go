@@ -898,6 +898,14 @@ func (d *Driver) create(ctx context.Context, name, instanceID, templateID, hash 
 	// the dir lives under /var/lib/obacht (0750), which already excludes the
 	// world. Non-numeric users we can't map fall back to world-writable (still
 	// contained by that 0750 parent) so we never break a running template.
+	//
+	// Not on macOS: there the bind source lives inside the VM's filesystem
+	// (dockerd runs in the VM), so the host-side MkdirAll could only fail
+	// with "permission denied" under /var/lib/obacht and warned on every
+	// install. The VM's dockerd creates missing bind sources itself.
+	if runtime.GOOS == "darwin" {
+		preCreateDirs = nil
+	}
 	agentGID := os.Getegid()
 	for _, src := range preCreateDirs {
 		if err := os.MkdirAll(src, 0o750); err != nil {
