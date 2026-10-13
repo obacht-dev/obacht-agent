@@ -17,10 +17,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 )
 
 // ErrEmptySpec mirrors container.ErrEmptySpec for consistent reconciler-side
@@ -154,6 +158,76 @@ type HostServiceSpec struct {
 	Args         []string          `json:"args,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
 	DataDir      string            `json:"data_dir,omitempty"` // optional; agent picks a default otherwise
+	// PostStart (spec v2.9) runs after launchd loaded the service: HTTP
+	// calls against the service itself (loopback only), e.g. Ollama's model
+	// pull. The instance is "ready" once every hook returned 2xx. Hooks are
+	// idempotent by contract; they run again after a restart.
+	PostStart []PostStartHook `json:"post_start,omitempty"`
+}
+
+// PostStartHook is one post-start step. Only the HTTP flavor exists.
+type PostStartHook struct {
+	HTTP *PostStartHTTP `json:"http"`
+}
+
+// PostStartHTTP is an HTTP request the agent sends to the host service once
+// it accepts connections. URL is loopback only: a manifest must never make
+// the agent call out, so anything but 127.0.0.1/localhost is refused.
+type PostStartHTTP struct {
+	Method         string `json:"method"`
+	URL            string `json:"url"`
+	Body           string `json:"body,omitempty"`
+	ContentType    string `json:"contentType,omitempty"`
+	TimeoutSeconds int    `json:"timeoutSeconds,omitempty"`
+}
+
+// Post-start hook defaults and bounds.
+const (
+	PostStartDefaultContentType = "application/json"
+	PostStartDefaultTimeout     = 1800
+	PostStartMinTimeout         = 10
+	PostStartMaxTimeout         = 7200
+)
+
+// postStartURLRe is the loopback-only URL shape a hook may target.
+var postStartURLRe = regexp.MustCompile(`^http://(127\.0\.0\.1|localhost)(:[0-9]+)?/`)
+
+// validate checks one hook. Defaults are applied by effective(), not here,
+// so the stored spec stays what the manifest said.
+func (h PostStartHook) validate() error {
+	if h.HTTP == nil {
+		return errors.New("post_start hook: http block is required")
+	}
+	p := h.HTTP
+	switch strings.ToUpper(p.Method) {
+	case http.MethodGet, http.MethodPost:
+	default:
+		return fmt.Errorf("post_start hook: method %q must be GET or POST", p.Method)
+	}
+	if !postStartURLRe.MatchString(p.URL) || strings.ContainsAny(p.URL, "\x00\n\r \t") {
+		return fmt.Errorf("post_start hook: url %q must be http://127.0.0.1[:port]/... or http://localhost[:port]/...", p.URL)
+	}
+	if strings.ContainsAny(p.ContentType, "\x00\n\r") {
+		return errors.New("post_start hook: contentType contains control characters")
+	}
+	if p.TimeoutSeconds != 0 && (p.TimeoutSeconds < PostStartMinTimeout || p.TimeoutSeconds > PostStartMaxTimeout) {
+		return fmt.Errorf("post_start hook: timeoutSeconds %d out of range %d-%d", p.TimeoutSeconds, PostStartMinTimeout, PostStartMaxTimeout)
+	}
+	return nil
+}
+
+// effective returns the request parameters with defaults applied.
+func (p PostStartHTTP) effective() (method, contentType string, timeout time.Duration) {
+	method = strings.ToUpper(p.Method)
+	contentType = p.ContentType
+	if contentType == "" {
+		contentType = PostStartDefaultContentType
+	}
+	secs := p.TimeoutSeconds
+	if secs == 0 {
+		secs = PostStartDefaultTimeout
+	}
+	return method, contentType, time.Duration(secs) * time.Second
 }
 
 // allowedHostBinaries is the allowlist of binaries the host-service runtime may
@@ -223,6 +297,11 @@ func (h HostServiceSpec) validate() error {
 		if !filepath.IsAbs(h.DataDir) || filepath.Clean(h.DataDir) != h.DataDir ||
 			strings.ContainsAny(h.DataDir, "\x00\n\r") {
 			return fmt.Errorf("host service: data_dir %q must be a clean absolute path", h.DataDir)
+		}
+	}
+	for i, hook := range h.PostStart {
+		if err := hook.validate(); err != nil {
+			return fmt.Errorf("host service: post_start[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -351,6 +430,10 @@ type Service struct {
 	TargetType string `json:"target_type"`
 	TargetPort int    `json:"target_port"`
 	AppPath    string `json:"app_path,omitempty"`
+	// Readiness (spec v2.9) tunes how the reconciler probes this service
+	// before reporting the instance ready. Nil = defaults. A host service
+	// with post_start hooks is governed by the hooks instead.
+	Readiness *readiness.Config `json:"readiness,omitempty"`
 }
 
 // File is a supporting file rendered alongside the unit. Mode defaults to
@@ -435,6 +518,11 @@ func (s Spec) Validate() error {
 		}
 		if err := validateFilePath(f.Path); err != nil {
 			return err
+		}
+	}
+	for _, svc := range s.Services {
+		if err := svc.Readiness.Validate(); err != nil {
+			return fmt.Errorf("system spec: service %q: %w", svc.Name, err)
 		}
 	}
 	if s.HostService != nil {

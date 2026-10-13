@@ -24,6 +24,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 	"gopkg.in/yaml.v3"
 )
 
@@ -69,10 +70,11 @@ type matSecretField struct {
 }
 
 type matComposeServiceSpec struct {
-	Name          string `json:"name"`
-	TargetService string `json:"targetService"`
-	TargetPort    int    `json:"targetPort"`
-	AppPath       string `json:"appPath,omitempty"`
+	Name          string            `json:"name"`
+	TargetService string            `json:"targetService"`
+	TargetPort    int               `json:"targetPort"`
+	AppPath       string            `json:"appPath,omitempty"`
+	Readiness     *readiness.Config `json:"readiness,omitempty"`
 }
 
 // Result is what materialize* funcs return: the runtime kind
@@ -95,10 +97,31 @@ type matVolumeMount struct {
 }
 
 type matServiceSpec struct {
-	Name       string `json:"name"`
-	TargetType string `json:"targetType,omitempty"`
-	TargetPort int    `json:"targetPort"`
-	AppPath    string `json:"appPath,omitempty"`
+	Name       string            `json:"name"`
+	TargetType string            `json:"targetType,omitempty"`
+	TargetPort int               `json:"targetPort"`
+	AppPath    string            `json:"appPath,omitempty"`
+	Readiness  *readiness.Config `json:"readiness,omitempty"`
+}
+
+// matReadiness copies a manifest services[].readiness block (spec v2.9)
+// into the typed shape every runtime spec stores. Closed-shape values, no
+// substitution. Returns nil when the block is absent or not a map.
+func matReadiness(v any) *readiness.Config {
+	rm, ok := v.(map[string]any)
+	if !ok || len(rm) == 0 {
+		return nil
+	}
+	cfg := &readiness.Config{
+		Path:           toString(rm["path"]),
+		TimeoutSeconds: toInt(rm["timeoutSeconds"]),
+	}
+	if codes, ok := rm["expectStatus"].([]any); ok {
+		for _, c := range codes {
+			cfg.ExpectStatus = append(cfg.ExpectStatus, toInt(c))
+		}
+	}
+	return cfg
 }
 
 // Materialize takes the raw manifest bytes (YAML, since v2
@@ -285,6 +308,7 @@ func materializeContainer(spec, runtime map[string]any, userConfig map[string]an
 				TargetType: toString(sm["targetType"]),
 				TargetPort: toInt(sm["targetPort"]),
 				AppPath:    toString(sm["appPath"]),
+				Readiness:  matReadiness(sm["readiness"]),
 			})
 		}
 	}
@@ -407,7 +431,43 @@ func materializeSystem(spec, runtime map[string]any, userConfig map[string]any, 
 
 	wrapper := map[string]any{}
 	if hs != nil {
+		// post_start hooks (spec v2.9): loopback HTTP calls the agent makes
+		// once the service is up. url/body get the same ${cfg.X} /
+		// ${instance.id} substitution as env/args (a model name in the pull
+		// body); ${host.*} stays literal for the darwin driver. The
+		// loopback-only rule is enforced by runtime/system.Spec.Validate on
+		// the device.
+		if hooksAny, ok := src["post_start"].([]any); ok {
+			hooks := make([]map[string]any, 0, len(hooksAny))
+			for _, h := range hooksAny {
+				hm, _ := h.(map[string]any)
+				httpAny, _ := hm["http"].(map[string]any)
+				if httpAny == nil {
+					continue
+				}
+				req := map[string]any{
+					"method": toString(httpAny["method"]),
+					"url":    subst.string(toString(httpAny["url"])),
+				}
+				if b := subst.string(toString(httpAny["body"])); b != "" {
+					req["body"] = b
+				}
+				if ct := toString(httpAny["contentType"]); ct != "" {
+					req["contentType"] = ct
+				}
+				if ts := toInt(httpAny["timeoutSeconds"]); ts != 0 {
+					req["timeoutSeconds"] = ts
+				}
+				hooks = append(hooks, map[string]any{"http": req})
+			}
+			if len(hooks) > 0 {
+				out["post_start"] = hooks
+			}
+		}
 		wrapper["host_service"] = out
+		if svcs := materializeSystemServices(spec); svcs != nil {
+			wrapper["services"] = svcs
+		}
 	} else {
 		// managed_service-only fields: the closed hardware grants and the
 		// documented listen ports flow through verbatim (they are enums /
@@ -483,6 +543,9 @@ func materializeSystemServices(spec map[string]any) []map[string]any {
 		}
 		if ap := toString(sm["appPath"]); ap != "" {
 			entry["app_path"] = ap
+		}
+		if r := matReadiness(sm["readiness"]); r != nil {
+			entry["readiness"] = r
 		}
 		out = append(out, entry)
 	}
@@ -616,6 +679,7 @@ func materializeCompose(spec, runtime map[string]any, userConfig map[string]any,
 				TargetService: targetService,
 				TargetPort:    targetPort,
 				AppPath:       toString(sm["appPath"]),
+				Readiness:     matReadiness(sm["readiness"]),
 			})
 		}
 	}

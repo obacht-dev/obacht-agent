@@ -35,6 +35,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
 	"github.com/obacht-dev/obacht-agent/internal/progress"
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 )
 
 // ErrEmptySpec is returned by ParseSpec when config_json is empty.
@@ -123,6 +124,9 @@ type ServiceSpec struct {
 	TargetService string `json:"targetService"`
 	TargetPort    int    `json:"targetPort"`
 	AppPath       string `json:"appPath,omitempty"`
+	// Readiness (spec v2.9) tunes how the reconciler probes this service
+	// before reporting the instance ready. Nil = defaults.
+	Readiness *readiness.Config `json:"readiness,omitempty"`
 }
 
 // ParseSpec parses the JSON body stored in instances.config_json.
@@ -133,6 +137,11 @@ func ParseSpec(raw string) (Spec, error) {
 	var s Spec
 	if err := json.Unmarshal([]byte(raw), &s); err != nil {
 		return Spec{}, fmt.Errorf("parse compose spec: %w", err)
+	}
+	for _, svc := range s.Services {
+		if err := svc.Readiness.Validate(); err != nil {
+			return Spec{}, fmt.Errorf("service %q: %w", svc.Name, err)
+		}
 	}
 	return s, nil
 }

@@ -37,6 +37,7 @@ import (
 
 	"github.com/obacht-dev/obacht-agent/internal/diskcheck"
 	"github.com/obacht-dev/obacht-agent/internal/progress"
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 )
 
 // obachtDataRoot is the agent's on-disk data root. On a Pi the Docker image
@@ -264,6 +265,9 @@ type ServiceSpec struct {
 	TargetType string `json:"targetType,omitempty"`
 	TargetPort int    `json:"targetPort"`
 	AppPath    string `json:"appPath,omitempty"`
+	// Readiness (spec v2.9) tunes how the reconciler probes this service
+	// before reporting the instance ready. Nil = defaults.
+	Readiness *readiness.Config `json:"readiness,omitempty"`
 }
 
 // PortMap maps a host port to a container port (TCP only for v1).
@@ -1019,6 +1023,11 @@ func ParseSpec(configJSON string) (Spec, error) {
 	}
 	if s.Image == "" {
 		return Spec{}, errors.New("spec.image is required")
+	}
+	for _, svc := range s.Services {
+		if err := svc.Readiness.Validate(); err != nil {
+			return Spec{}, fmt.Errorf("service %q: %w", svc.Name, err)
+		}
 	}
 	return s, nil
 }
