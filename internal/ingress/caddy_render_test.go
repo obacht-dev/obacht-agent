@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -198,5 +199,95 @@ func TestSanitizeAppPath(t *testing.T) {
 		if got := sanitizeAppPath(p); got != p {
 			t.Errorf("sanitizeAppPath(%q) = %q, want %q", p, got, p)
 		}
+	}
+}
+
+// Readiness (spec v2.9): every reverse_proxy bridges brief upstream gaps
+// (lb_try_duration) and every bound site carries a handle_errors block that
+// serves the inline "still starting" page for 502/503/504, outside basic
+// auth. Both the root and the path-prefix forms.
+func TestRenderStartingPageAndRetry(t *testing.T) {
+	ctx := context.Background()
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	if err := st.UpsertInstance(ctx, store.Instance{ID: "web1", TemplateID: "whoami", Runtime: store.RuntimeContainer, DesiredState: store.DesiredInstalled}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertService(ctx, store.InstanceService{InstanceID: "web1", ServiceName: "web", TargetType: "docker_dns", Target: "obacht-web1:80"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"root.example.com", "path.example.com", "auth.example.com", "free.example.com"} {
+		if err := st.UpsertDomain(ctx, d, store.DomainStatusReady); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.UpsertBinding(ctx, store.IngressBinding{Domain: "root.example.com", InstanceID: "web1", ServiceName: "web", Mode: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBinding(ctx, store.IngressBinding{Domain: "path.example.com", InstanceID: "web1", ServiceName: "web", Mode: "path", PathPrefix: "/app"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertBinding(ctx, store.IngressBinding{Domain: "auth.example.com", InstanceID: "web1", ServiceName: "web", Mode: "root"}); err != nil {
+		t.Fatal(err)
+	}
+	hash := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	if err := st.SetDomainBasicAuth(ctx, "auth.example.com", "admin", hash); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{store: st, cfg: config.IngressConfig{HTTPPort: 80, HTTPSPort: 443}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	body, _, err := m.renderCaddyfile(ctx)
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	if os.Getenv("OBACHT_DUMP_CADDYFILE") != "" {
+		_ = os.WriteFile(os.Getenv("OBACHT_DUMP_CADDYFILE"), []byte(body), 0o644)
+	}
+
+	root := siteBlock(t, body, "root.example.com")
+	if !strings.Contains(root, "reverse_proxy obacht-web1:80 {\n\t\tlb_try_duration 5s\n\t\tlb_try_interval 250ms\n\t}") {
+		t.Errorf("root site must use the retry block form:\n%s", root)
+	}
+	if !strings.Contains(root, "handle_errors 502 503 504 {") || !strings.Contains(root, "header Refresh 5") ||
+		!strings.Contains(root, "Just a moment") || !strings.Contains(root, "{err.status_code}") {
+		t.Errorf("root site missing the still-starting error page:\n%s", root)
+	}
+	if strings.Contains(root, "`") && strings.Count(root, "`") != 2 {
+		t.Errorf("backtick body must be a single raw token:\n%s", root)
+	}
+	if strings.Contains(startingErrorHTML, "`") || strings.ContainsAny(startingErrorHTML, "{}") {
+		t.Errorf("error page body must contain neither backticks nor braces")
+	}
+
+	path := siteBlock(t, body, "path.example.com")
+	if !strings.Contains(path, "handle /app* {\n\t\treverse_proxy obacht-web1:80 {\n\t\t\tlb_try_duration 5s\n\t\t\tlb_try_interval 250ms\n\t\t}\n\t}") {
+		t.Errorf("path site must use the retry block form inside handle:\n%s", path)
+	}
+	if !strings.Contains(path, "handle_errors 502 503 504 {") {
+		t.Errorf("path site missing the error page:\n%s", path)
+	}
+
+	// Basic auth: the error page sits next to basic_auth, not inside it, so
+	// the "still starting" page needs no credentials; the app still does.
+	auth := siteBlock(t, body, "auth.example.com")
+	ia, ie, ip := strings.Index(auth, "basic_auth {"), strings.Index(auth, "handle_errors"), strings.Index(auth, "reverse_proxy")
+	if ia < 0 || ie < 0 || ip < 0 {
+		t.Fatalf("auth site incomplete:\n%s", auth)
+	}
+	if ia > ie || ie > ip {
+		t.Errorf("expected basic_auth, then handle_errors, then reverse_proxy:\n%s", auth)
+	}
+	if strings.Contains(auth[ie:ip], "basic_auth") {
+		t.Errorf("handle_errors must not nest basic_auth:\n%s", auth)
+	}
+
+	// An unbound domain gets neither.
+	free := siteBlock(t, body, "free.example.com")
+	if strings.Contains(free, "handle_errors") || strings.Contains(free, "lb_try") {
+		t.Errorf("unbound site must stay a plain respond:\n%s", free)
 	}
 }

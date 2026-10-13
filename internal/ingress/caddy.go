@@ -430,8 +430,13 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 				fmt.Fprintf(&b, "\trespond \"obacht: %s\" 503\n", escape(upErr.Error()))
 				summary.observed[d.Domain] = store.DomainStatusReady
 			} else {
+				// While the app behind the upstream is still starting, a
+				// visitor (the QR code scanned a minute too early) gets the
+				// "still starting" page instead of a bare 502. Not behind
+				// basic_auth: error routes are a separate handler chain.
+				b.WriteString(startingErrorPage)
 				if bind.Mode == "path" && bind.PathPrefix != "" {
-					fmt.Fprintf(&b, "\thandle %s* {\n\t\treverse_proxy %s\n\t}\n", bind.PathPrefix, upstream)
+					fmt.Fprintf(&b, "\thandle %s* {\n%s\t}\n", bind.PathPrefix, reverseProxyBlock("\t\t", upstream))
 				} else {
 					// Spec v2.8 service.appPath: for an app whose entry page lives
 					// under a subpath (e.g. MediaMTX at /cam/), send a bare root
@@ -439,7 +444,7 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 					if ap := sanitizeAppPath(appPath); ap != "" {
 						fmt.Fprintf(&b, "\tredir / %s\n", ap)
 					}
-					fmt.Fprintf(&b, "\treverse_proxy %s\n", upstream)
+					b.WriteString(reverseProxyBlock("\t", upstream))
 				}
 				summary.bound++
 				summary.observed[d.Domain] = store.DomainStatusBound
@@ -458,6 +463,38 @@ func (m *Manager) renderCaddyfile(ctx context.Context) (string, renderSummary, e
 	}
 	return b.String(), summary, nil
 }
+
+// reverseProxyBlock renders a reverse_proxy directive that bridges brief
+// upstream gaps (a container restart, an app that just bound its port):
+// Caddy retries the dial for up to 5 s before it gives up with a 502.
+func reverseProxyBlock(indent, upstream string) string {
+	return fmt.Sprintf("%sreverse_proxy %s {\n%s\tlb_try_duration 5s\n%s\tlb_try_interval 250ms\n%s}\n",
+		indent, upstream, indent, indent, indent)
+}
+
+// startingErrorPage is the per-site handle_errors block for upstream
+// failures (502/503/504): a plain inline page with no external assets that
+// reloads itself every 5 s (Refresh header + meta), keeping the original
+// status code so monitors still see the failure. The body is a backtick
+// (raw) Caddyfile token: it must not contain backticks, and it uses no
+// braces so Caddy's placeholder replacer leaves it alone.
+const startingErrorPage = "\thandle_errors 502 503 504 {\n" +
+	"\t\theader Refresh 5\n" +
+	"\t\theader Content-Type \"text/html; charset=utf-8\"\n" +
+	"\t\trespond `" + startingErrorHTML + "` {err.status_code}\n" +
+	"\t}\n"
+
+// startingErrorHTML is the page body. Inline styles only (no <style> block:
+// CSS braces would look like placeholders), one line, no backticks.
+const startingErrorHTML = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">` +
+	`<meta name="viewport" content="width=device-width, initial-scale=1">` +
+	`<meta http-equiv="refresh" content="5"><title>Just a moment</title></head>` +
+	`<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;` +
+	`background:#f6f6f2;color:#1a1a1a;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;">` +
+	`<main style="max-width:28rem;padding:2rem;text-align:center;">` +
+	`<h1 style="font-size:1.5rem;font-weight:600;margin:0 0 .75rem;">Just a moment</h1>` +
+	`<p style="margin:0;line-height:1.5;">The app on this device is still starting. This page reloads on its own.</p>` +
+	`</main></body></html>`
 
 // httpPort / httpsPort return the configured Caddy ports, defaulting to the
 // privileged 80/443 (Pi) when unset.
