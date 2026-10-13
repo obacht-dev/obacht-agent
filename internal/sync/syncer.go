@@ -487,6 +487,12 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		// Spec v2.1+: per-service health for compose bundles. Empty for
 		// single-container instances.
 		ServicesStatus []compose.ServiceStatus `json:"services_status,omitempty"`
+		// Spec v2.9: readiness of the app behind the instance, separate
+		// from observed_state ("" / starting / ready / unhealthy) and the
+		// unix time it last became ready. Driven by the readiness prober
+		// and macOS post_start hooks; transitions push immediately.
+		ServiceReady string `json:"service_ready,omitempty"`
+		ReadyAt      int64  `json:"ready_at,omitempty"`
 	}
 	type bindOut struct {
 		Domain      string `json:"domain"`
@@ -531,6 +537,10 @@ func (s *Syncer) pushObserved(ctx context.Context) {
 		}
 		if !i.ObservedAt.IsZero() {
 			o.ObservedAt = i.ObservedAt.Unix()
+		}
+		o.ServiceReady = i.ServiceReady
+		if !i.ReadyAt.IsZero() {
+			o.ReadyAt = i.ReadyAt.Unix()
 		}
 		// For compose bundles, attach per-service docker status. Cheap
 		// (one `docker ps` per instance), failures are non-fatal — we

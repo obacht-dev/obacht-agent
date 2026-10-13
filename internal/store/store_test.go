@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStoreUpsertAndList(t *testing.T) {
@@ -68,5 +69,38 @@ func TestStoreUpsertAndList(t *testing.T) {
 	}
 	if _, err := st.GetInstance(ctx, "demo-1"); err != ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+// Migration 0012: service_ready / ready_at round-trip through the Instance
+// struct; ready_at is only kept while the state carries a time.
+func TestSetServiceReady(t *testing.T) {
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer st.Close()
+	if err := st.UpsertInstance(ctx, Instance{ID: "i1", TemplateID: "tpl", Runtime: RuntimeContainer, DesiredState: DesiredInstalled}); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := st.GetInstance(ctx, "i1")
+	if err != nil || inst.ServiceReady != "" || !inst.ReadyAt.IsZero() {
+		t.Fatalf("fresh row: %+v %v", inst, err)
+	}
+	at := time.Unix(1_800_000_000, 0)
+	if err := st.SetServiceReady(ctx, "i1", "ready", at); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ = st.GetInstance(ctx, "i1")
+	if inst.ServiceReady != "ready" || !inst.ReadyAt.Equal(at) {
+		t.Fatalf("ready: %+v", inst)
+	}
+	if err := st.SetServiceReady(ctx, "i1", "starting", time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := st.ListInstances(ctx)
+	if len(list) != 1 || list[0].ServiceReady != "starting" || !list[0].ReadyAt.IsZero() {
+		t.Fatalf("starting via list: %+v", list)
 	}
 }

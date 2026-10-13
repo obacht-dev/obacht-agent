@@ -29,6 +29,7 @@ import (
 	"github.com/obacht-dev/obacht-agent/internal/ipc"
 	"github.com/obacht-dev/obacht-agent/internal/logging"
 	logspkg "github.com/obacht-dev/obacht-agent/internal/logs"
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 	"github.com/obacht-dev/obacht-agent/internal/reconciler"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
@@ -142,6 +143,11 @@ func main() {
 	rec := reconciler.New(st, docker, log.With("component", "reconciler"), *reconcileEv)
 	rec.SetSocketPath(cfg.Paths.Socket)
 	rec.SetHostGateway(*hostGateway)
+	rec.SetAudit(auditW)
+	// Readiness (spec v2.9): probes through the device's own Caddy on its
+	// TLS port (443 on Pis, 8443 in the Mac VM), falling back to the
+	// container directly / docker health.
+	rec.SetReadiness(readiness.New(st, docker, cfg.Ingress.HTTPSPort, log))
 
 	// Compose runtime driver — bundle templates (spec v2.1).
 	if err := os.MkdirAll(cfg.Paths.ComposeRoot, 0o750); err != nil {

@@ -37,8 +37,14 @@ type Instance struct {
 	ObservedState string // free-form, last value pushed by runtime/template ("running", "stopped", "error", ...)
 	ObservedJSON  string
 	ObservedAt    time.Time
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	// ServiceReady is the readiness signal ("" / starting / ready /
+	// unhealthy) the reconciler's prober or the host-service post_start
+	// hooks drive. Independent of ObservedState. ReadyAt is when the
+	// instance last became ready (zero otherwise).
+	ServiceReady string
+	ReadyAt      time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ErrNotFound is returned by Get* methods when the row is missing.
@@ -76,6 +82,7 @@ func (s *Store) GetInstance(ctx context.Context, id string) (*Instance, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, template_id, runtime, version, desired_state, COALESCE(config_json,''),
 		       COALESCE(observed_state,''), COALESCE(observed_json,''), COALESCE(observed_at,0),
+		       COALESCE(service_ready,''), COALESCE(ready_at,0),
 		       created_at, updated_at
 		FROM instances WHERE id = ?`, id)
 	return scanInstance(row)
@@ -86,6 +93,7 @@ func (s *Store) ListInstances(ctx context.Context) ([]Instance, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, template_id, runtime, version, desired_state, COALESCE(config_json,''),
 		       COALESCE(observed_state,''), COALESCE(observed_json,''), COALESCE(observed_at,0),
+		       COALESCE(service_ready,''), COALESCE(ready_at,0),
 		       created_at, updated_at
 		FROM instances ORDER BY created_at ASC`)
 	if err != nil {
@@ -130,14 +138,15 @@ func scanInstanceFromRows(rows *sql.Rows) (*Instance, error) {
 
 func readInstance(r rowScanner) (*Instance, error) {
 	var (
-		i                Instance
-		runtime          string
-		desiredState     string
-		observedAt       int64
-		createdAt, ua    int64
+		i             Instance
+		runtime       string
+		desiredState  string
+		observedAt    int64
+		readyAt       int64
+		createdAt, ua int64
 	)
 	if err := r.Scan(&i.ID, &i.TemplateID, &runtime, &i.Version, &desiredState, &i.ConfigJSON,
-		&i.ObservedState, &i.ObservedJSON, &observedAt, &createdAt, &ua); err != nil {
+		&i.ObservedState, &i.ObservedJSON, &observedAt, &i.ServiceReady, &readyAt, &createdAt, &ua); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -147,6 +156,9 @@ func readInstance(r rowScanner) (*Instance, error) {
 	i.DesiredState = DesiredState(desiredState)
 	if observedAt > 0 {
 		i.ObservedAt = time.Unix(observedAt, 0)
+	}
+	if readyAt > 0 {
+		i.ReadyAt = time.Unix(readyAt, 0)
 	}
 	i.CreatedAt = time.Unix(createdAt, 0)
 	i.UpdatedAt = time.Unix(ua, 0)
@@ -160,6 +172,21 @@ func (s *Store) SetObservedState(ctx context.Context, instanceID, state, payload
 		UPDATE instances
 		   SET observed_state = ?, observed_json = ?, observed_at = ?
 		 WHERE id = ?`, state, payload, time.Now().Unix(), instanceID)
+	return err
+}
+
+// SetServiceReady records the readiness state for an instance. readyAt is
+// stored when non-zero (the moment the instance became ready) and cleared
+// otherwise, so ready_at is only ever set while state is "ready".
+func (s *Store) SetServiceReady(ctx context.Context, instanceID, state string, readyAt time.Time) error {
+	var at any
+	if !readyAt.IsZero() {
+		at = readyAt.Unix()
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE instances
+		   SET service_ready = ?, ready_at = ?
+		 WHERE id = ?`, state, at, instanceID)
 	return err
 }
 

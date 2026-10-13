@@ -25,7 +25,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/obacht-dev/obacht-agent/internal/audit"
 	"github.com/obacht-dev/obacht-agent/internal/progress"
+	"github.com/obacht-dev/obacht-agent/internal/readiness"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/compose"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/container"
 	"github.com/obacht-dev/obacht-agent/internal/runtime/system"
@@ -86,6 +88,14 @@ type Reconciler struct {
 	notify func()
 
 	prog progress.Reporter
+
+	// ready drives the per-instance readiness signal (service_ready): a
+	// goroutine per starting instance, inline re-probes per tick once
+	// settled. nil disables readiness (tests, agents without the prober).
+	ready *readiness.Prober
+
+	// audit records post_start hook failures. nil-safe (no-op writer).
+	audit *audit.Writer
 
 	// Serial apply worker state. workQueue holds jobs FIFO; workPending
 	// dedupes enqueues (including against the in-flight job, so a 5-minute
@@ -165,6 +175,43 @@ func (r *Reconciler) SetChangeNotifier(fn func()) { r.notify = fn }
 // SetProgress wires a progress sink (see internal/progress). Must be wired
 // before Run starts.
 func (r *Reconciler) SetProgress(p progress.Reporter) { r.prog = progress.OrNop(p) }
+
+// SetReadiness wires the readiness prober. Its transitions fire the change
+// notifier (immediate push), and macOS host-service post_start hooks report
+// through it too. Must be wired before Run starts.
+func (r *Reconciler) SetReadiness(p *readiness.Prober) {
+	r.ready = p
+	if p == nil {
+		return
+	}
+	p.SetNotify(r.notifyChanged)
+	r.system.SetReadinessSink(r.hookReadiness)
+}
+
+// SetAudit wires the audit writer (post_start hook failures). nil-safe.
+func (r *Reconciler) SetAudit(w *audit.Writer) { r.audit = w }
+
+// hookReadiness is the sink for host-service post_start hook outcomes
+// (runtime/system). Persists the state like a probe result and leaves an
+// audit trail when a hook failed: the agent made an HTTP call on the
+// manifest's behalf and it did not succeed.
+func (r *Reconciler) hookReadiness(instanceID, state, errMsg string) {
+	if r.ready == nil {
+		return
+	}
+	ctx := context.Background()
+	r.ready.Set(ctx, instanceID, state)
+	if state == readiness.StateUnhealthy {
+		_ = r.audit.Append(ctx, audit.Entry{
+			Op:            "instance.post_start",
+			Actor:         "reconciler",
+			Target:        instanceID,
+			Result:        audit.ResultError,
+			ErrorMessage:  errMsg,
+			ParamsSummary: "post_start hook failed",
+		})
+	}
+}
 
 func (r *Reconciler) notifyChanged() {
 	if r.notify != nil {
@@ -439,6 +486,12 @@ func (r *Reconciler) reconcile(ctx context.Context, syncApply bool) error {
 	desiredIDs := make(map[string]struct{}, len(desired))
 	changed := false
 
+	// Readiness bookkeeping for this pass: which service each instance has
+	// bound (so the probe targets what visitors reach) and the settled
+	// instances to re-probe inline after the loop.
+	boundService := r.boundServices(ctx)
+	var steady []readiness.Target
+
 	for _, inst := range desired {
 		desiredIDs[inst.ID] = struct{}{}
 		switch inst.Runtime {
@@ -453,6 +506,7 @@ func (r *Reconciler) reconcile(ctx context.Context, syncApply bool) error {
 				} else {
 					r.enqueueApply(inst, observedByInstance)
 				}
+				r.collectReadiness(inst, boundService, &steady)
 				continue
 			}
 			// Stop/remove must never overlap a concurrent Apply of the same
@@ -467,7 +521,10 @@ func (r *Reconciler) reconcile(ctx context.Context, syncApply bool) error {
 				changed = r.reconcileComposeDown(ctx, inst) || changed
 			}
 		case store.RuntimeSystem:
-			r.reconcileSystem(ctx, inst)
+			if r.reconcileSystem(ctx, inst) {
+				inst.ObservedState = "installed"
+				r.collectReadiness(inst, boundService, &steady)
+			}
 		default:
 			r.log.Warn("unknown runtime, skipping", "instance", inst.ID, "runtime", inst.Runtime)
 		}
@@ -526,6 +583,13 @@ func (r *Reconciler) reconcile(ctx context.Context, syncApply bool) error {
 				}
 			}
 		}
+	}
+
+	// Steady-state readiness: re-probe settled instances in parallel (bounded
+	// workers, 5 s per request) so a dead app flips to unhealthy and a
+	// recovered one back to ready without any long-lived goroutine.
+	if r.ready != nil {
+		r.ready.RunSteady(ctx, steady)
 	}
 
 	if syncApply {
@@ -613,7 +677,164 @@ func (r *Reconciler) applyContainer(ctx context.Context, inst store.Instance, ob
 	if err := r.store.SetObservedState(ctx, inst.ID, state, ""); err != nil {
 		r.log.Warn("record observed state", "instance", inst.ID, "err", err)
 	}
+	// A (re)created container or a fresh install starts the readiness clock;
+	// a steady no-op apply leaves the settled state to the tick's re-probe.
+	if applied || (state == "installed" && inst.ObservedState != "installed") {
+		r.beginReadiness(ctx, inst)
+	}
 	return applied || state != inst.ObservedState
+}
+
+// beginReadiness (re)starts the readiness starting phase for an instance
+// whose runtime just converged (container created/recreated/restarted).
+func (r *Reconciler) beginReadiness(ctx context.Context, inst store.Instance) {
+	if r.ready == nil {
+		return
+	}
+	if t, ok := r.readinessTarget(inst, r.boundServices(ctx)); ok {
+		r.ready.Begin(t)
+	}
+}
+
+// resetReadiness clears the readiness signal of an instance that was
+// stopped (the row stays) and drops the prober's bookkeeping for it.
+func (r *Reconciler) resetReadiness(ctx context.Context, inst store.Instance) {
+	if r.ready == nil {
+		return
+	}
+	r.ready.Forget(inst.ID, "obacht-"+inst.ID)
+	if inst.DesiredState == store.DesiredStopped && inst.ServiceReady != "" {
+		if err := r.store.SetServiceReady(ctx, inst.ID, "", time.Time{}); err != nil {
+			r.log.Warn("reset service_ready", "instance", inst.ID, "err", err)
+		}
+	}
+}
+
+// collectReadiness routes an installed instance to the right readiness
+// path for this pass: an unevaluated (or orphaned "starting", e.g. after an
+// agent restart) instance gets a starting goroutine; a settled one is
+// queued for the inline re-probe. Only instances whose runtime reports
+// installed are considered — readiness never speaks for a container that
+// is not running.
+func (r *Reconciler) collectReadiness(inst store.Instance, bound map[string]string, steady *[]readiness.Target) {
+	if r.ready == nil || inst.DesiredState != store.DesiredInstalled || inst.ObservedState != "installed" {
+		return
+	}
+	t, ok := r.readinessTarget(inst, bound)
+	if !ok {
+		return
+	}
+	switch inst.ServiceReady {
+	case readiness.StateReady, readiness.StateUnhealthy:
+		*steady = append(*steady, t)
+	default: // "" or starting
+		if !r.ready.Active(inst.ID) {
+			r.ready.Begin(t)
+		}
+	}
+}
+
+// boundServices maps instance id → service name bound to a domain, so the
+// probe targets the service visitors actually reach when a template
+// exposes more than one.
+func (r *Reconciler) boundServices(ctx context.Context) map[string]string {
+	out := map[string]string{}
+	binds, err := r.store.ListBindings(ctx)
+	if err != nil {
+		return out
+	}
+	for _, b := range binds {
+		if b.InstanceID != "" {
+			out[b.InstanceID] = b.ServiceName
+		}
+	}
+	return out
+}
+
+// readinessTarget derives what to probe for an instance from its runtime
+// spec: the bound service if any, else the first routable one. false when
+// the instance has nothing to probe (no services) or its readiness is
+// governed elsewhere (host-service post_start hooks).
+func (r *Reconciler) readinessTarget(inst store.Instance, bound map[string]string) (readiness.Target, bool) {
+	want := bound[inst.ID]
+	switch inst.Runtime {
+	case store.RuntimeContainer:
+		spec, err := container.ParseSpec(inst.ConfigJSON)
+		if err != nil {
+			return readiness.Target{}, false
+		}
+		var pick *container.ServiceSpec
+		for i := range spec.Services {
+			svc := &spec.Services[i]
+			if svc.Name == "" || svc.TargetPort == 0 {
+				continue
+			}
+			if pick == nil || svc.Name == want {
+				pick = svc
+			}
+		}
+		if pick == nil {
+			return readiness.Target{}, false
+		}
+		return readiness.Target{
+			InstanceID:    inst.ID,
+			ServiceName:   pick.Name,
+			ContainerName: "obacht-" + inst.ID,
+			TargetPort:    pick.TargetPort,
+			Config:        pick.Readiness,
+		}, true
+	case store.RuntimeCompose:
+		spec, err := compose.ParseSpec(inst.ConfigJSON)
+		if err != nil {
+			return readiness.Target{}, false
+		}
+		var pick *compose.ServiceSpec
+		for i := range spec.Services {
+			svc := &spec.Services[i]
+			if svc.Name == "" || svc.TargetPort == 0 || svc.TargetService == "" {
+				continue
+			}
+			if pick == nil || svc.Name == want {
+				pick = svc
+			}
+		}
+		if pick == nil {
+			return readiness.Target{}, false
+		}
+		return readiness.Target{
+			InstanceID:    inst.ID,
+			ServiceName:   pick.Name,
+			ContainerName: compose.PrimaryContainerName(inst.ID, pick.TargetService),
+			TargetPort:    pick.TargetPort,
+			Config:        pick.Readiness,
+		}, true
+	case store.RuntimeSystem:
+		spec, err := system.ParseSpec(inst.ConfigJSON)
+		if err != nil || system.HasPostStart(spec) {
+			return readiness.Target{}, false
+		}
+		var pick *system.Service
+		for i := range spec.Services {
+			svc := &spec.Services[i]
+			if svc.Name == "" || svc.TargetPort == 0 || (svc.TargetType != "" && svc.TargetType != "host_port") {
+				continue
+			}
+			if pick == nil || svc.Name == want {
+				pick = svc
+			}
+		}
+		if pick == nil {
+			return readiness.Target{}, false
+		}
+		return readiness.Target{
+			InstanceID:  inst.ID,
+			ServiceName: pick.Name,
+			TargetPort:  pick.TargetPort,
+			HostPort:    true,
+			Config:      pick.Readiness,
+		}, true
+	}
+	return readiness.Target{}, false
 }
 
 // recordObservedError writes an 'error' observed state and reports whether
@@ -637,12 +858,14 @@ func (r *Reconciler) reconcileContainerDown(ctx context.Context, inst store.Inst
 			r.log.Error("stop (remove) instance", "instance", inst.ID, "err", err)
 			return false
 		}
+		r.resetReadiness(ctx, inst)
 		return removed
 	case store.DesiredRemoved:
 		if _, err := r.docker.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove instance", "instance", inst.ID, "err", err)
 			return false
 		}
+		r.resetReadiness(ctx, inst)
 		if err := r.store.DropTemplateSecrets(ctx, inst.ID); err != nil {
 			r.log.Warn("drop template secrets", "instance", inst.ID, "err", err)
 		}
@@ -661,18 +884,21 @@ func (r *Reconciler) reconcileContainerDown(ctx context.Context, inst store.Inst
 // locks are acquired here (not at install time) so the reconciler is the
 // single authority — this also recovers from agent crashes between the IPC
 // upsert and the first reconcile.
-func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
+//
+// Returns true when the instance converged to installed this pass (the
+// caller then tracks its readiness).
+func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) bool {
 	switch inst.DesiredState {
 	case store.DesiredInstalled:
 		spec, err := system.ParseSpec(inst.ConfigJSON)
 		if err != nil {
 			if errors.Is(err, system.ErrEmptySpec) {
 				r.log.Warn("system instance has empty config_json, skipping", "instance", inst.ID)
-				return
+				return false
 			}
 			r.log.Error("parse system spec", "instance", inst.ID, "err", err)
 			_ = r.store.SetObservedState(ctx, inst.ID, "error", err.Error())
-			return
+			return false
 		}
 		if spec.ExclusivityGroup != "" {
 			if err := r.store.TryAcquireLock(ctx, spec.ExclusivityGroup, inst.ID); err != nil {
@@ -681,13 +907,13 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 					"instance", inst.ID, "group", spec.ExclusivityGroup, "holder", holder)
 				_ = r.store.SetObservedState(ctx, inst.ID, "error",
 					fmt.Sprintf("resource %q already in use by %s", spec.ExclusivityGroup, holder))
-				return
+				return false
 			}
 		}
 		if err := r.system.Apply(ctx, inst.ID, spec); err != nil {
 			r.log.Error("apply system instance", "instance", inst.ID, "err", err)
 			_ = r.store.SetObservedState(ctx, inst.ID, "error", err.Error())
-			return
+			return false
 		}
 		// Register the manifest's named services so ingress bindings can route
 		// to the host process. A managed service listens on a host port; the
@@ -718,6 +944,7 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 			r.log.Warn("set system observed state", "instance", inst.ID, "err", err)
 		}
 		r.log.Info("applied system", "instance", inst.ID)
+		return true
 	case store.DesiredStopped, store.DesiredRemoved:
 		// The managed-service unit name is deterministic from the instance ID,
 		// so removal works even when config_json is gone/corrupt. The spec is
@@ -735,8 +962,9 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 		}
 		if err := r.system.Remove(ctx, inst.ID, spec); err != nil {
 			r.log.Error("remove system instance", "instance", inst.ID, "err", err)
-			return
+			return false
 		}
+		r.resetReadiness(ctx, inst)
 		if err := r.store.ReleaseLocksForInstance(ctx, inst.ID); err != nil {
 			r.log.Warn("release locks", "instance", inst.ID, "err", err)
 		}
@@ -749,6 +977,7 @@ func (r *Reconciler) reconcileSystem(ctx context.Context, inst store.Instance) {
 			_ = r.store.SetObservedState(ctx, inst.ID, "stopped", "")
 		}
 	}
+	return false
 }
 
 // injectIPC enriches a container Spec with the per-instance IPC affordances
@@ -848,6 +1077,9 @@ func (r *Reconciler) applyCompose(ctx context.Context, inst store.Instance) bool
 	if err := r.store.SetObservedState(ctx, inst.ID, "installed", ""); err != nil {
 		r.log.Warn("record observed state", "instance", inst.ID, "err", err)
 	}
+	if applied || inst.ObservedState != "installed" {
+		r.beginReadiness(ctx, inst)
+	}
 	return applied || inst.ObservedState != "installed"
 }
 
@@ -867,12 +1099,14 @@ func (r *Reconciler) reconcileComposeDown(ctx context.Context, inst store.Instan
 			r.log.Error("stop compose instance", "instance", inst.ID, "err", err)
 			return false
 		}
+		r.resetReadiness(ctx, inst)
 		return removed
 	case store.DesiredRemoved:
 		if _, err := r.compose.Remove(ctx, inst.ID); err != nil {
 			r.log.Error("remove compose instance", "instance", inst.ID, "err", err)
 			return false
 		}
+		r.resetReadiness(ctx, inst)
 		if err := r.store.ReleaseLocksForInstance(ctx, inst.ID); err != nil {
 			r.log.Warn("release locks", "instance", inst.ID, "err", err)
 		}
