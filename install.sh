@@ -157,21 +157,24 @@ echo "==> verifying checksum"
 # marker) are out of scope; a manual downgrade must remove the marker.
 installed_agent="$INSTALL_DIR/obacht-agent"
 VERIFY_SUPPORT_MARKER="$INSTALL_DIR/.verify-release-supported"
+# Fail closed: once the installed binary can verify, a missing or
+# unverifiable signature aborts the update exactly like a bad one
+# (security audit 2026-10-22). Only a verified release is installed.
 if [ "${SELF_UPDATE:-0}" = "1" ] && [ -x "$installed_agent" ] && [ -f "$VERIFY_SUPPORT_MARKER" ]; then
-  if curl -fsSL -o "$tmpdir/$asset.minisig" "$base_url/$asset.minisig" 2>/dev/null; then
-    echo "==> verifying release signature"
-    set +e
-    "$installed_agent" verify-release --file "$tmpdir/$asset" --sig "$tmpdir/$asset.minisig"
-    vr=$?
-    set -e
-    case "$vr" in
-      0) : ;;  # verified
-      1) echo "FATAL: release signature REJECTED - refusing to self-update" >&2; exit 1 ;;
-      *) echo "WARN: could not verify release signature (unsigned-migration); continuing on sha256" >&2 ;;
-    esac
-  else
-    echo "WARN: no .minisig for $asset (unsigned release); continuing on sha256" >&2
+  if ! curl -fsSL -o "$tmpdir/$asset.minisig" "$base_url/$asset.minisig" 2>/dev/null; then
+    echo "FATAL: no .minisig for $asset - refusing to self-update an unsigned release" >&2
+    exit 1
   fi
+  echo "==> verifying release signature"
+  set +e
+  "$installed_agent" verify-release --file "$tmpdir/$asset" --sig "$tmpdir/$asset.minisig"
+  vr=$?
+  set -e
+  case "$vr" in
+    0) : ;;  # verified
+    1) echo "FATAL: release signature REJECTED - refusing to self-update" >&2; exit 1 ;;
+    *) echo "FATAL: could not verify release signature (exit $vr) - refusing to self-update" >&2; exit 1 ;;
+  esac
 elif [ "${SELF_UPDATE:-0}" = "1" ]; then
   echo "==> installed agent predates signed releases; skipping signature check (sha256 only)"
 fi
@@ -334,9 +337,15 @@ curl -fsSL -o "$tmp" "$url"
 # Guard: only call verify-release when the installed binary supports it
 # (marker written by install.sh right after installing a capable binary).
 # Agents <= v0.4.0 lack the subcommand and would start the daemon + hang.
+# Fail closed (security audit 2026-10-22): when the installed binary can
+# verify, install.sh runs only with a valid signature. A missing .minisig or
+# an unverifiable one aborts like a rejected one.
 installed_agent="/opt/obacht-agent/obacht-agent"
-if [ -x "$installed_agent" ] && [ -f /opt/obacht-agent/.verify-release-supported ] \
-   && curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/null; then
+if [ -x "$installed_agent" ] && [ -f /opt/obacht-agent/.verify-release-supported ]; then
+  if ! curl -fsSL -o "$tmpsig" "$url.minisig" 2>/dev/null; then
+    echo "FATAL: no install.sh.minisig - aborting self-update of an unsigned release" >&2
+    exit 1
+  fi
   set +e
   "$installed_agent" verify-release --file "$tmp" --sig "$tmpsig"
   vr=$?
@@ -344,10 +353,10 @@ if [ -x "$installed_agent" ] && [ -f /opt/obacht-agent/.verify-release-supported
   case "$vr" in
     0) echo "==> obacht-self-update: install.sh signature OK" ;;
     1) echo "FATAL: install.sh signature REJECTED - aborting self-update" >&2; exit 1 ;;
-    *) echo "WARN: could not verify install.sh signature (unsigned-migration); continuing" >&2 ;;
+    *) echo "FATAL: could not verify install.sh signature (exit $vr) - aborting self-update" >&2; exit 1 ;;
   esac
 else
-  echo "WARN: install.sh signature not verified (old agent, unsigned release, or no anchor); continuing" >&2
+  echo "WARN: installed agent predates signed releases; install.sh not verified" >&2
 fi
 
 chmod +x "$tmp"

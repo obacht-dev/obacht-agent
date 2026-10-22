@@ -93,6 +93,12 @@ done
 echo "==> uploading ${#uploads[@]} signatures to $TAG"
 gh release upload "$TAG" --repo "$REPO" --clobber "${uploads[@]}"
 
+# CI creates releases as drafts so devices never see an unsigned release
+# (security audit 2026-10-22). Publish only now, once every artifact has its
+# signature, and mark it latest so /releases/latest/download resolves to it.
+echo "==> publishing $TAG"
+gh release edit "$TAG" --repo "$REPO" --draft=false --latest
+
 echo "==> done. signed:"
 printf '   %s\n' "${artifacts[@]}"
 echo

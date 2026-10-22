@@ -336,9 +336,10 @@ func authorizedKeysPath() string {
 //
 //	0  verified OK        → proceed with the swap
 //	1  signature REJECTED → abort (a real tampering signal, never skip)
-//	2  cannot verify      → no embedded keys yet (signing-migration
-//	                        window) or bad usage; installer may fall back
-//	                        to sha256+TLS and warn.
+//	2  cannot verify      → no embedded keys or bad usage. Since the
+//	                        2026-10-22 security audit the installer and the
+//	                        self-update wrapper abort on 2 as well: only 0
+//	                        lets an update through.
 func runVerifyRelease(args []string) int {
 	fs := flag.NewFlagSet("verify-release", flag.ContinueOnError)
 	file := fs.String("file", "", "path to the artifact to verify (tarball or install.sh)")
