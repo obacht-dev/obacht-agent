@@ -64,4 +64,24 @@ run_case "rejected signature is refused"               1 0 1 blocked
 run_case "unverifiable signature (exit 2) is refused"  1 0 2 blocked
 run_case "pre-signing agent (no marker) still updates" 0 1 0 ran
 
+# Self-overwrite: install.sh replaces the wrapper while the old wrapper is
+# still running it. The old bash must finish its own file and must not read
+# into the new one. Uses the real wrapper-writing block from install.sh.
+mkdir -p "$work/sbin"
+{
+  echo 'set -e'
+  # the block as install.sh has it, from the line that writes the wrapper to
+  # the line that installs it, with paths pointed into $work
+  awk '/obacht-self-update/ && /cat >|wrapper_tmp=/ {f=1} f {print} f && /^(mv -f|chmod 0755) .*\/usr\/local\/sbin\/obacht-self-update$/ {exit}' "$here/install.sh"
+} | sed "s#/usr/local/sbin#$work/sbin#g" > "$work/write-wrapper.sh"
+printf '#!/usr/bin/env bash\nbash "%s"\necho old-wrapper-done\n' "$work/write-wrapper.sh" > "$work/sbin/obacht-self-update"
+set +e
+out="$(bash "$work/sbin/obacht-self-update" 2>&1)"; rc=$?
+set -e
+if [ "$rc" -eq 0 ] && [ "$out" = "old-wrapper-done" ] && grep -q 'verify-release' "$work/sbin/obacht-self-update"; then
+  echo "ok   - wrapper replaced while running: old process ends cleanly"
+else
+  echo "FAIL - wrapper replaced while running (rc=$rc, output: $(echo "$out" | head -c 120))"; fails=$((fails+1))
+fi
+
 [ "$fails" -eq 0 ] && echo "all wrapper cases passed" || { echo "$fails case(s) failed"; exit 1; }

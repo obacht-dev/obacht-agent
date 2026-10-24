@@ -303,7 +303,14 @@ chmod 0755 "$INSTALL_DIR/libexec/obacht-kiosk-session"
 # webapp via ssh-gateway -> obachtctl) re-run this very installer to
 # upgrade the agent in place.
 echo "==> writing /usr/local/sbin/obacht-self-update"
-cat > /usr/local/sbin/obacht-self-update <<'SELF'
+# Write the wrapper to a temp file and rename it into place. During a
+# self-update this install.sh is run BY the old wrapper: rewriting the file in
+# place would make the still-running bash continue reading the new content at
+# its old offset (seen on v0.7.0 -> v0.7.1: syntax error after a successful
+# install). rename() gives the new wrapper a new inode, so the old process
+# reads its own file to the end.
+wrapper_tmp="/usr/local/sbin/.obacht-self-update.new.$$"
+cat > "$wrapper_tmp" <<'SELF'
 #!/usr/bin/env bash
 # Managed by obacht-agent install.sh - fixed content. Only argv is the
 # release tag (or "latest").
@@ -362,7 +369,8 @@ fi
 chmod +x "$tmp"
 OBACHT_AGENT_VERSION="$ver" bash "$tmp" --self-update
 SELF
-chmod 0755 /usr/local/sbin/obacht-self-update
+chmod 0755 "$wrapper_tmp"
+mv -f "$wrapper_tmp" /usr/local/sbin/obacht-self-update
 
 # ---------------------------------------------------------------------------
 # S5: create the unprivileged `obacht` user that the agent runs as.
